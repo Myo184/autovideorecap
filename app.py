@@ -5,6 +5,7 @@
 # Recommended Runtime: T4 GPU (Runtime > Change runtime type > T4 GPU)
 
 import os, sys, subprocess, importlib.util, shutil
+import base64
 
 # ----------------------------------------------------------------
 # 0) AUTO INSTALL DEPENDENCIES
@@ -229,6 +230,200 @@ def update_preview_image(video_value, blur_y_percent, blur_height_percent, blur_
         return Image.fromarray(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB))
     except Exception:
         return None
+
+
+def video_first_frame_data_uri(video_value):
+    """Return a lightweight JPEG data URI for the browser-side drag blur editor."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return ""
+    cap = None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return ""
+        h, w = frame.shape[:2]
+        max_w = 900
+        if w > max_w:
+            scale = max_w / float(w)
+            frame = cv2.resize(frame, (max_w, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if not ok:
+            return ""
+        return 'data:image/jpeg;base64,' + base64.b64encode(encoded.tobytes()).decode('ascii')
+    except Exception as exc:
+        print(f'⚠️ Blur editor preview error: {exc}')
+        return ""
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def sync_blur_editor(evt: gr.EventData):
+    """Receive browser drag/resize percentages from the custom blur editor."""
+    try:
+        center = float(evt.center)
+        height = float(evt.height)
+    except Exception:
+        return 78.0, 12.0
+    height = max(3.0, min(45.0, height))
+    half = height / 2.0
+    center = max(half, min(100.0 - half, center))
+    return round(center, 2), round(height, 2)
+
+
+BLUR_EDITOR_TEMPLATE = r"""
+<div class="drag-blur-editor">
+  <div class="drag-blur-toolbar">
+    <div>
+      <div class="drag-blur-title">✋ Drag Blur Editor</div>
+      <div class="drag-blur-help">Purple band ကို drag လုပ်ပြီးရွှေ့ပါ • အပေါ်/အောက် handle ကိုဆွဲပြီး အမြင့်ပြောင်းပါ</div>
+    </div>
+    <button class="drag-blur-reset" type="button">Reset</button>
+  </div>
+  <div class="drag-blur-stage">
+    <img class="drag-blur-image" src="${value}" draggable="false" alt="Video preview">
+    <div class="drag-blur-empty">🎬 Video upload လုပ်ပြီး Blur Band ကို mouse နဲ့တိုက်ရိုက်ညှိနိုင်ပါတယ်</div>
+    <div class="drag-blur-band">
+      <div class="drag-blur-handle drag-blur-handle-top" title="Drag to resize"></div>
+      <div class="drag-blur-grip">⋮⋮ DRAG BLUR AREA ⋮⋮</div>
+      <div class="drag-blur-handle drag-blur-handle-bottom" title="Drag to resize"></div>
+    </div>
+  </div>
+  <div class="drag-blur-readout">
+    <span>Center <b class="drag-center-value">78%</b></span>
+    <span>Height <b class="drag-height-value">12%</b></span>
+    <span class="drag-blur-saved">✓ Final render position synced</span>
+  </div>
+</div>
+"""
+
+BLUR_EDITOR_CSS = r"""
+.drag-blur-editor { width:100%; color:#eef2ff; user-select:none; }
+.drag-blur-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+.drag-blur-title { font-size:14px; font-weight:900; color:#fff; }
+.drag-blur-help { margin-top:3px; font-size:11px; color:#8f9abb; line-height:1.45; }
+.drag-blur-reset { border:1px solid rgba(167,139,250,.28); background:rgba(139,92,246,.10); color:#ddd6fe; padding:7px 11px; border-radius:10px; font-size:11px; font-weight:800; cursor:pointer; }
+.drag-blur-reset:hover { background:rgba(139,92,246,.19); }
+.drag-blur-stage { position:relative; width:100%; min-height:260px; overflow:hidden; border-radius:18px; border:1px solid rgba(139,125,255,.25); background:#070a16; touch-action:none; box-shadow:inset 0 0 0 1px rgba(255,255,255,.02); }
+.drag-blur-image { display:block; width:100%; height:auto; min-height:260px; max-height:590px; object-fit:contain; background:#050713; pointer-events:none; }
+.drag-blur-empty { position:absolute; inset:0; display:grid; place-items:center; padding:24px; text-align:center; color:#71809f; font-size:12px; pointer-events:none; background:linear-gradient(135deg,rgba(13,18,38,.95),rgba(6,9,20,.96)); }
+.drag-blur-stage.has-image .drag-blur-empty { display:none; }
+.drag-blur-band { position:absolute; left:0; width:100%; top:72%; height:12%; min-height:26px; cursor:grab; border-top:2px solid #a78bfa; border-bottom:2px solid #22d3ee; background:rgba(124,58,237,.09); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); box-shadow:0 0 25px rgba(124,58,237,.18), inset 0 0 30px rgba(34,211,238,.06); }
+.drag-blur-band:active { cursor:grabbing; }
+.drag-blur-grip { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); padding:7px 13px; white-space:nowrap; border-radius:999px; background:rgba(8,11,25,.78); border:1px solid rgba(196,181,253,.32); color:#e9d5ff; font-size:10px; font-weight:900; letter-spacing:.08em; pointer-events:none; box-shadow:0 6px 20px rgba(0,0,0,.25); }
+.drag-blur-handle { position:absolute; left:50%; width:82px; height:12px; transform:translateX(-50%); z-index:5; cursor:ns-resize; }
+.drag-blur-handle:after { content:""; position:absolute; left:16px; right:16px; top:4px; height:4px; border-radius:999px; background:#fff; box-shadow:0 0 0 1px rgba(124,58,237,.28),0 2px 8px rgba(0,0,0,.28); }
+.drag-blur-handle-top { top:-7px; }
+.drag-blur-handle-bottom { bottom:-7px; }
+.drag-blur-readout { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:9px; font-size:11px; color:#a8b2ca; }
+.drag-blur-readout span { padding:6px 9px; border-radius:9px; background:rgba(15,20,42,.62); border:1px solid rgba(148,163,184,.12); }
+.drag-blur-readout b { color:#fff; }
+.drag-blur-readout .drag-blur-saved { color:#86efac; border-color:rgba(52,211,153,.16); background:rgba(52,211,153,.06); }
+@media (max-width:720px) { .drag-blur-stage{min-height:210px}.drag-blur-image{min-height:210px}.drag-blur-help{max-width:270px}.drag-blur-grip{font-size:9px;padding:6px 9px} }
+"""
+
+BLUR_EDITOR_JS = r"""
+const stage = element.querySelector('.drag-blur-stage');
+const image = element.querySelector('.drag-blur-image');
+const band = element.querySelector('.drag-blur-band');
+const topHandle = element.querySelector('.drag-blur-handle-top');
+const bottomHandle = element.querySelector('.drag-blur-handle-bottom');
+const resetBtn = element.querySelector('.drag-blur-reset');
+const centerLabel = element.querySelector('.drag-center-value');
+const heightLabel = element.querySelector('.drag-height-value');
+let center = 78.0;
+let height = 12.0;
+let mode = null;
+let startY = 0;
+let startCenter = center;
+let startHeight = height;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+function imageReady() {
+  const ready = !!image.getAttribute('src') && image.naturalWidth > 0;
+  stage.classList.toggle('has-image', ready);
+  return ready;
+}
+function normalize() {
+  height = clamp(height, 3, 45);
+  const half = height / 2;
+  center = clamp(center, half, 100 - half);
+}
+function draw() {
+  normalize();
+  band.style.top = `${center - height / 2}%`;
+  band.style.height = `${height}%`;
+  centerLabel.textContent = `${center.toFixed(1)}%`;
+  heightLabel.textContent = `${height.toFixed(1)}%`;
+}
+function emitValue() {
+  normalize();
+  trigger('change', {center: Number(center.toFixed(2)), height: Number(height.toFixed(2))});
+}
+function pointerPercent(ev) {
+  const rect = stage.getBoundingClientRect();
+  return ((ev.clientY - rect.top) / Math.max(1, rect.height)) * 100;
+}
+function begin(ev, nextMode) {
+  if (!imageReady()) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  mode = nextMode;
+  startY = pointerPercent(ev);
+  startCenter = center;
+  startHeight = height;
+  stage.setPointerCapture?.(ev.pointerId);
+}
+band.addEventListener('pointerdown', (ev) => {
+  if (ev.target === topHandle || ev.target === bottomHandle) return;
+  begin(ev, 'move');
+});
+topHandle.addEventListener('pointerdown', (ev) => begin(ev, 'top'));
+bottomHandle.addEventListener('pointerdown', (ev) => begin(ev, 'bottom'));
+stage.addEventListener('pointermove', (ev) => {
+  if (!mode) return;
+  ev.preventDefault();
+  const now = pointerPercent(ev);
+  const delta = now - startY;
+  if (mode === 'move') {
+    center = startCenter + delta;
+  } else if (mode === 'top') {
+    const startTop = startCenter - startHeight / 2;
+    const fixedBottom = startCenter + startHeight / 2;
+    const newTop = clamp(startTop + delta, 0, fixedBottom - 3);
+    height = fixedBottom - newTop;
+    center = (fixedBottom + newTop) / 2;
+  } else if (mode === 'bottom') {
+    const fixedTop = startCenter - startHeight / 2;
+    const startBottom = startCenter + startHeight / 2;
+    const newBottom = clamp(startBottom + delta, fixedTop + 3, 100);
+    height = newBottom - fixedTop;
+    center = (fixedTop + newBottom) / 2;
+  }
+  draw();
+});
+function endDrag(ev) {
+  if (!mode) return;
+  mode = null;
+  try { stage.releasePointerCapture?.(ev.pointerId); } catch (_) {}
+  draw();
+  emitValue();
+}
+stage.addEventListener('pointerup', endDrag);
+stage.addEventListener('pointercancel', endDrag);
+resetBtn.addEventListener('click', (ev) => {
+  ev.preventDefault();
+  center = 78;
+  height = 12;
+  draw();
+  emitValue();
+});
+image.addEventListener('load', () => { imageReady(); draw(); });
+image.addEventListener('error', () => { stage.classList.remove('has-image'); });
+imageReady();
+draw();
+"""
 
 # ================================================================
 # 6) TRANSLATION MODULE
@@ -1283,8 +1478,16 @@ def create_app():
                         gr.HTML('<div class="section-cap"><span>🎬</span> Source Video</div>')
                         video_input = gr.Video(label="Upload Original Movie / Clip", sources=["upload"])
                     with gr.Column(elem_classes=["glass-card"]):
-                        gr.HTML('<div class="section-cap"><span>👁</span> Subtitle Blur Preview</div>')
-                        preview_image = gr.Image(label="Preview", interactive=False)
+                        gr.HTML('<div class="section-cap"><span>👁</span> Manual Subtitle Blur Editor</div>')
+                        blur_editor = gr.HTML(
+                            value=video_first_frame_data_uri,
+                            inputs=[video_input],
+                            html_template=BLUR_EDITOR_TEMPLATE,
+                            css_template=BLUR_EDITOR_CSS,
+                            js_on_load=BLUR_EDITOR_JS,
+                            apply_default_css=False,
+                            container=False,
+                        )
 
                 with gr.Column(scale=5):
                     with gr.Column(elem_classes=["glass-card"]):
@@ -1396,10 +1599,14 @@ def create_app():
                     subtitle_size_percent = gr.Slider(2.0, 7.0, value=3.8, step=0.1, label="Font Size (%)")
 
                 with gr.Column(elem_classes=["glass-card"]):
-                    gr.HTML('<div class="section-cap"><span>🌫</span> Subtitle Blur Band</div>')
-                    blur_y_percent = gr.Slider(0, 100, value=78, step=1, label="Blur Center")
-                    blur_height_percent = gr.Slider(3, 30, value=12, step=1, label="Blur Height (%)")
-                    blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
+                    gr.HTML("""<div class="section-cap"><span>🌫</span> Blur Strength</div>
+                    <div class="engine-box">
+                      <b>Position & Height</b> ကို အပေါ်က video preview ပေါ်မှာ mouse နဲ့တိုက်ရိုက် drag/resize လုပ်ပါ။
+                      ဒီနေရာမှာ final blur အားကိုပဲ ချိန်ရပါမယ်။
+                    </div>""")
+                    blur_y_percent = gr.Number(value=78, visible=False)
+                    blur_height_percent = gr.Number(value=12, visible=False)
+                    blur_strength = gr.Slider(5, 151, value=51, step=2, label="Final Blur Strength")
 
             with gr.Accordion("✨ Brand, BGM & Advanced", open=False):
                 with gr.Row():
@@ -1462,9 +1669,12 @@ def create_app():
             outputs=voice_preview_audio,
         )
 
-        p_inputs = [video_input, blur_y_percent, blur_height_percent, blur_strength]
-        for trig in p_inputs:
-            trig.change(update_preview_image, inputs=p_inputs, outputs=preview_image)
+        blur_editor.change(
+            fn=sync_blur_editor,
+            outputs=[blur_y_percent, blur_height_percent],
+            queue=False,
+            show_progress="hidden",
+        )
 
         submit_btn.click(
             fn=process_magic_recap_video,
