@@ -456,15 +456,32 @@ def probe_duration(path, fallback=1.0):
 
 
 def update_voice_engine_panels(engine):
+    """Switch engine-specific controls while keeping external clone upload visible."""
     engine = str(engine or "")
     is_edge = engine.startswith("⚡")
     is_design = "Voice Design" in engine
-    is_clone = "Voice Clone" in engine
     return (
         gr.update(visible=is_edge),
         gr.update(visible=is_design),
-        gr.update(visible=is_clone),
+        gr.update(visible=True),  # Clone upload is intentionally always visible.
     )
+
+
+def inspect_clone_reference(reference_value):
+    """Confirm that an uploaded external voice is detected and report duration."""
+    path = normalize_file_path(reference_value)
+    if not path or not os.path.exists(path):
+        return "<div class='ref-status warn'>⚠️ MP3/WAV reference voice ကို upload သို့မဟုတ် microphone နဲ့ record လုပ်ပါ။</div>"
+
+    duration = probe_duration(path, fallback=0.0)
+    name = os.path.basename(path)
+    if duration <= 0:
+        return f"<div class='ref-status warn'>⚠️ <b>{name}</b> ကိုတွေ့ပေမယ့် duration မဖတ်နိုင်ပါ။</div>"
+    if duration < 3.0:
+        return f"<div class='ref-status warn'>⚠️ <b>{name}</b> • {duration:.1f}s — reference တိုလွန်းပါတယ်။ 5–15 sec ကြည်လင်တဲ့အသံကို အကြံပြုပါတယ်။</div>"
+    if duration > 15.0:
+        return f"<div class='ref-status ok'>✅ <b>{name}</b> • {duration:.1f}s — detected. Voice Clone မှာ ပထမ 15 sec ကို အသုံးပြုပါမယ်။</div>"
+    return f"<div class='ref-status ok'>✅ <b>{name}</b> • {duration:.1f}s — VoxCPM2 cloning အတွက် reference ready ဖြစ်ပါတယ်။</div>"
 
 
 def generate_voice_preview(
@@ -1194,6 +1211,18 @@ def create_app():
     .engine-box { padding:11px 13px; border-radius:14px; border:1px solid rgba(34,211,238,.18); background:rgba(34,211,238,.055); color:#bae6fd; font-size:12px; margin-bottom:10px; }
     .voice-note { padding:10px 12px; border-radius:12px; background:rgba(139,92,246,.07); border:1px solid rgba(167,139,250,.16); color:#c4b5fd; font-size:11px; line-height:1.55; margin:4px 0 10px; }
     .clone-note { padding:10px 12px; border-radius:12px; background:rgba(245,158,11,.07); border:1px solid rgba(245,158,11,.18); color:#fde68a; font-size:11px; line-height:1.55; }
+    .voice-engine-shell { padding:12px; border-radius:16px; border:1px solid rgba(34,211,238,.16); background:linear-gradient(135deg,rgba(34,211,238,.045),rgba(139,92,246,.045)); margin-top:8px; }
+    .clone-always-card { margin-top:12px !important; padding:14px !important; border:1px solid rgba(245,158,11,.22) !important; border-radius:18px !important; background:linear-gradient(180deg,rgba(65,39,12,.26),rgba(23,18,34,.56)) !important; }
+    .clone-title-row { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; }
+    .clone-title { color:#fff7d6; font-size:14px; font-weight:900; }
+    .clone-ready-pill { border:1px solid rgba(52,211,153,.25); background:rgba(52,211,153,.09); color:#a7f3d0; border-radius:999px; padding:5px 9px; font-size:10px; font-weight:900; letter-spacing:.06em; }
+    .clone-sub { color:#d8c79b; font-size:11px; line-height:1.55; margin-bottom:10px; }
+    .ref-status { margin-top:8px; padding:9px 11px; border-radius:11px; font-size:11px; line-height:1.45; }
+    .ref-status.ok { border:1px solid rgba(52,211,153,.22); background:rgba(52,211,153,.07); color:#bbf7d0; }
+    .ref-status.warn { border:1px solid rgba(245,158,11,.22); background:rgba(245,158,11,.07); color:#fde68a; }
+    #voice-engine-radio label { border-radius:13px !important; }
+    #voice-preview-btn { border-radius:14px !important; font-weight:850 !important; }
+    #check-ref-btn { border-radius:12px !important; }
     #generate-btn { min-height:60px !important; border:0 !important; border-radius:17px !important; font-size:17px !important; font-weight:950 !important; letter-spacing:.02em; color:white !important; background:linear-gradient(100deg,#7c3aed 0%,#8b5cf6 42%,#06b6d4 100%) !important; box-shadow:0 13px 36px rgba(124,58,237,.30) !important; }
     #generate-btn:hover { transform:translateY(-1px); filter:brightness(1.06); }
     #logout-btn { border-radius:12px !important; }
@@ -1203,7 +1232,7 @@ def create_app():
     """
     theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
 
-    with gr.Blocks(css=css, theme=theme, title="⚡ YF Recap • VoxCPM2") as app:
+    with gr.Blocks(css=css, theme=theme, title="⚡ YF Recap • VoxCPM2 Full Voice Studio") as app:
         session_id_state = gr.State(lambda: str(uuid.uuid4()))
         vip_access_state = gr.State({"authenticated": False})
 
@@ -1214,7 +1243,7 @@ def create_app():
             <div class="brand-text">
               <div class="brand-kicker">NEXT UI DESIGN</div>
               <div class="brand-name">YF Recap</div>
-              <div class="brand-tag">Premium movie recap studio • VoxCPM2 Voice Clone</div>
+              <div class="brand-tag">Premium movie recap studio • External Voice Upload • VoxCPM2 Clone</div>
             </div>
           </div>
           <div class="top-badge">● FAST ENGINE ONLINE</div>
@@ -1268,59 +1297,77 @@ def create_app():
                             choices=["Thriller", "Comedy", "Dramatic", "Action/Epic", "Neutral"],
                             value="Thriller", label="Narrative Tone"
                         )
-                        voice_engine = gr.Radio(
-                            choices=[
-                                "⚡ Edge TTS • Fast",
-                                "🎨 VoxCPM2 Voice Design",
-                                "🎙️ VoxCPM2 Voice Clone",
-                            ],
-                            value="⚡ Edge TTS • Fast",
-                            label="Voice Engine",
-                        )
-
-                        with gr.Column(visible=True) as edge_voice_panel:
-                            edge_voice_select = gr.Dropdown(
-                                choices=list(EDGE_VOICES.keys()),
-                                value="👩 Myanmar Female • Nilar",
-                                label="Standard Burmese Voice",
+                        with gr.Column(elem_classes=["voice-engine-shell"]):
+                            voice_engine = gr.Radio(
+                                choices=[
+                                    "⚡ Edge TTS • Fast",
+                                    "🎨 VoxCPM2 Voice Design",
+                                    "🎙️ VoxCPM2 Voice Clone",
+                                ],
+                                value="⚡ Edge TTS • Fast",
+                                label="🎙️ Voice Engine",
+                                elem_id="voice-engine-radio",
                             )
 
-                        with gr.Column(visible=False) as voxcpm_design_panel:
-                            gr.HTML('<div class="voice-note">VoxCPM2 Voice Design • Reference အသံမလိုပါ။ Burmese narration အတွက် voice style အသစ်ကို AI ကဖန်တီးပေးမည်။</div>')
-                            voice_preset = gr.Dropdown(
-                                choices=list(VOXCPM_VOICE_PRESETS.keys()),
-                                value="🎬 Deep Male Movie Narrator",
-                                label="Voice Style",
-                            )
-                            custom_voice_description = gr.Textbox(
-                                label="Custom Voice Description",
-                                placeholder="ဥပမာ: Mature female narrator, elegant, dramatic, calm, clear Burmese pronunciation",
-                                lines=2,
-                            )
+                            with gr.Column(visible=True) as edge_voice_panel:
+                                edge_voice_select = gr.Dropdown(
+                                    choices=list(EDGE_VOICES.keys()),
+                                    value="👩 Myanmar Female • Nilar",
+                                    label="Standard Burmese Voice",
+                                )
 
-                        with gr.Column(visible=False) as voxcpm_clone_panel:
-                            gr.HTML('<div class="clone-note">🎙️ VoxCPM2 Voice Clone • ကြည်လင်သော 5–15 sec reference audio သုံးပါ။ Transcript အတိအကျ ထည့်လျှင် Ultimate Cloning mode သုံးမည်။</div>')
+                            with gr.Column(visible=False) as voxcpm_design_panel:
+                                gr.HTML('<div class="voice-note">🎨 <b>VoxCPM2 Voice Design</b> • Reference အသံမလိုပါ။ Preset သို့ Custom Voice Description နဲ့ narration voice အသစ်ဖန်တီးနိုင်ပါတယ်။</div>')
+                                voice_preset = gr.Dropdown(
+                                    choices=list(VOXCPM_VOICE_PRESETS.keys()),
+                                    value="🎬 Deep Male Movie Narrator",
+                                    label="Voice Style",
+                                )
+                                custom_voice_description = gr.Textbox(
+                                    label="Custom Voice Description",
+                                    placeholder="ဥပမာ: Mature female narrator, elegant, dramatic, calm, clear Burmese pronunciation",
+                                    lines=2,
+                                )
+
+                        # External voice upload stays visible for every engine.
+                        # It is consumed only when VoxCPM2 Voice Clone is selected.
+                        with gr.Column(visible=True, elem_classes=["clone-always-card"]) as voxcpm_clone_panel:
+                            gr.HTML("""
+                            <div class="clone-title-row">
+                              <div class="clone-title">🎙️ External Voice • VoxCPM2 Clone</div>
+                              <div class="clone-ready-pill">ALWAYS READY</div>
+                            </div>
+                            <div class="clone-sub">
+                              အပြင်က MP3/WAV အသံကို ဒီနေရာမှာ အချိန်မရွေး upload လုပ်ထားနိုင်ပါတယ်။
+                              Voice Engine ကို <b>VoxCPM2 Voice Clone</b> ရွေးထားတဲ့အခါမှ ဒီ reference အသံကို final narration အတွက် အသုံးပြုပါမယ်။
+                              5–15 sec ကြည်လင်ပြီး background music မပါတဲ့ speech ကို အကြံပြုပါတယ်။
+                            </div>
+                            """)
                             clone_reference = gr.Audio(
-                                label="Reference Voice (MP3/WAV)",
+                                label="📤 External Reference Voice • MP3 / WAV / Mic",
                                 sources=["upload", "microphone"],
                                 type="filepath",
                             )
+                            clone_check_btn = gr.Button("✓ Check Reference", variant="secondary", elem_id="check-ref-btn")
+                            clone_reference_status = gr.HTML(
+                                "<div class='ref-status warn'>Reference voice မထည့်ရသေးပါ။ MP3/WAV upload သို့ mic record လုပ်နိုင်ပါတယ်။</div>"
+                            )
                             clone_transcript = gr.Textbox(
-                                label="Reference Transcript (Optional • exact words)",
-                                placeholder="Reference audio ထဲမှာ ပြောထားတဲ့ စာသားကို အတိအကျရေးပါ။ မရေးလည်း clone လုပ်နိုင်ပါတယ်။",
+                                label="Reference Transcript • Optional",
+                                placeholder="Reference audio ထဲမှာပြောထားတဲ့ စာသားကို အတိအကျရေးပါ။ မထည့်လည်း zero-shot clone သုံးနိုင်ပါတယ်။",
                                 lines=2,
                             )
                             clone_consent = gr.Checkbox(
-                                label="အသံပိုင်ရှင်၏ ခွင့်ပြုချက်ရှိသော အသံကိုသာ Voice Clone လုပ်မည်",
+                                label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်",
                                 value=False,
                             )
 
                         desired_speed = gr.Slider(0.9, 1.6, value=1.25, step=0.05, label="Voice Pace")
-                        with gr.Accordion("VoxCPM2 Quality Settings", open=False):
+                        with gr.Accordion("⚙️ VoxCPM2 Quality Settings", open=False):
                             voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label="CFG Guidance")
                             voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Inference Steps")
                             voxcpm_seed = gr.Number(value=42, precision=0, label="Seed")
-                        voice_preview_btn = gr.Button("▶ Preview Selected Voice", variant="secondary")
+                        voice_preview_btn = gr.Button("▶ Preview Selected Voice", variant="secondary", elem_id="voice-preview-btn")
                         voice_preview_audio = gr.Audio(label="Voice Preview", interactive=False)
 
                     with gr.Column(elem_classes=["glass-card"]):
@@ -1374,7 +1421,7 @@ def create_app():
                 gr.HTML('<div class="section-cap"><span>✅</span> Final Output</div>')
                 output_video = gr.Video(label="Rendered Recap Video")
 
-            gr.HTML('<div class="footer-note">YF RECAP • FFmpeg / NVENC • VoxCPM2 Voice Design + Voice Clone</div>')
+            gr.HTML('<div class="footer-note">YF RECAP • External Voice Upload • VoxCPM2 Clone • FFmpeg / NVENC</div>')
 
         unlock_btn.click(
             unlock_vip, [vip_code_input],
@@ -1394,6 +1441,17 @@ def create_app():
             inputs=[voice_engine],
             outputs=[edge_voice_panel, voxcpm_design_panel, voxcpm_clone_panel],
         )
+        clone_check_btn.click(
+            fn=inspect_clone_reference,
+            inputs=[clone_reference],
+            outputs=[clone_reference_status],
+        )
+        clone_reference.change(
+            fn=inspect_clone_reference,
+            inputs=[clone_reference],
+            outputs=[clone_reference_status],
+        )
+
         voice_preview_btn.click(
             fn=generate_voice_preview,
             inputs=[
