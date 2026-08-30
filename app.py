@@ -1212,7 +1212,11 @@ def build_ass_subtitles(
     selected_font_family = detect_font_family(selected_font_path) if selected_font_path else ASS_FONT_FAMILY
     font_size = max(18, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.74))
     outline = max(2, int(font_size * 0.07))
-    margin_v = max(8, int(target_h * (float(sub_pos_percent) / 100.0)))
+    # sub_pos_percent now means exact subtitle CENTER Y from the top of the final frame.
+    subtitle_y_percent = max(3.0, min(97.0, float(sub_pos_percent)))
+    subtitle_x = int(target_w * 0.50)
+    subtitle_y = int(target_h * (subtitle_y_percent / 100.0))
+    margin_v = 0
 
     # Wrap each subtitle once here instead of measuring/drawing it on every video frame.
     try:
@@ -1223,7 +1227,7 @@ def build_ass_subtitles(
         pil_font = None
         draw = None
 
-    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {target_w}\nPlayResY: {target_h}\nWrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.709\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,{selected_font_family},{font_size},{ass_color(text_color)},&H000000FF,{ass_color(stroke_color)},&H66000000,-1,0,0,0,100,100,0,0,1,{outline},0,2,30,30,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
+    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {target_w}\nPlayResY: {target_h}\nWrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.709\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,{selected_font_family},{font_size},{ass_color(text_color)},&H000000FF,{ass_color(stroke_color)},&H66000000,-1,0,0,0,100,100,0,0,1,{outline},0,5,30,30,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
 
     lines = [header]
     for seg in subtitle_segments:
@@ -1234,8 +1238,9 @@ def build_ass_subtitles(
             wrapped = wrap_text_myanmar_smart(txt, pil_font, int(target_w * 0.90), draw)
             txt = r"\N".join(wrapped)
         txt = escape_ass_text(txt).replace(r"\\N", r"\N")
+        positioned_txt = rf"{{\an5\pos({subtitle_x},{subtitle_y})}}" + txt
         lines.append(
-            f"Dialogue: 0,{ass_time(seg['start'])},{ass_time(seg['end'])},Default,,0,0,0,,{txt}\n"
+            f"Dialogue: 0,{ass_time(seg['start'])},{ass_time(seg['end'])},Default,,0,0,0,,{positioned_txt}\n"
         )
 
     Path(output_path).write_text("".join(lines), encoding="utf-8-sig")
@@ -2112,7 +2117,7 @@ def create_app_legacy():
                     with gr.Row():
                         text_color_input = gr.ColorPicker(label="Text", value="#FFFF00")
                         stroke_color_input = gr.ColorPicker(label="Outline", value="#000000")
-                    sub_pos_percent = gr.Slider(0, 60, value=15, step=1, label="Bottom Position (%)")
+                    sub_pos_percent = gr.Slider(4, 96, value=82, step=1, label="Subtitle Y Position (%)")
                     subtitle_size_percent = gr.Slider(2.0, 7.0, value=3.8, step=0.1, label="Font Size (%)")
 
                 with gr.Column(elem_classes=["glass-card"]):
@@ -3011,46 +3016,52 @@ def sync_layout_editor(evt: gr.EventData):
     try:
         center = float(evt.center)
         height = float(evt.height)
-        subtitle_bottom = float(evt.subtitleBottom)
+        # Exact subtitle center Y, measured from the TOP of the preview/final frame.
+        raw_y = getattr(evt, "subtitleY", None)
+        if raw_y is None:
+            # Compatibility with older editor payloads that stored bottom margin.
+            old_bottom = float(getattr(evt, "subtitleBottom", 15.0))
+            raw_y = 100.0 - old_bottom - 3.0
+        subtitle_y = float(raw_y)
     except Exception:
-        return 78.0, 12.0, 15.0
+        return 78.0, 12.0, 82.0
     height = max(3.0, min(45.0, height))
     center = max(height/2, min(100-height/2, center))
-    subtitle_bottom = max(2.0, min(65.0, subtitle_bottom))
-    return round(center, 2), round(height, 2), round(subtitle_bottom, 2)
+    subtitle_y = max(4.0, min(96.0, subtitle_y))
+    return round(center, 2), round(height, 2), round(subtitle_y, 2)
 
 
 LAYOUT_EDITOR_TEMPLATE = r"""
 <div class="yf-layout-editor">
-  <div class="yf-layout-head"><div><b>✋ Drag Layout Editor</b><small>Purple = Blur • Yellow = Subtitle position</small></div><button type="button" class="yf-reset">Reset</button></div>
+  <div class="yf-layout-head"><div><b>✋ Drag Layout Editor</b><small>Purple = Blur • Yellow = EXACT final subtitle center</small></div><button type="button" class="yf-reset">Reset</button></div>
   <div class="yf-stage">
     <img class="yf-img" src="${value}" draggable="false">
     <div class="yf-empty">🎬 Video upload ပြီး Blur + Subtitle ကို mouse နဲ့တိုက်ရိုက်ညှိပါ</div>
     <div class="yf-blur"><i class="yf-top"></i><span>⋮⋮ DRAG BLUR ⋮⋮</span><i class="yf-bottom"></i></div>
     <div class="yf-sub"><span>SUBTITLE • DRAG UP / DOWN</span></div>
   </div>
-  <div class="yf-read"><span>Blur <b class="yc">78%</b></span><span>Height <b class="yh">12%</b></span><span>Subtitle Bottom <b class="ys">15%</b></span><em>✓ Final render synced</em></div>
+  <div class="yf-read"><span>Blur <b class="yc">78%</b></span><span>Height <b class="yh">12%</b></span><span>Subtitle Y <b class="ys">82%</b></span><em>✓ Exact final position synced</em></div>
 </div>
 """
 
 LAYOUT_EDITOR_CSS = r"""
-.yf-layout-editor{width:100%;color:#eef2ff;user-select:none}.yf-layout-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.yf-layout-head b{font-size:14px}.yf-layout-head small{display:block;color:#8896b7;margin-top:3px}.yf-reset{border:1px solid #554c88;background:#17152d;color:#ddd6fe;border-radius:10px;padding:7px 11px;cursor:pointer}.yf-stage{position:relative;overflow:hidden;min-height:280px;border-radius:18px;border:1px solid #34345e;background:#050713;touch-action:none}.yf-img{display:block;width:100%;height:auto;min-height:280px;max-height:620px;object-fit:contain;pointer-events:none}.yf-empty{position:absolute;inset:0;display:grid;place-items:center;color:#71809f;background:#090d1df0;padding:20px;text-align:center}.yf-stage.ready .yf-empty{display:none}.yf-blur{position:absolute;left:0;top:72%;height:12%;width:100%;min-height:25px;border-top:2px solid #a78bfa;border-bottom:2px solid #22d3ee;background:#7c3aed18;backdrop-filter:blur(9px);cursor:grab}.yf-blur span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#080b19d9;border:1px solid #a78bfa66;padding:6px 11px;border-radius:999px;font-size:10px;font-weight:900}.yf-blur i{position:absolute;left:50%;width:80px;height:12px;transform:translateX(-50%);cursor:ns-resize}.yf-blur i:after{content:"";position:absolute;left:18px;right:18px;top:4px;height:4px;background:white;border-radius:999px}.yf-top{top:-7px}.yf-bottom{bottom:-7px}.yf-sub{position:absolute;left:6%;right:6%;top:82%;height:34px;border:2px dashed #facc15;background:#facc1517;border-radius:10px;display:grid;place-items:center;cursor:ns-resize;box-shadow:0 0 24px #facc1518}.yf-sub span{background:#0b0d18de;color:#fde68a;padding:5px 9px;border-radius:8px;font-size:10px;font-weight:900}.yf-read{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;font-size:11px}.yf-read span,.yf-read em{padding:6px 9px;border-radius:9px;background:#0f142a;border:1px solid #25304b;font-style:normal}.yf-read em{color:#86efac}.yf-read b{color:white}@media(max-width:720px){.yf-stage,.yf-img{min-height:220px}}
+.yf-layout-editor{width:100%;color:#eef2ff;user-select:none}.yf-layout-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.yf-layout-head b{font-size:14px}.yf-layout-head small{display:block;color:#8896b7;margin-top:3px}.yf-reset{border:1px solid #554c88;background:#17152d;color:#ddd6fe;border-radius:10px;padding:7px 11px;cursor:pointer}.yf-stage{position:relative;overflow:hidden;min-height:280px;border-radius:18px;border:1px solid #34345e;background:#050713;touch-action:none}.yf-img{display:block;width:100%;height:auto;min-height:280px;max-height:620px;object-fit:contain;pointer-events:none}.yf-empty{position:absolute;inset:0;display:grid;place-items:center;color:#71809f;background:#090d1df0;padding:20px;text-align:center}.yf-stage.ready .yf-empty{display:none}.yf-blur{position:absolute;left:0;top:72%;height:12%;width:100%;min-height:25px;border-top:2px solid #a78bfa;border-bottom:2px solid #22d3ee;background:#7c3aed18;backdrop-filter:blur(9px);cursor:grab}.yf-blur span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#080b19d9;border:1px solid #a78bfa66;padding:6px 11px;border-radius:999px;font-size:10px;font-weight:900}.yf-blur i{position:absolute;left:50%;width:80px;height:12px;transform:translateX(-50%);cursor:ns-resize}.yf-blur i:after{content:"";position:absolute;left:18px;right:18px;top:4px;height:4px;background:white;border-radius:999px}.yf-top{top:-7px}.yf-bottom{bottom:-7px}.yf-sub{position:absolute;left:6%;right:6%;top:82%;transform:translateY(-50%);height:34px;border:2px dashed #facc15;background:#facc1517;border-radius:10px;display:grid;place-items:center;cursor:ns-resize;box-shadow:0 0 24px #facc1518}.yf-sub span{background:#0b0d18de;color:#fde68a;padding:5px 9px;border-radius:8px;font-size:10px;font-weight:900}.yf-read{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;font-size:11px}.yf-read span,.yf-read em{padding:6px 9px;border-radius:9px;background:#0f142a;border:1px solid #25304b;font-style:normal}.yf-read em{color:#86efac}.yf-read b{color:white}@media(max-width:720px){.yf-stage,.yf-img{min-height:220px}}
 """
 
 LAYOUT_EDITOR_JS = r"""
 const stage=element.querySelector('.yf-stage'), img=element.querySelector('.yf-img'), blur=element.querySelector('.yf-blur'), topH=element.querySelector('.yf-top'), botH=element.querySelector('.yf-bottom'), sub=element.querySelector('.yf-sub'), reset=element.querySelector('.yf-reset');
 const yc=element.querySelector('.yc'),yh=element.querySelector('.yh'),ys=element.querySelector('.ys');
-let center=78,height=12,subBottom=15,mode=null,startY=0,sc=center,sh=height,sb=subBottom;
+let center=78,height=12,subY=82,mode=null,startY=0,sc=center,sh=height,sy=subY;
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 function ready(){const ok=!!img.getAttribute('src')&&img.naturalWidth>0;stage.classList.toggle('ready',ok);return ok}
-function norm(){height=clamp(height,3,45);center=clamp(center,height/2,100-height/2);subBottom=clamp(subBottom,2,65)}
-function draw(){norm();blur.style.top=`${center-height/2}%`;blur.style.height=`${height}%`;sub.style.top=`${100-subBottom-7}%`;yc.textContent=`${center.toFixed(1)}%`;yh.textContent=`${height.toFixed(1)}%`;ys.textContent=`${subBottom.toFixed(1)}%`}
-function emit(){norm();trigger('change',{center:+center.toFixed(2),height:+height.toFixed(2),subtitleBottom:+subBottom.toFixed(2)})}
+function norm(){height=clamp(height,3,45);center=clamp(center,height/2,100-height/2);subY=clamp(subY,4,96)}
+function draw(){norm();blur.style.top=`${center-height/2}%`;blur.style.height=`${height}%`;sub.style.top=`${subY}%`;yc.textContent=`${center.toFixed(1)}%`;yh.textContent=`${height.toFixed(1)}%`;ys.textContent=`${subY.toFixed(1)}%`}
+function emit(){norm();trigger('change',{center:+center.toFixed(2),height:+height.toFixed(2),subtitleY:+subY.toFixed(2)})}
 function pct(e){const r=stage.getBoundingClientRect();return((e.clientY-r.top)/Math.max(1,r.height))*100}
-function begin(e,m){if(!ready())return;e.preventDefault();e.stopPropagation();mode=m;startY=pct(e);sc=center;sh=height;sb=subBottom;stage.setPointerCapture?.(e.pointerId)}
+function begin(e,m){if(!ready())return;e.preventDefault();e.stopPropagation();mode=m;startY=pct(e);sc=center;sh=height;sy=subY;stage.setPointerCapture?.(e.pointerId)}
 blur.addEventListener('pointerdown',e=>{if(e.target===topH||e.target===botH)return;begin(e,'move')});topH.addEventListener('pointerdown',e=>begin(e,'top'));botH.addEventListener('pointerdown',e=>begin(e,'bottom'));sub.addEventListener('pointerdown',e=>begin(e,'sub'));
-stage.addEventListener('pointermove',e=>{if(!mode)return;e.preventDefault();const d=pct(e)-startY;if(mode==='move')center=sc+d;else if(mode==='top'){const b=sc+sh/2,t=clamp(sc-sh/2+d,0,b-3);height=b-t;center=(b+t)/2}else if(mode==='bottom'){const t=sc-sh/2,b=clamp(sc+sh/2+d,t+3,100);height=b-t;center=(b+t)/2}else if(mode==='sub')subBottom=sb-d;draw()});
-function end(e){if(!mode)return;mode=null;try{stage.releasePointerCapture?.(e.pointerId)}catch(_){ }draw();emit()}stage.addEventListener('pointerup',end);stage.addEventListener('pointercancel',end);reset.addEventListener('click',e=>{e.preventDefault();center=78;height=12;subBottom=15;draw();emit()});img.addEventListener('load',()=>{ready();draw()});img.addEventListener('error',()=>stage.classList.remove('ready'));ready();draw();
+stage.addEventListener('pointermove',e=>{if(!mode)return;e.preventDefault();const d=pct(e)-startY;if(mode==='move')center=sc+d;else if(mode==='top'){const b=sc+sh/2,t=clamp(sc-sh/2+d,0,b-3);height=b-t;center=(b+t)/2}else if(mode==='bottom'){const t=sc-sh/2,b=clamp(sc+sh/2+d,t+3,100);height=b-t;center=(b+t)/2}else if(mode==='sub')subY=sy+d;draw()});
+function end(e){if(!mode)return;mode=null;try{stage.releasePointerCapture?.(e.pointerId)}catch(_){ }draw();emit()}stage.addEventListener('pointerup',end);stage.addEventListener('pointercancel',end);reset.addEventListener('click',e=>{e.preventDefault();center=78;height=12;subY=82;draw();emit()});img.addEventListener('load',()=>{ready();draw();emit()});img.addEventListener('error',()=>stage.classList.remove('ready'));ready();draw();
 """
 
 
@@ -3305,7 +3316,7 @@ def create_app():
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 10px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Server Connected';document.body.appendChild(d);})();
     """
 
-    with gr.Blocks(title="YF Recap V6.4 • Direct Download") as app:
+    with gr.Blocks(title="YF Recap V6.5 • Exact Layout Sync") as app:
         app._yf_theme=theme; app._yf_css=css; app._yf_js=connection_js
         session_id_state=gr.State(lambda:str(uuid.uuid4()))
         vip_access_state=gr.State({"authenticated":False})
@@ -3313,7 +3324,7 @@ def create_app():
 
         gr.HTML("""
         <section class='yf-hero neo-hero'>
-          <div class='neo-topline'><span class='neo-pill'>● YF ENGINE READY</span><span class='neo-version'>V6.4</span></div>
+          <div class='neo-topline'><span class='neo-pill'>● YF ENGINE READY</span><span class='neo-version'>V6.5</span></div>
           <div class='yf-brand'>
             <div class='yf-logo'>YF</div>
             <div><div class='yf-name'>YF Recap</div><div class='yf-tag'>NEO MOVIE RECAP STUDIO</div></div>
@@ -3395,7 +3406,7 @@ def create_app():
                 with gr.Column(scale=5,elem_classes=["glass-card"]):
                     gr.HTML("<div class='step-head'><span class='step-no'>4</span> Subtitle + Blur by Drag</div><div class='hint'>Mobile မှာလည်း finger နဲ့ drag/resize လုပ်နိုင်ပါတယ်။</div>")
                     layout_editor=gr.HTML(value=video_first_frame_data_uri,inputs=[video_input],html_template=LAYOUT_EDITOR_TEMPLATE,css_template=LAYOUT_EDITOR_CSS,js_on_load=LAYOUT_EDITOR_JS,apply_default_css=False,container=False)
-                    blur_y_percent=gr.Number(value=78,visible=False); blur_height_percent=gr.Number(value=12,visible=False); sub_pos_percent=gr.Number(value=15,visible=False)
+                    blur_y_percent=gr.Number(value=78,visible=False); blur_height_percent=gr.Number(value=12,visible=False); sub_pos_percent=gr.Number(value=82,visible=False)
                     with gr.Row(elem_classes=["mobile-stack"]):
                         text_color=gr.ColorPicker(label="Subtitle Text",value="#FFFF00")
                         stroke_color=gr.ColorPicker(label="Outline",value="#000000")
@@ -3463,7 +3474,7 @@ def create_app():
                 srt_file=gr.File(visible=False)
                 mp3_file=gr.File(visible=False)
                 script_file=gr.File(visible=False)
-            gr.HTML("<div class='footer-note'>YF RECAP V6.4 • DIRECT DOWNLOAD • GEMINI AUTO • EDGE FALLBACK • SOURCE-DURATION LOCK • CUSTOM FONT • ONE-CLICK • MOBILE FIRST</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.5 • EXACT PREVIEW→FINAL LAYOUT • DIRECT DOWNLOAD • GEMINI AUTO • EDGE FALLBACK • SOURCE-DURATION LOCK • CUSTOM FONT • ONE-CLICK • MOBILE FIRST</div>")
 
         unlock_btn.click(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
         vip_code_input.submit(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
