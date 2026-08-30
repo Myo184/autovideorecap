@@ -156,7 +156,53 @@ def find_myanmar_font():
     return None
 
 FONT_PATH = find_myanmar_font()
-print("🔤 Myanmar font:", FONT_PATH or "NOT FOUND - fallback default used")
+print("🔤 Default Myanmar font:", FONT_PATH or "NOT FOUND - fallback default used")
+
+# Subtitle font styles. Put these .ttf files in /content/fonts/ or /content/ on Colab.
+FONT_STYLE_FILES = {
+    "Noto Sans Myanmar (Default)": [],
+    "Myanmar Phetsot": ["Myanmar Phetsot Version 2.0 2017.ttf"],
+    "Padauk Book Bold": ["Padauk-bookbold.ttf"],
+    "Myanmar Sagar": ["Myanmar Sagar Version 2.0 2017.ttf"],
+    "Myanmar Pyu": ["Myanmar Pyu Version 2.0 2017.ttf"],
+    "Myanmar Pyu Pro": ["Myanmar Pyu Pro Version 2.0 2017.ttf"],
+}
+
+FONT_SEARCH_DIRS = [
+    "/content/fonts",
+    "/content",
+    os.path.join(os.getcwd(), "fonts"),
+    os.getcwd(),
+    "/mnt/data",  # useful in ChatGPT/container testing; harmless in Colab
+]
+
+def resolve_subtitle_font(font_style):
+    style = str(font_style or "Noto Sans Myanmar (Default)")
+    names = FONT_STYLE_FILES.get(style, [])
+    for directory in FONT_SEARCH_DIRS:
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
+    if style == "Noto Sans Myanmar (Default)":
+        return FONT_PATH
+    # If the requested custom font is missing, do not fail the render.
+    return FONT_PATH
+
+def subtitle_font_status(font_style):
+    path = resolve_subtitle_font(font_style)
+    requested = str(font_style or "Noto Sans Myanmar (Default)")
+    custom_expected = bool(FONT_STYLE_FILES.get(requested))
+    found_custom = False
+    if custom_expected and path:
+        found_custom = os.path.basename(path) in FONT_STYLE_FILES.get(requested, [])
+    if not custom_expected or found_custom:
+        label = requested
+        return f"<div class='font-ok'>✅ Font: <b>{label}</b></div>"
+    return (
+        f"<div class='font-warn'>⚠️ <b>{requested}</b> file မတွေ့သေးပါ။ "
+        "Colab <code>/content/fonts/</code> ထဲ font file ထည့်ပါ။ အခု Noto fallback သုံးမယ်။</div>"
+    )
 
 # ================================================================
 # 4) WHISPER MODEL LOADING
@@ -210,6 +256,74 @@ def wrap_text_myanmar_smart(text, font, max_width, draw):
 def draw_line(draw, position, text, font, fill_color, stroke_w, stroke_c):
     clean_text = text.replace(" ြ", "ြ").replace("ြ ", "ြ")
     draw.text(position, clean_text, font=font, fill=fill_color, stroke_width=stroke_w, stroke_fill=stroke_c)
+
+
+def _subtitle_visual_len(value):
+    """Count visible Burmese/Latin characters, ignoring combining marks, spaces and punctuation."""
+    import unicodedata
+    punctuation = set("၊။,.!?;:…—–-_'\"()[]{}")
+    count = 0
+    for ch in (value or ""):
+        if ch.isspace() or ch in punctuation:
+            continue
+        # Myanmar vowel signs / virama / medials / tone marks are combining parts
+        # of the same visible syllable and should not count as separate letters.
+        if unicodedata.combining(ch):
+            continue
+        count += 1
+    return count
+
+
+def split_subtitle_display_chunks(text, min_chars=20, max_chars=30):
+    """
+    Split narration into short, readable subtitle cards based on VISIBLE
+    characters rather than raw Unicode codepoints.  A typical card is 20-30
+    visible characters and is intended to stay on ONE LINE.
+
+    Example:
+      သူ တံခါးကို ဖြည်းဖြည်းဖွင့်လိုက်တော့
+      မထင်မှတ်ထားတဲ့အရာကို တွေ့လိုက်ရတယ်
+    becomes two separate subtitle events.
+    """
+    text = (text or "").replace(" ြ", "ြ").replace("ြ ", "ြ").strip()
+    if not text:
+        return []
+
+    try:
+        tokens = segment_myanmar_syllables(text)
+    except Exception:
+        tokens = list(text)
+    if not tokens:
+        return [text]
+
+    chunks = []
+    current = ""
+    for token in tokens:
+        proposal = current + token
+        proposal_len = _subtitle_visual_len(proposal)
+        current_len = _subtitle_visual_len(current)
+
+        # Break once the current phrase is already readable and adding the next
+        # syllable would exceed the 30-visible-character target.
+        if current.strip() and proposal_len > max_chars and current_len >= min_chars:
+            chunks.append(current.strip())
+            current = token
+        else:
+            current = proposal
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    # If the final fragment is too short, merge it only when the merged card
+    # remains reasonably compact. Otherwise leave it as its own short card.
+    if len(chunks) >= 2 and _subtitle_visual_len(chunks[-1]) < min_chars:
+        merged = chunks[-2] + chunks[-1]
+        if _subtitle_visual_len(merged) <= max_chars + 4:
+            chunks[-2] = merged.strip()
+            chunks.pop()
+
+    return [c for c in chunks if c]
+
 
 def update_preview_image(video_value, blur_y_percent, blur_height_percent, blur_strength):
     video_path = normalize_file_path(video_value)
@@ -519,8 +633,13 @@ Chronological subtitle JSON:
 # ================================================================
 # 7) TTS • EDGE + VOXCPM2 VOICE DESIGN / VOICE CLONE
 # ================================================================
-def generate_voice_sync(text, voice_id, filename, desired_tts_rate=1.15, target_duration_sec=None):
-    """Edge-TTS standard Burmese voice."""
+def generate_voice_sync(text, voice_id, filename, desired_tts_rate=1.15, target_duration_sec=None, retries=3):
+    """Edge-TTS standard Burmese voice with retry protection.
+
+    Edge's public speech endpoint occasionally returns ``NoAudioReceived`` even
+    for valid requests.  Retry a few times before the render pipeline falls
+    back to VoxCPM2 Voice Design.
+    """
     rate_percentage = int((float(desired_tts_rate) - 1.0) * 100)
     if target_duration_sec and target_duration_sec > 0:
         cps = len(text) / target_duration_sec
@@ -535,18 +654,40 @@ def generate_voice_sync(text, voice_id, filename, desired_tts_rate=1.15, target_
         communicate = edge_tts.Communicate(text, voice_id, rate=rate_str)
         await communicate.save(filename)
 
-    try:
-        asyncio.run(_async_gen())
-    except RuntimeError:
-        import threading
-        holder = {"error": None}
-        def runner():
-            try: asyncio.run(_async_gen())
-            except Exception as exc: holder["error"] = exc
-        t = threading.Thread(target=runner)
-        t.start(); t.join()
-        if holder["error"]: raise holder["error"]
+    last_error = None
+    for attempt in range(1, max(1, int(retries)) + 1):
+        try:
+            try:
+                if os.path.exists(filename):
+                    os.remove(filename)
+            except OSError:
+                pass
 
+            try:
+                asyncio.run(_async_gen())
+            except RuntimeError:
+                import threading
+                holder = {"error": None}
+                def runner():
+                    try:
+                        asyncio.run(_async_gen())
+                    except Exception as exc:
+                        holder["error"] = exc
+                t = threading.Thread(target=runner, daemon=True)
+                t.start(); t.join()
+                if holder["error"]:
+                    raise holder["error"]
+
+            if os.path.exists(filename) and os.path.getsize(filename) > 512:
+                return filename
+            raise RuntimeError("Edge TTS returned no usable audio data")
+        except Exception as exc:
+            last_error = exc
+            print(f"⚠️ Edge TTS attempt {attempt}/{retries} failed: {exc}")
+            if attempt < retries:
+                time.sleep(1.25 * attempt)
+
+    raise RuntimeError(f"Edge TTS unavailable after {retries} attempts: {last_error}")
 
 def get_voxcpm_model():
     """Lazy-load VoxCPM2 so Edge-TTS users do not consume VoxCPM VRAM."""
@@ -814,22 +955,24 @@ ASS_FONT_FAMILY = detect_font_family(FONT_PATH)
 
 def build_ass_subtitles(
     subtitle_segments, output_path, target_w, target_h,
-    subtitle_size_percent, sub_pos_percent, text_color, stroke_color
+    subtitle_size_percent, sub_pos_percent, text_color, stroke_color, font_style="Noto Sans Myanmar (Default)"
 ):
-    font_size = max(24, int(target_h * (float(subtitle_size_percent) / 100.0)))
-    outline = max(2, int(font_size * 0.085))
+    selected_font_path = resolve_subtitle_font(font_style)
+    selected_font_family = detect_font_family(selected_font_path) if selected_font_path else ASS_FONT_FAMILY
+    font_size = max(18, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.74))
+    outline = max(2, int(font_size * 0.07))
     margin_v = max(8, int(target_h * (float(sub_pos_percent) / 100.0)))
 
     # Wrap each subtitle once here instead of measuring/drawing it on every video frame.
     try:
-        pil_font = ImageFont.truetype(FONT_PATH, font_size) if FONT_PATH else ImageFont.load_default()
+        pil_font = ImageFont.truetype(selected_font_path, font_size) if selected_font_path else ImageFont.load_default()
         dummy = Image.new("RGB", (target_w, target_h), "black")
         draw = ImageDraw.Draw(dummy)
     except Exception:
         pil_font = None
         draw = None
 
-    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {target_w}\nPlayResY: {target_h}\nWrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.709\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,{ASS_FONT_FAMILY},{font_size},{ass_color(text_color)},&H000000FF,{ass_color(stroke_color)},&H66000000,-1,0,0,0,100,100,0,0,1,{outline},0,2,30,30,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
+    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {target_w}\nPlayResY: {target_h}\nWrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.709\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,{selected_font_family},{font_size},{ass_color(text_color)},&H000000FF,{ass_color(stroke_color)},&H66000000,-1,0,0,0,100,100,0,0,1,{outline},0,2,30,30,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
 
     lines = [header]
     for seg in subtitle_segments:
@@ -859,12 +1002,12 @@ def parse_ffmpeg_time(value):
         return 0.0
 
 def run_ffmpeg_with_progress(cmd, total_duration, progress, start=0.70, end=0.98, desc="🚀 Fast Rendering"):
-    """Run FFmpeg while translating -progress output into the Gradio progress bar."""
+    """Run FFmpeg while translating progress into percent + live ETA."""
     cmd = list(cmd)
-    # Place progress controls before output path (last item).
     output_path = cmd.pop()
     cmd.extend(["-progress", "pipe:1", "-nostats", output_path])
     recent = []
+    started = time.time()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, universal_newlines=True
@@ -877,9 +1020,12 @@ def run_ffmpeg_with_progress(cmd, total_duration, progress, start=0.70, end=0.98
             if len(recent) > 80:
                 recent.pop(0)
         if line.startswith("out_time="):
-            elapsed = parse_ffmpeg_time(line.split("=", 1)[1])
-            frac = min(1.0, elapsed / max(float(total_duration), 0.1))
-            progress(start + (end - start) * frac, desc=f"{desc} ({int(frac * 100)}%)")
+            elapsed_video = parse_ffmpeg_time(line.split("=", 1)[1])
+            frac = max(0.0, min(1.0, elapsed_video / max(float(total_duration), 0.1)))
+            wall_elapsed = max(0.01, time.time() - started)
+            eta = (wall_elapsed * (1.0 - frac) / frac) if frac >= 0.02 else None
+            eta_text = f" • ETA {_fmt_eta_seconds(eta)}" if eta is not None else " • ETA calculating…"
+            progress(start + (end - start) * frac, desc=f"{desc} ({int(frac * 100)}%){eta_text}")
     rc = proc.wait()
     if rc != 0:
         raise RuntimeError("FFmpeg render failed:\n" + "\n".join(recent[-20:]))
@@ -888,7 +1034,7 @@ def build_video_filter_graph(
     target_w, target_h, render_fps, total_duration,
     background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
     blur_y_percent, blur_height_percent, blur_strength,
-    ass_path, logo_input_index=None
+    ass_path, logo_input_index=None, font_style="Noto Sans Myanmar (Default)"
 ):
     fg_filters = [f"fps={render_fps}"]
     z = max(1.0, float(zoom_level))
@@ -938,7 +1084,8 @@ def build_video_filter_graph(
         current = "withlogo"
 
     ass_escaped = ffmpeg_filter_escape(ass_path)
-    font_dir = ffmpeg_filter_escape(os.path.dirname(FONT_PATH) if FONT_PATH else "/usr/share/fonts")
+    active_font_path = resolve_subtitle_font(font_style)
+    font_dir = ffmpeg_filter_escape(os.path.dirname(active_font_path) if active_font_path else "/usr/share/fonts")
     parts.append(
         f"[{current}]ass=filename='{ass_escaped}':fontsdir='{font_dir}',format=yuv420p[vout]"
     )
@@ -978,6 +1125,7 @@ def process_magic_recap_video(
     blur_strength,
     sub_pos_percent,
     subtitle_size_percent,
+    subtitle_font_style,
     desired_speed,
     render_mode,
     session_id,
@@ -1129,13 +1277,24 @@ def process_magic_recap_video(
                 continue
 
             audio_dur = max(0.1, probe_duration(audio_path, fallback=orig_dur))
-            subtitle_segments.append({
-                "start": total_adjusted_duration,
-                "end": total_adjusted_duration + audio_dur,
-                "text": mm_text,
-            })
+            display_chunks = split_subtitle_display_chunks(mm_text, min_chars=20, max_chars=30)
+            if not display_chunks:
+                display_chunks = [mm_text]
+            total_chars = max(1, sum(len(c) for c in display_chunks))
+            chunk_cursor = total_adjusted_duration
+            for chunk in display_chunks:
+                chunk_share = len(chunk) / total_chars
+                chunk_dur = max(0.65, audio_dur * chunk_share)
+                subtitle_segments.append({
+                    "start": chunk_cursor,
+                    "end": chunk_cursor + chunk_dur,
+                    "text": chunk,
+                })
+                chunk_cursor += chunk_dur
             audio_segments.append(audio_path)
             total_adjusted_duration += audio_dur
+            if subtitle_segments:
+                subtitle_segments[-1]["end"] = total_adjusted_duration
             progress(
                 0.35 + 0.18 * ((idx + 1) / total_segments),
                 desc=f"🎙️ 03/06 • {engine_label} {idx + 1}/{total_segments}",
@@ -1182,7 +1341,7 @@ def process_magic_recap_video(
         ass_path = os.path.join(work_dir, "recap_subtitles.ass")
         build_ass_subtitles(
             subtitle_segments, ass_path, target_w, target_h,
-            subtitle_size_percent, sub_pos_percent, text_color, stroke_color
+            subtitle_size_percent, sub_pos_percent, text_color, stroke_color, subtitle_font_style
         )
 
         # 6) ONE-PASS render: background + resize + mirror + blur band + logo + subtitles + audio.
@@ -1916,6 +2075,12 @@ def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_t
 
 
 def _target_seconds(choice, source_duration):
+    """Resolve requested recap duration.
+
+    The default Auto mode is adaptive to the uploaded video's duration instead
+    of forcing a fixed 1/3/5/10 minute target. Short clips keep more of the
+    story; long movies are compressed more aggressively.
+    """
     mapping = {
         "⚡ 1 Minute Short": 60,
         "🎬 3 Minute Recap": 180,
@@ -1924,7 +2089,27 @@ def _target_seconds(choice, source_duration):
     }
     if choice in mapping:
         return mapping[choice]
-    return min(max(90, source_duration * 0.20), 720)
+
+    source_duration = max(1.0, float(source_duration or 0.0))
+
+    # 🎞 Unspecified / adaptive mode — based on the uploaded source duration.
+    if source_duration <= 120:       # <= 2 min
+        target = source_duration * 0.75
+    elif source_duration <= 300:     # 2–5 min
+        target = source_duration * 0.55
+    elif source_duration <= 900:     # 5–15 min
+        target = source_duration * 0.40
+    elif source_duration <= 1800:    # 15–30 min
+        target = source_duration * 0.30
+    elif source_duration <= 3600:    # 30–60 min
+        target = source_duration * 0.24
+    elif source_duration <= 7200:    # 1–2 hours
+        target = source_duration * 0.18
+    else:                            # > 2 hours
+        target = source_duration * 0.15
+
+    # Avoid unusably short recaps and runaway Colab renders.
+    return min(max(45.0, target), 1800.0)
 
 
 def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_length,
@@ -2033,9 +2218,9 @@ SOURCE SCENES:
         )
     editor_text = "\n".join(editor_lines)
     approx_chars = sum(len(s["text"]) for s in script_segments)
-    progress(1.0, desc="✅ Script Ready — Review/Edit လုပ်နိုင်ပါပြီ")
+    progress(1.0, desc="✅ Viral Recap Script Ready")
     status = (
-        f"### ✏️ Script Ready for Review\n"
+        f"### ✅ Viral Recap Script Ready\n"
         f"**Selected scenes:** {len(script_segments)} · **Target:** ~{int(target_sec/60)} min · **Characters:** {approx_chars:,}\n\n"
         "`|` နောက်က Burmese narration ကို လိုသလိုပြင်နိုင်ပါတယ်။ Timestamp ကို မဖျက်ပါနဲ့။"
     )
@@ -2157,7 +2342,8 @@ def mix_story_audio(voice_path, original_path, bgm_path, narration_volume, origi
 def build_story_video_filter_graph(source_segments, voice_durations, target_w, target_h, render_fps,
                                    total_duration, background_fill, enable_zoom, zoom_level,
                                    mirror_flip, filter_color, blur_y_percent, blur_height_percent,
-                                   blur_strength, ass_path, logo_input_index=None):
+                                   blur_strength, ass_path, logo_input_index=None,
+                                   font_style="Noto Sans Myanmar (Default)"):
     parts, clip_labels = [], []
     for i, (seg, out_dur) in enumerate(zip(source_segments, voice_durations)):
         st, en = float(seg["start"]), float(seg["end"])
@@ -2212,7 +2398,8 @@ def build_story_video_filter_graph(source_segments, voice_durations, target_w, t
         parts.append(f"[{current}][logo]overlay=W-w-24:24:format=auto[withlogo]")
         current = "withlogo"
     ass_escaped = ffmpeg_filter_escape(ass_path)
-    font_dir = ffmpeg_filter_escape(os.path.dirname(FONT_PATH) if FONT_PATH else "/usr/share/fonts")
+    active_font_path = resolve_subtitle_font(font_style)
+    font_dir = ffmpeg_filter_escape(os.path.dirname(active_font_path) if active_font_path else "/usr/share/fonts")
     parts.append(f"[{current}]ass=filename='{ass_escaped}':fontsdir='{font_dir}',format=yuv420p[vout]")
     return ";\n".join(parts)
 
@@ -2226,7 +2413,7 @@ def render_reviewed_script_v3(
     clone_reference, clone_transcript, clone_consent,
     voxcpm_cfg, voxcpm_steps, voxcpm_seed,
     text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
-    sub_pos_percent, subtitle_size_percent, desired_speed, render_mode,
+    sub_pos_percent, subtitle_size_percent, subtitle_font_style, desired_speed, render_mode,
     session_id, vip_access_state,
     progress=gr.Progress(track_tqdm=False)
 ):
@@ -2253,14 +2440,45 @@ def render_reviewed_script_v3(
     timeline = 0.0
     total = len(script_segments)
 
-    progress(0.03, desc="🎙️ Reviewed script ကနေ narration ထုတ်နေသည်...")
+    total_started_at = time.time()
+    voice_started_at = time.time()
+    progress(0.03, desc="🎙️ Recap narration ထုတ်နေသည်... • ETA calculating…")
     for idx, seg in enumerate(script_segments):
         text = seg["text"].strip()
         src_dur = max(0.3, seg["end"] - seg["start"])
         if "Edge TTS" in str(voice_engine):
             audio = os.path.join(work_dir, f"voice_{idx:03d}.mp3")
             voice_id = EDGE_VOICES.get(edge_voice_name, "my-MM-NilarNeural")
-            generate_voice_sync(text, voice_id, audio, desired_tts_rate=desired_speed, target_duration_sec=src_dur)
+            try:
+                generate_voice_sync(
+                    text, voice_id, audio,
+                    desired_tts_rate=desired_speed,
+                    target_duration_sec=src_dur,
+                    retries=3,
+                )
+            except Exception as edge_exc:
+                # Do not abort the whole recap because Microsoft's public Edge
+                # endpoint temporarily returned NoAudioReceived.  Fall back to
+                # local VoxCPM2 Voice Design on the Colab GPU.
+                print(f"⚠️ Edge TTS unavailable — VoxCPM2 fallback: {edge_exc}")
+                audio = os.path.join(work_dir, f"voice_{idx:03d}_fallback.wav")
+                fallback_preset = (
+                    "🌸 Soft Female Storyteller"
+                    if "Female" in str(edge_voice_name) or "Nilar" in str(edge_voice_name)
+                    else "🎬 Deep Male Movie Narrator"
+                )
+                generate_voxcpm_audio(
+                    text, audio,
+                    mode="design",
+                    voice_preset=fallback_preset,
+                    custom_voice_description="",
+                    reference_wav_path=None,
+                    reference_transcript="",
+                    desired_speed=desired_speed,
+                    cfg_value=voxcpm_cfg,
+                    inference_timesteps=voxcpm_steps,
+                    seed=(int(voxcpm_seed or 42) + idx),
+                )
         else:
             audio = os.path.join(work_dir, f"voice_{idx:03d}.wav")
             generate_voxcpm_audio(
@@ -2277,9 +2495,27 @@ def render_reviewed_script_v3(
         voice_files.append(audio)
         voice_durations.append(dur)
         successful_source_segments.append({"start": float(seg["start"]), "end": float(seg["end"]), "text": text})
-        subtitle_segments.append({"start": timeline, "end": timeline + dur, "text": text})
+        display_chunks = split_subtitle_display_chunks(text, min_chars=20, max_chars=30)
+        if not display_chunks:
+            display_chunks = [text]
+        total_chars = max(1, sum(len(c) for c in display_chunks))
+        chunk_cursor = timeline
+        for chunk in display_chunks:
+            chunk_share = len(chunk) / total_chars
+            chunk_dur = max(0.65, dur * chunk_share)
+            subtitle_segments.append({"start": chunk_cursor, "end": chunk_cursor + chunk_dur, "text": chunk})
+            chunk_cursor += chunk_dur
+        # keep subtitle timeline synced to the narration audio duration exactly
         timeline += dur
-        progress(0.04 + 0.37 * ((idx + 1) / total), desc=f"🎙️ Narration {idx+1}/{total}")
+        if subtitle_segments:
+            subtitle_segments[-1]["end"] = timeline
+        completed = idx + 1
+        voice_elapsed = max(0.01, time.time() - voice_started_at)
+        voice_eta = (voice_elapsed / completed) * max(0, total - completed)
+        progress(
+            0.04 + 0.37 * (completed / total),
+            desc=f"🎙️ Narration {completed}/{total} • ETA {_fmt_eta_seconds(voice_eta)}"
+        )
 
     if not voice_files:
         raise gr.Error("Voice narration ထုတ်မရပါ။")
@@ -2317,7 +2553,7 @@ def render_reviewed_script_v3(
     render_fps = 24 if "Turbo" in str(render_mode) else 30
     ass_path = os.path.join(work_dir, "YF_Recap_Subtitles.ass")
     build_ass_subtitles(subtitle_segments, ass_path, target_w, target_h,
-                        subtitle_size_percent, sub_pos_percent, text_color, stroke_color)
+                        subtitle_size_percent, sub_pos_percent, text_color, stroke_color, subtitle_font_style)
     srt_path = write_srt_file(subtitle_segments, os.path.join(work_dir, "YF_Recap_Subtitles.srt"))
     script_path = os.path.join(work_dir, "YF_Recap_Script.txt")
     with open(script_path, "w", encoding="utf-8") as f:
@@ -2361,8 +2597,12 @@ def render_reviewed_script_v3(
 
     if not os.path.exists(out_video):
         raise RuntimeError("Final MP4 was not created.")
-    progress(1.0, desc="✅ YF Recap V3 Complete")
-    return out_video, srt_path, narration_mp3, script_path, "### ✅ Export Complete\nMP4 + SRT + MP3 + Script အားလုံးအဆင်သင့်ဖြစ်ပါပြီ။"
+    total_elapsed = time.time() - total_started_at
+    progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
+    return (
+        out_video, srt_path, narration_mp3, script_path,
+        f"### ✅ Export Complete\nMP4 + SRT + MP3 + Script အားလုံးအဆင်သင့်ဖြစ်ပါပြီ။  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+    )
 
 
 # ---- Combined manual layout editor: Blur band + Subtitle vertical position ----
@@ -2413,23 +2653,246 @@ function end(e){if(!mode)return;mode=null;try{stage.releasePointerCapture?.(e.po
 """
 
 
+
+def _fmt_eta_seconds(seconds):
+    """Human-friendly ETA formatter used in cards and progress descriptions."""
+    if seconds is None:
+        return "calculating…"
+    try:
+        seconds = max(0, int(round(float(seconds))))
+    except Exception:
+        return "calculating…"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def update_voice_engine_panels_v4(engine):
+    """Only show controls belonging to the selected voice engine."""
+    engine = str(engine or "")
+    is_edge = "Edge TTS" in engine
+    is_design = "Voice Design" in engine
+    is_clone = "Voice Clone" in engine
+    is_voxcpm = is_design or is_clone
+    return (
+        gr.update(visible=is_edge),
+        gr.update(visible=is_design),
+        gr.update(visible=is_clone),
+        gr.update(visible=is_voxcpm),
+    )
+
+
+def estimate_processing_eta(analysis_state, script_editor, voice_engine, render_mode, desired_speed, voxcpm_steps):
+    """Estimate remaining processing time before Render. It is intentionally a range."""
+    segments = parse_script_editor(script_editor)
+    if not segments:
+        return """
+        <div class='eta-card waiting'>
+          <div class='eta-icon'>⏱</div><div>
+          <b>Estimated completion time</b><span>Generate the Viral Recap Script first.</span>
+          </div>
+        </div>"""
+
+    chars = sum(len(s.get("text", "")) for s in segments)
+    pace = max(0.85, min(1.7, float(desired_speed or 1.2)))
+    # Approximate final spoken duration. This is not a promise; language and cloned voice pacing vary.
+    spoken_seconds = max(15.0, chars / (8.6 * pace))
+    count = max(1, len(segments))
+    engine = str(voice_engine or "")
+    steps = max(4.0, float(voxcpm_steps or 10))
+
+    if "Edge TTS" in engine:
+        tts_low = count * 0.45 + spoken_seconds * 0.10
+        tts_high = count * 1.25 + spoken_seconds * 0.32
+        first_load_note = ""
+    elif "Voice Clone" in engine:
+        step_factor = steps / 10.0
+        tts_low = 45 + spoken_seconds * 0.95 * step_factor
+        tts_high = 120 + spoken_seconds * 2.10 * step_factor
+        first_load_note = "First VoxCPM2 load/download can add ~2–5 min."
+    else:
+        step_factor = steps / 10.0
+        tts_low = 35 + spoken_seconds * 0.80 * step_factor
+        tts_high = 100 + spoken_seconds * 1.80 * step_factor
+        first_load_note = "First VoxCPM2 load/download can add ~2–5 min."
+
+    turbo = "Turbo" in str(render_mode or "")
+    if HAS_NVENC:
+        render_low = spoken_seconds * (0.12 if turbo else 0.18) + 15
+        render_high = spoken_seconds * (0.34 if turbo else 0.48) + 45
+    else:
+        render_low = spoken_seconds * (0.55 if turbo else 0.75) + 25
+        render_high = spoken_seconds * (1.15 if turbo else 1.45) + 75
+
+    overhead_low, overhead_high = 20, 55
+    low = tts_low + render_low + overhead_low
+    high = tts_high + render_high + overhead_high
+    # Avoid oddly narrow ranges for real-world cloud/network variation.
+    high = max(high, low * 1.35)
+    duration_text = _fmt_eta_seconds(spoken_seconds)
+    note_html = f"<small>{first_load_note}</small>" if first_load_note else ""
+    return f"""
+    <div class='eta-card ready'>
+      <div class='eta-icon'>⏱</div>
+      <div class='eta-main'>
+        <b>Estimated processing: {_fmt_eta_seconds(low)} – {_fmt_eta_seconds(high)}</b>
+        <span>Expected final recap length ~ {duration_text} • {RENDER_ENGINE_LABEL}</span>
+        {note_html}
+      </div>
+    </div>"""
+
+
+def render_start_status(analysis_state, script_editor, voice_engine, render_mode, desired_speed, voxcpm_steps):
+    estimate = estimate_processing_eta(analysis_state, script_editor, voice_engine, render_mode, desired_speed, voxcpm_steps)
+    return estimate.replace("Estimated processing:", "Rendering started • estimated:")
+
+
+
+class _ProgressSlice:
+    """Map a child task's 0..1 progress into one part of overall Auto Recap."""
+    def __init__(self, parent, start, end):
+        self.parent = parent
+        self.start = float(start)
+        self.end = float(end)
+
+    def __call__(self, value=0.0, desc=None, **kwargs):
+        try:
+            value = max(0.0, min(1.0, float(value)))
+        except Exception:
+            value = 0.0
+        mapped = self.start + (self.end - self.start) * value
+        return self.parent(mapped, desc=desc, **kwargs)
+
+
+def estimate_auto_recap_eta(video_value, recap_length, voice_engine, render_mode, voxcpm_steps):
+    """Quick ETA shown immediately after the single AUTO RECAP button is pressed."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return """<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div><b>Upload a movie first</b><span>ပြီးရင် AUTO RECAP တစ်ခုပဲနှိပ်ပါ။</span></div></div>"""
+    duration = probe_duration(video_path, fallback=300.0)
+    target = _target_seconds(recap_length, duration)
+    engine = str(voice_engine or "")
+    steps = max(4.0, float(voxcpm_steps or 10))
+    if "Edge TTS" in engine:
+        # Includes room for network retry and a possible VoxCPM2 fallback.
+        low = 45 + target * 0.55
+        high = 180 + target * 1.45
+        note = "Edge TTS မရရင် VoxCPM2 ကို auto fallback လုပ်မယ်။"
+    else:
+        factor = steps / 10.0
+        low = 70 + target * 0.85 * factor
+        high = 240 + target * 2.10 * factor
+        note = "First VoxCPM2 model load can take extra time."
+    if not HAS_NVENC:
+        low += target * 0.35
+        high += target * 0.90
+    elif "Balanced" in str(render_mode or ""):
+        low += target * 0.12
+        high += target * 0.30
+    return f"""<div class='eta-card ready'><div class='eta-icon'>⏱</div><div class='eta-main'><b>AUTO RECAP started • estimated {_fmt_eta_seconds(low)} – {_fmt_eta_seconds(high)}</b><span>Analyze → Viral Script → Voice → Render → Export ကို တစ်ခါတည်းလုပ်နေမယ်။</span><small>{note}</small></div></div>"""
+
+
+def auto_recap_pipeline_v5(
+    video_value, user_api_key, tone_style, recap_length,
+    ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
+    bgm_value, narration_volume, original_volume, bgm_volume, auto_duck_bgm,
+    mirror_flip, filter_color,
+    voice_engine, edge_voice_name, voice_preset, custom_voice_description,
+    clone_reference, clone_transcript, clone_consent,
+    voxcpm_cfg, voxcpm_steps, voxcpm_seed,
+    text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
+    sub_pos_percent, subtitle_size_percent, subtitle_font_style, desired_speed, render_mode,
+    session_id, vip_access_state,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """One user action: Analyze → script → narration → render → exports."""
+    if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        raise gr.Error("🔒 VIP Login ပြန်ဝင်ပါ။")
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        raise gr.Error("🎬 Movie / clip ကိုအရင် Upload လုပ်ပါ။")
+
+    if "Voice Clone" in str(voice_engine):
+        ref = normalize_file_path(clone_reference)
+        if not clone_consent:
+            raise gr.Error("🎙️ Voice Clone permission checkbox ကို အမှန်ခြစ်ပါ။")
+        if not ref or not os.path.exists(ref):
+            raise gr.Error("🎙️ Voice Clone အတွက် Reference MP3/WAV ထည့်ပါ။")
+
+    started = time.time()
+    progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
+
+    # Stage 1: speech / scene analysis (hidden from the user UI).
+    analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
+        video_value, vip_access_state,
+        progress=_ProgressSlice(progress, 0.01, 0.18),
+    )
+
+    # Stage 2: viral storytelling script (hidden from the user UI).
+    script_text, _script_summary = generate_recap_script_v3(
+        analysis, user_api_key, tone_style, recap_length,
+        progress=_ProgressSlice(progress, 0.18, 0.34),
+    )
+
+    # Stage 3: voice + scene render + exports.
+    result = render_reviewed_script_v3(
+        analysis, script_text,
+        ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
+        bgm_value, narration_volume, original_volume, bgm_volume, auto_duck_bgm,
+        mirror_flip, filter_color,
+        voice_engine, edge_voice_name, voice_preset, custom_voice_description,
+        clone_reference, clone_transcript, clone_consent,
+        voxcpm_cfg, voxcpm_steps, voxcpm_seed,
+        text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
+        sub_pos_percent, subtitle_size_percent, subtitle_font_style, desired_speed, render_mode,
+        session_id, vip_access_state,
+        progress=_ProgressSlice(progress, 0.34, 1.0),
+    )
+    out_video, srt_path, mp3_path, script_path, _old_status = result
+    elapsed = time.time() - started
+    status = (
+        "### ✅ AUTO RECAP COMPLETE\n"
+        "Analyze + Viral Script + Narration + Render + Export အားလုံးပြီးပါပြီ။  \n"
+        f"**Total time:** {_fmt_eta_seconds(elapsed)}"
+    )
+    return out_video, srt_path, mp3_path, script_path, status
+
+
 def create_app():
     css = r"""
     :root{--bg:#050713;--panel:#0e1429;--panel2:#111a35;--line:#29345a;--violet:#8b5cf6;--cyan:#22d3ee;--gold:#facc15;--text:#f8fafc;--muted:#8f9abb;--green:#34d399}
-    body,.gradio-container{background:radial-gradient(circle at 10% 0,#172554 0,transparent 28%),radial-gradient(circle at 92% 3%,#3b1768 0,transparent 26%),linear-gradient(180deg,#090d1d,#050713)!important}.gradio-container{max-width:1360px!important;margin:auto!important;color:var(--text)!important}.yf-hero{padding:26px 28px;border:1px solid #38436b;border-radius:26px;background:linear-gradient(135deg,#161f43f2,#0d1228f5);box-shadow:0 22px 70px #0006;margin:8px 0 18px}.yf-brand{display:flex;align-items:center;gap:14px}.yf-logo{width:62px;height:62px;border-radius:20px;display:grid;place-items:center;font-size:24px;font-weight:950;background:linear-gradient(135deg,#7c3aed,#06b6d4);box-shadow:0 12px 35px #22d3ee2c}.yf-name{font-size:27px;font-weight:950}.yf-tag{font-size:12px;color:var(--muted)}.yf-flow{display:flex;gap:7px;flex-wrap:wrap;margin-top:18px}.yf-flow span{padding:7px 9px;border:1px solid #2b365b;background:#080d20b8;border-radius:10px;font-size:10px;font-weight:800;color:#c7d2fe}.glass-card{border:1px solid #263252!important;background:linear-gradient(180deg,#121a35eb,#0a1025f2)!important;border-radius:20px!important;padding:16px!important;box-shadow:0 13px 40px #0003}.step-head{display:flex;align-items:center;gap:9px;font-weight:950;margin-bottom:10px}.step-no{width:28px;height:28px;display:grid;place-items:center;border-radius:9px;background:#7c3aed2b;border:1px solid #8b5cf655;color:#ddd6fe}.hint{font-size:11px;color:#8492b3;line-height:1.5}.login-shell-pro{max-width:620px;margin:26px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:26px!important}.login-head{text-align:center;font-size:24px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:12px;margin:6px 0 15px}.member-strip{padding:12px 15px;border:1px solid #34d39945;background:#34d3990d;border-radius:15px;margin-bottom:10px}.member-name{font-weight:900}.member-small{font-size:10px;color:#7dd3fc}.quota-badge{font-size:10px;color:#fde68a}.clone-always-card{border:1px solid #7c3aed48!important;border-radius:16px!important;padding:12px!important;background:#7c3aed0b!important}#analyze-btn,#script-btn,#render-btn{min-height:52px!important;border:0!important;border-radius:14px!important;font-weight:950!important}#analyze-btn{background:linear-gradient(90deg,#2563eb,#06b6d4)!important}#script-btn{background:linear-gradient(90deg,#7c3aed,#a855f7)!important}#render-btn{background:linear-gradient(90deg,#7c3aed,#06b6d4)!important;min-height:60px!important;font-size:17px!important}.export-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.footer-note{text-align:center;color:#5f6d8d;font-size:10px;padding:18px}@media(max-width:800px){.export-grid{grid-template-columns:1fr 1fr}.yf-hero{padding:20px 17px}}
+    html,body{overflow-x:hidden!important;background:#050713!important}*{box-sizing:border-box}
+    body,.gradio-container{background:radial-gradient(circle at 10% 0,#172554 0,transparent 28%),radial-gradient(circle at 92% 3%,#3b1768 0,transparent 26%),linear-gradient(180deg,#090d1d,#050713)!important}
+    .gradio-container{width:100%!important;max-width:1360px!important;margin:auto!important;color:var(--text)!important;padding-left:14px!important;padding-right:14px!important}
+    .yf-hero{padding:26px 28px;border:1px solid #38436b;border-radius:26px;background:linear-gradient(135deg,#161f43f2,#0d1228f5);box-shadow:0 22px 70px #0006;margin:8px 0 18px;overflow:hidden}.yf-brand{display:flex;align-items:center;gap:14px;min-width:0}.yf-logo{flex:0 0 62px;width:62px;height:62px;border-radius:20px;display:grid;place-items:center;font-size:24px;font-weight:950;background:linear-gradient(135deg,#7c3aed,#06b6d4);box-shadow:0 12px 35px #22d3ee2c}.yf-name{font-size:27px;font-weight:950}.yf-tag{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.yf-flow{display:flex;gap:7px;flex-wrap:wrap;margin-top:18px}.yf-flow span{padding:7px 9px;border:1px solid #2b365b;background:#080d20b8;border-radius:10px;font-size:10px;font-weight:800;color:#c7d2fe}
+    .glass-card{border:1px solid #263252!important;background:linear-gradient(180deg,#121a35eb,#0a1025f2)!important;border-radius:20px!important;padding:16px!important;box-shadow:0 13px 40px #0003;min-width:0!important}.step-head{display:flex;align-items:center;gap:9px;font-weight:950;margin-bottom:10px}.step-no{flex:0 0 28px;width:28px;height:28px;display:grid;place-items:center;border-radius:9px;background:#7c3aed2b;border:1px solid #8b5cf655;color:#ddd6fe}.hint{font-size:11px;color:#8492b3;line-height:1.5}.login-shell-pro{max-width:620px;margin:26px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:26px!important}.login-head{text-align:center;font-size:24px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:12px;margin:6px 0 15px}.member-strip{padding:12px 15px;border:1px solid #34d39945;background:#34d3990d;border-radius:15px;margin-bottom:10px}.member-name{font-weight:900}.member-small{font-size:10px;color:#7dd3fc}.quota-badge{font-size:10px;color:#fde68a}
+    .font-ok,.font-warn{font-size:11px;line-height:1.45;padding:8px 10px;border-radius:10px;margin-top:6px}.font-ok{color:#a7f3d0;background:#34d39912;border:1px solid #34d39935}.font-warn{color:#fde68a;background:#f59e0b12;border:1px solid #f59e0b35}.font-warn code{color:#e0e7ff}
+    .engine-panel{border:1px solid #334268!important;background:#0a1229aa!important;border-radius:16px!important;padding:12px!important;margin-top:8px!important}.clone-panel{border-color:#8b5cf65c!important;background:linear-gradient(180deg,#3a1d6a26,#0a1229d9)!important}.clone-title{font-weight:950;color:#ddd6fe;margin-bottom:4px}.clone-copy{font-size:11px;color:#9aa6c4;line-height:1.5;margin-bottom:9px}.quality-panel{margin-top:8px!important}
+    .eta-card{display:flex;align-items:center;gap:12px;width:100%;padding:13px 15px;border-radius:16px;margin:10px 0 12px}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:38px;height:38px;flex:0 0 38px;border-radius:12px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33;font-size:18px}.eta-main,.eta-card>div:last-child{min-width:0}.eta-card b{display:block;color:#f8fafc;font-size:13px}.eta-card span{display:block;color:#9fb0cd;font-size:11px;margin-top:3px;line-height:1.45}.eta-card small{display:block;color:#facc15;font-size:10px;margin-top:4px}
+    #auto-recap-btn{min-height:66px!important;border:0!important;border-radius:16px!important;font-weight:950!important;font-size:18px!important;background:linear-gradient(90deg,#7c3aed,#2563eb,#06b6d4)!important;box-shadow:0 14px 34px #7c3aed44!important}.footer-note{text-align:center;color:#5f6d8d;font-size:10px;padding:18px}
+    .mobile-stack,.mobile-controls{min-width:0!important}.export-row{min-width:0!important}
+    input,textarea,select{max-width:100%!important}
+    @media(max-width:860px){
+      .gradio-container{padding-left:8px!important;padding-right:8px!important}.yf-hero{padding:18px 14px;border-radius:19px;margin-top:4px}.yf-logo{width:52px;height:52px;flex-basis:52px;border-radius:16px;font-size:20px}.yf-name{font-size:22px}.yf-tag{font-size:10px}.yf-flow{flex-wrap:nowrap;overflow-x:auto;padding-bottom:5px;-webkit-overflow-scrolling:touch;scrollbar-width:none}.yf-flow::-webkit-scrollbar{display:none}.yf-flow span{white-space:nowrap;flex:0 0 auto}.glass-card{padding:12px!important;border-radius:16px!important}.mobile-stack{display:flex!important;flex-direction:column!important;gap:10px!important}.mobile-stack>*{width:100%!important;max-width:100%!important;min-width:0!important}.mobile-controls{display:flex!important;flex-direction:column!important}.mobile-controls>*{width:100%!important;min-width:0!important}.step-head{font-size:14px}.hint{font-size:10px}.login-shell-pro{margin:14px auto!important}.login-card-pro{padding:18px 14px!important}.login-head{font-size:21px}.eta-card{padding:11px 12px}.eta-card b{font-size:12px}.eta-card span{font-size:10px}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.export-row{display:flex!important;flex-direction:column!important}.export-row>*{width:100%!important;min-width:0!important}#auto-recap-btn{position:sticky!important;bottom:10px!important;z-index:80!important;margin:8px 0 12px!important;box-shadow:0 12px 38px #000a,0 0 26px #7c3aed55!important}.gradio-container video{max-height:52vh!important}.footer-note{padding-bottom:74px}#yf-conn{right:8px!important;bottom:82px!important}
+    }
+    @media(max-width:430px){.gradio-container{padding-left:5px!important;padding-right:5px!important}.yf-brand{gap:10px}.yf-logo{width:46px;height:46px;flex-basis:46px}.yf-name{font-size:20px}.glass-card{padding:10px!important}.eta-icon{width:34px;height:34px;flex-basis:34px}.step-no{width:26px;height:26px;flex-basis:26px}}
     """
     theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
     connection_js = r"""
-    (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 10px Arial';d.textContent='● YF Cloud Connected';document.body.appendChild(d);})();
+    (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 10px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Cloud Connected';document.body.appendChild(d);})();
     """
 
-    with gr.Blocks(title="YF Recap V3 • Story Studio") as app:
+    with gr.Blocks(title="YF Recap V5 • One-Click Mobile Studio") as app:
         app._yf_theme=theme; app._yf_css=css; app._yf_js=connection_js
         session_id_state=gr.State(lambda:str(uuid.uuid4()))
         vip_access_state=gr.State({"authenticated":False})
         analysis_state=gr.State({})
 
-        gr.HTML("""<section class='yf-hero'><div class='yf-brand'><div class='yf-logo'>YF</div><div><div class='yf-name'>YF Recap V3</div><div class='yf-tag'>Story Studio • Review before render • VoxCPM2 • Scene-aligned export</div></div></div><div class='yf-flow'><span>1 Upload</span><span>2 Analyze Scenes</span><span>3 Viral Script</span><span>4 Review/Edit</span><span>5 Voice</span><span>6 Drag Layout</span><span>7 Audio Mixer</span><span>8 Fast Render</span><span>9 Export</span></div></section>""")
+        gr.HTML("""<section class='yf-hero'><div class='yf-brand'><div class='yf-logo'>YF</div><div><div class='yf-name'>YF Recap</div><div class='yf-tag'>Mobile Studio • VoxCPM2 Clone • Fast Dual-Link Render</div></div></div><div class='yf-flow'><span>1 Upload</span><span>2 Style</span><span>3 Voice</span><span>4 Drag Layout</span><span>5 Audio</span><span>6 AUTO RECAP</span><span>7 Export</span></div></section>""")
 
         with gr.Column(visible=True,elem_classes=["login-shell-pro"]) as login_panel:
             with gr.Column(elem_classes=["login-card-pro"]):
@@ -2439,129 +2902,146 @@ def create_app():
                 login_status=gr.HTML()
 
         with gr.Column(visible=False) as main_panel:
-            with gr.Row():
+            with gr.Row(elem_classes=["mobile-stack"]):
                 with gr.Column(scale=9): member_status_html=gr.HTML()
                 with gr.Column(scale=1,min_width=100): logout_btn=gr.Button("Logout")
 
-            # STEP 1 + 2
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=7,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>1</span> Upload Movie</div>")
-                    video_input=gr.Video(label="Original Movie / Clip",sources=["upload"])
-                    analyze_btn=gr.Button("🧠 ANALYZE MOVIE & SCENES",variant="primary",elem_id="analyze-btn")
-                with gr.Column(scale=5,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>2</span> Analyze Scenes</div><div class='hint'>Whisper speech timing ကိုသုံးပြီး narrative scene blocks ခွဲပေးပါတယ်။ Full visual re-decode မလုပ်လို့ Colab မှာ ပိုမြန်ပါတယ်။</div>")
-                    analysis_status=gr.Markdown("Movie upload ပြီး Analyze ကိုနှိပ်ပါ။")
-                    scene_table=gr.Dataframe(headers=["Scene","Start","End","Speech / Context"],datatype=["number","str","str","str"],interactive=False,wrap=True,value=[])
+            with gr.Column(elem_classes=["glass-card"]):
+                gr.HTML("<div class='step-head'><span class='step-no'>1</span> Upload Movie</div><div class='hint'>Movie / clip ကို upload လုပ်ပြီး settings ချိန်ပါ။ နောက်ဆုံး AUTO RECAP တစ်ခုပဲနှိပ်ရပါမယ်။</div>")
+                video_input=gr.Video(label="Original Movie / Clip",sources=["upload"])
 
-            # STEP 3 + 4
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=4,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>3</span> Generate Viral Recap Script</div>")
+            analysis_status=gr.Markdown(visible=False)
+            scene_table=gr.Dataframe(headers=["Scene","Start","End","Speech / Context"],datatype=["number","str","str","str"],interactive=False,wrap=True,value=[],visible=False)
+
+            with gr.Column(elem_classes=["glass-card"]):
+                gr.HTML("<div class='step-head'><span class='step-no'>2</span> Recap Style</div><div class='hint'>AI က Analyze + Viral Story Script ကို AUTO RECAP နှိပ်တဲ့အခါ backend မှာ အလိုအလျောက်လုပ်ပေးမယ်။</div>")
+                with gr.Row(elem_classes=["mobile-stack"]):
                     user_api_key=gr.Textbox(label="Gemini API Key",type="password",placeholder="Best storytelling quality အတွက်ထည့်ပါ")
                     tone_style=gr.Dropdown(choices=["Viral Story Recap","Thriller","Comedy","Dramatic","Action/Epic","Neutral"],value="Viral Story Recap",label="Narrative Tone")
-                    recap_length=gr.Dropdown(choices=["⚡ 1 Minute Short","🎬 3 Minute Recap","🔥 5 Minute Recap","🍿 10 Minute Recap","🧠 Auto Smart Length"],value="🔥 5 Minute Recap",label="Target Recap Length")
-                    script_btn=gr.Button("✨ GENERATE VIRAL RECAP SCRIPT",variant="primary",elem_id="script-btn")
-                    script_status=gr.Markdown()
-                with gr.Column(scale=8,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>4</span> User Review / Edit Script</div><div class='hint'>`|` နောက်က Burmese narration ကို ပြင်ပါ။ `[start --> end]` timestamp ကို မဖျက်ပါနဲ့ — final scene alignment အတွက်သုံးပါတယ်။</div>")
-                    script_editor=gr.Textbox(label="Editable Recap Script",lines=18,placeholder="#001 [0.00 --> 12.20] | ဒီနေရာမှာ recap narration ပေါ်လာပါမယ်...")
+                    recap_length=gr.Dropdown(
+                        choices=[
+                            "🎞 မသတ်မှတ် (Video အလိုက် Auto)",
+                            "⚡ 1 Minute Short",
+                            "🎬 3 Minute Recap",
+                            "🔥 5 Minute Recap",
+                            "🍿 10 Minute Recap",
+                        ],
+                        value="🎞 မသတ်မှတ် (Video အလိုက် Auto)",
+                        label="Target Recap Length",
+                        info="မသတ်မှတ်ကိုရွေးထားရင် upload လုပ်တဲ့ video အရှည်အလိုက် recap duration ကို YF Recap က အလိုအလျောက်ဆုံးဖြတ်ပါမယ်။",
+                    )
+            script_editor=gr.Textbox(visible=False)
 
-            # STEP 5 voice
-            with gr.Row(equal_height=False):
+            with gr.Row(equal_height=False,elem_classes=["mobile-stack"]):
                 with gr.Column(scale=7,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Choose Voice / VoxCPM2 Clone</div>")
+                    gr.HTML("<div class='step-head'><span class='step-no'>3</span> Choose Voice</div><div class='hint'>ရွေးထားတဲ့ Voice Engine နဲ့သက်ဆိုင်တဲ့ controls ပဲပေါ်ပါမယ်။</div>")
                     voice_engine=gr.Radio(choices=["⚡ Edge TTS • Fast","🎨 VoxCPM2 Voice Design","🎙️ VoxCPM2 Voice Clone"],value="⚡ Edge TTS • Fast",label="Voice Engine")
-                    with gr.Row():
+
+                    with gr.Column(visible=True,elem_classes=["engine-panel"]) as edge_voice_panel:
+                        gr.Markdown("**⚡ Edge TTS — Fast Burmese Voice**")
                         edge_voice_select=gr.Dropdown(choices=list(EDGE_VOICES.keys()),value="👩 Myanmar Female • Nilar",label="Edge Voice")
-                        voice_preset=gr.Dropdown(choices=list(VOXCPM_VOICE_PRESETS.keys()),value="🎬 Deep Male Movie Narrator",label="VoxCPM2 Voice Style")
-                    custom_voice_description=gr.Textbox(label="Custom Voice Description",lines=2)
-                    with gr.Column(elem_classes=["clone-always-card"]):
-                        gr.Markdown("**🎙 External Reference Voice — always visible** · MP3/WAV upload သို့ microphone record လုပ်နိုင်ပါတယ်။")
-                        clone_reference=gr.Audio(label="Reference Voice",sources=["upload","microphone"],type="filepath")
-                        clone_reference_status=gr.HTML("<div>Reference voice မထည့်ရသေးပါ။</div>")
-                        clone_check_btn=gr.Button("✓ Check Reference")
-                        clone_transcript=gr.Textbox(label="Reference Transcript (Optional)",lines=2)
+
+                    with gr.Column(visible=False,elem_classes=["engine-panel"]) as voxcpm_design_panel:
+                        gr.Markdown("**🎨 VoxCPM2 Voice Design**")
+                        voice_preset=gr.Dropdown(choices=list(VOXCPM_VOICE_PRESETS.keys()),value="🎬 Deep Male Movie Narrator",label="Voice Style")
+                        custom_voice_description=gr.Textbox(label="Custom Voice Description",lines=2,placeholder="ဥပမာ: deep cinematic Burmese male narrator, calm but suspenseful")
+
+                    with gr.Column(visible=False,elem_classes=["engine-panel","clone-panel"]) as voxcpm_clone_panel:
+                        gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>Voice Clone ကိုရွေးမှသာ ဒီ Reference Voice / Transcript / Permission controls ပေါ်ပါမယ်။ 5–15 sec ကြည်လင်တဲ့ reference ကိုအကြံပြုပါတယ်။</div>")
+                        clone_reference=gr.Audio(label="Reference Voice • MP3/WAV",sources=["upload","microphone"],type="filepath")
+                        clone_reference_status=gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
+                        clone_transcript=gr.Textbox(label="Reference Transcript (Optional)",lines=2,placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                         clone_consent=gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
+
                     desired_speed=gr.Slider(0.9,1.6,value=1.22,step=.05,label="Voice Pace")
-                    with gr.Accordion("VoxCPM2 Quality",open=False):
-                        voxcpm_cfg=gr.Slider(1.0,3.0,value=2.0,step=.1,label="CFG")
-                        voxcpm_steps=gr.Slider(4,20,value=10,step=1,label="Steps")
-                        voxcpm_seed=gr.Number(value=42,precision=0,label="Seed")
-                    voice_preview_btn=gr.Button("▶ VOICE PREVIEW")
-                    voice_preview_audio=gr.Audio(label="Preview",interactive=False)
+                    with gr.Column(visible=False,elem_classes=["quality-panel"]) as voxcpm_quality_panel:
+                        with gr.Accordion("⚙️ VoxCPM2 Quality",open=False):
+                            voxcpm_cfg=gr.Slider(1.0,3.0,value=2.0,step=.1,label="CFG")
+                            voxcpm_steps=gr.Slider(4,20,value=10,step=1,label="Steps")
+                            voxcpm_seed=gr.Number(value=42,precision=0,label="Seed")
+
                 with gr.Column(scale=5,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>6</span> Subtitle + Blur by Drag</div>")
+                    gr.HTML("<div class='step-head'><span class='step-no'>4</span> Subtitle + Blur by Drag</div><div class='hint'>Mobile မှာလည်း finger နဲ့ drag/resize လုပ်နိုင်ပါတယ်။</div>")
                     layout_editor=gr.HTML(value=video_first_frame_data_uri,inputs=[video_input],html_template=LAYOUT_EDITOR_TEMPLATE,css_template=LAYOUT_EDITOR_CSS,js_on_load=LAYOUT_EDITOR_JS,apply_default_css=False,container=False)
                     blur_y_percent=gr.Number(value=78,visible=False); blur_height_percent=gr.Number(value=12,visible=False); sub_pos_percent=gr.Number(value=15,visible=False)
-                    with gr.Row():
+                    with gr.Row(elem_classes=["mobile-stack"]):
                         text_color=gr.ColorPicker(label="Subtitle Text",value="#FFFF00")
                         stroke_color=gr.ColorPicker(label="Outline",value="#000000")
-                    with gr.Row():
-                        subtitle_size=gr.Slider(2.0,7.0,value=3.8,step=.1,label="Font Size")
+                    with gr.Row(elem_classes=["mobile-stack"]):
+                        subtitle_size=gr.Slider(1.6,4.0,value=2.5,step=.1,label="Font Size (Compact)")
+                        subtitle_font_style=gr.Dropdown(
+                            choices=list(FONT_STYLE_FILES.keys()),
+                            value="Noto Sans Myanmar (Default)",
+                            label="Subtitle Font Style",
+                        )
                         blur_strength=gr.Slider(5,151,value=51,step=2,label="Blur Strength")
+                    font_style_status=gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
 
-            # STEP 7 mixer + visual options
-            with gr.Row(equal_height=False):
+            with gr.Row(equal_height=False,elem_classes=["mobile-stack"]):
                 with gr.Column(scale=6,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>7</span> Original Audio + BGM Mixer</div>")
+                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Original Audio + BGM Mixer</div>")
                     bgm_file=gr.Audio(label="Background Music",type="filepath")
                     narration_vol=gr.Slider(0,150,value=100,step=1,label="Narration Volume %")
                     original_vol=gr.Slider(0,60,value=10,step=1,label="Original Movie Audio %")
                     bgm_vol=gr.Slider(0,50,value=12,step=1,label="BGM Volume %")
                     auto_duck=gr.Checkbox(label="Auto Duck BGM while Narrator speaks",value=True)
                 with gr.Column(scale=6,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>8</span> Fast Render Settings</div>")
-                    with gr.Row():
+                    gr.HTML("<div class='step-head'><span class='step-no'>6</span> Fast Render Settings</div>")
+                    with gr.Row(elem_classes=["mobile-stack"]):
                         ratio_select=gr.Dropdown(choices=["9:16 (TikTok/Reels)","16:9 (Landscape)"],value="9:16 (TikTok/Reels)",label="Output Ratio")
                         render_mode=gr.Radio(choices=["⚡ Turbo 24 FPS (Recommended)","🎬 Balanced 30 FPS"],value="⚡ Turbo 24 FPS (Recommended)",label="Render Mode")
                     background_fill=gr.Radio(choices=["Blur Background","Black Background"],value="Blur Background",label="Background")
-                    with gr.Row():
+                    with gr.Row(elem_classes=["mobile-stack"]):
                         logo_file=gr.File(label="YF / Brand Logo PNG",file_types=["image"])
                         filter_color=gr.Dropdown(choices=["None","Chrome Cool","Warm Cinema"],value="None",label="Color Look")
-                    with gr.Row():
-                        enable_zoom=gr.Checkbox(label="Zoom & Crop",value=False)
-                        zoom_level=gr.Slider(1.0,3.0,value=1.0,step=.1,label="Zoom")
-                        mirror_flip=gr.Checkbox(label="Mirror Flip",value=False)
+                    enable_zoom=gr.Checkbox(label="Zoom & Crop",value=False)
+                    zoom_level=gr.Slider(1.0,3.0,value=1.0,step=.1,label="Zoom")
+                    mirror_flip=gr.Checkbox(label="Mirror Flip",value=False)
 
-            render_btn=gr.Button("⚡ RENDER REVIEWED YF RECAP",variant="primary",elem_id="render-btn")
+            eta_card=gr.HTML("<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div><b>Ready for one-click recap</b><span>Movie + settings အဆင်သင့်ဖြစ်ရင် AUTO RECAP တစ်ခုပဲနှိပ်ပါ။</span></div></div>")
+            auto_recap_btn=gr.Button("✨ AUTO RECAP — GENERATE VIDEO",variant="primary",elem_id="auto-recap-btn")
             render_status=gr.Markdown()
 
-            # STEP 9 exports
             with gr.Column(elem_classes=["glass-card"]):
-                gr.HTML("<div class='step-head'><span class='step-no'>9</span> MP4 + SRT + MP3 + Script</div>")
+                gr.HTML("<div class='step-head'><span class='step-no'>7</span> Export</div>")
                 final_video=gr.Video(label="Final YF Recap")
-                with gr.Row():
+                with gr.Row(elem_classes=["export-row"]):
                     srt_file=gr.File(label="SRT Subtitle")
                     mp3_file=gr.File(label="Narration MP3")
-                    script_file=gr.File(label="Reviewed Script")
-            gr.HTML("<div class='footer-note'>YF RECAP V3 • Story-first workflow • Review before Render • VoxCPM2 • Scene-aligned video • Cloudflare</div>")
+                    script_file=gr.File(label="Recap Script")
+            gr.HTML("<div class='footer-note'>YF RECAP V5.5 • FONT STYLES • ADAPTIVE AUTO LENGTH • 20-30 VISIBLE-CHAR ONE-LINE SUBTITLES • SMALLER SUBTITLES • ONE-CLICK AUTO RECAP • Voice Auto-Fallback • Mobile UI • Dual Links</div>")
 
         unlock_btn.click(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
         vip_code_input.submit(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
         logout_btn.click(logout_vip,[],[vip_access_state,login_panel,main_panel,login_status,member_status_html,vip_code_input])
 
-        analyze_btn.click(analyze_movie_v3,[video_input,vip_access_state],[analysis_state,analysis_status,scene_table])
-        script_btn.click(generate_recap_script_v3,[analysis_state,user_api_key,tone_style,recap_length],[script_editor,script_status])
-        clone_check_btn.click(inspect_clone_reference,[clone_reference],[clone_reference_status])
-        clone_reference.change(inspect_clone_reference,[clone_reference],[clone_reference_status])
-        voice_preview_btn.click(generate_voice_preview,[voice_engine,edge_voice_select,voice_preset,custom_voice_description,clone_reference,clone_transcript,clone_consent,desired_speed,voxcpm_cfg,voxcpm_steps,voxcpm_seed],voice_preview_audio)
+        voice_engine.change(update_voice_engine_panels_v4,[voice_engine],[edge_voice_panel,voxcpm_design_panel,voxcpm_clone_panel,voxcpm_quality_panel],queue=False,show_progress="hidden")
+        clone_reference.change(inspect_clone_reference,[clone_reference],[clone_reference_status],show_progress="hidden")
         layout_editor.change(sync_layout_editor,outputs=[blur_y_percent,blur_height_percent,sub_pos_percent],queue=False,show_progress="hidden")
 
-        render_btn.click(
-            render_reviewed_script_v3,
-            inputs=[analysis_state,script_editor,ratio_select,background_fill,enable_zoom,zoom_level,logo_file,
+        subtitle_font_style.change(subtitle_font_status,[subtitle_font_style],[font_style_status],queue=False,show_progress="hidden")
+
+        auto_evt=auto_recap_btn.click(
+            estimate_auto_recap_eta,
+            inputs=[video_input,recap_length,voice_engine,render_mode,voxcpm_steps],
+            outputs=eta_card,
+            queue=False,
+            show_progress="hidden",
+        )
+        auto_evt.then(
+            auto_recap_pipeline_v5,
+            inputs=[video_input,user_api_key,tone_style,recap_length,
+                    ratio_select,background_fill,enable_zoom,zoom_level,logo_file,
                     bgm_file,narration_vol,original_vol,bgm_vol,auto_duck,mirror_flip,filter_color,
                     voice_engine,edge_voice_select,voice_preset,custom_voice_description,clone_reference,clone_transcript,clone_consent,
                     voxcpm_cfg,voxcpm_steps,voxcpm_seed,text_color,stroke_color,blur_y_percent,blur_height_percent,blur_strength,
-                    sub_pos_percent,subtitle_size,desired_speed,render_mode,session_id_state,vip_access_state],
-            outputs=[final_video,srt_file,mp3_file,script_file,render_status]
+                    sub_pos_percent,subtitle_size,subtitle_font_style,desired_speed,render_mode,session_id_state,vip_access_state],
+            outputs=[final_video,srt_file,mp3_file,script_file,render_status],
         )
     return app
 
-
 # ================================================================
-# 11) COLAB PUBLIC LAUNCH — CLOUDFLARE (NO gradio.live)
+# 11) COLAB PUBLIC LAUNCH — DUAL LINKS (Cloudflare + gradio.live)
 # ================================================================
 # This launcher keeps the Gradio UI local (share=False) and exposes it
 # through a Cloudflare Quick Tunnel. No Gradio share link is created.
@@ -2716,14 +3196,79 @@ def start_cloudflare_tunnel(origin_url):
     )
 
 
-def launch_yf_recap_cloudflare():
-    """Run YF Recap in Colab with Cloudflare ONLY (no gradio.live, no localhost iframe)."""
+def _start_gradio_share_tunnel(demo):
+    """Create a gradio.live tunnel for the already-running local server."""
+    try:
+        import gradio.networking as gr_networking
+        import gradio.tunneling as gr_tunneling
+
+        url = gr_networking.setup_tunnel(
+            local_host="127.0.0.1",
+            local_port=PUBLIC_PORT,
+            share_token=demo.share_token,
+            share_server_address=getattr(demo, "share_server_address", None),
+            share_server_tls_certificate=getattr(demo, "share_server_tls_certificate", None),
+        )
+        tunnel_obj = gr_tunneling.CURRENT_TUNNELS[-1] if gr_tunneling.CURRENT_TUNNELS else None
+        return url, tunnel_obj, ""
+    except Exception as exc:
+        return "", None, str(exc)
+
+
+def _display_dual_links(cloudflare_url, gradio_url, cloudflare_error="", gradio_error=""):
+    """Show Cloudflare + Gradio Live links. Either one may be unavailable."""
+    try:
+        from IPython.display import clear_output, display, HTML
+        clear_output(wait=True)
+
+        def card(title, url, accent, note):
+            if url:
+                status = '<span style="color:#34d399;font-weight:800;">● ONLINE</span>'
+                link = (
+                    f'<a href="{url}" target="_blank" '
+                    f'style="font-size:17px;font-weight:900;word-break:break-all;color:{accent};">'
+                    f'{url}</a>'
+                )
+            else:
+                status = '<span style="color:#f87171;font-weight:800;">● UNAVAILABLE</span>'
+                link = (
+                    '<div style="color:#94a3b8;font-size:13px;">'
+                    'ဒီ tunnel ကို အခုမဖန်တီးနိုင်သေးပါ။ အခြား link ကိုသုံးနိုင်ပါတယ်။'
+                    '</div>'
+                )
+            return (
+                '<div style="padding:16px 18px;border:1px solid rgba(148,163,184,.22);'
+                'border-radius:16px;background:rgba(15,23,42,.84);margin:10px 0;">'
+                '<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;'
+                'margin-bottom:8px;">'
+                f'<div style="font-weight:900;color:#f8fafc;">{title}</div>{status}</div>'
+                f'{link}'
+                f'<div style="margin-top:8px;color:#94a3b8;font-size:12px;">{note}</div>'
+                '</div>'
+            )
+
+        html = (
+            '<div style="font-family:Arial,sans-serif;max-width:820px;padding:16px 0;">'
+            '<div style="font-size:22px;font-weight:950;color:#111827;margin-bottom:4px;">'
+            'YF RECAP LIVE LINKS</div>'
+            '<div style="font-size:13px;color:#64748b;margin-bottom:12px;">'
+            'တစ်ခုအဆင်မပြေရင် နောက်တစ်ခုကိုသုံးပါ။ Colab cell ကို Stop မလုပ်ပါနဲ့။</div>'
+            + card('☁️ Cloudflare Link', cloudflare_url, '#2563eb', 'Primary link • trycloudflare.com')
+            + card('🟣 Gradio Live Link', gradio_url, '#7c3aed', 'Backup link • gradio.live')
+            + '</div>'
+        )
+        display(HTML(html))
+    except Exception:
+        print("\nYF RECAP LIVE LINKS")
+        print("Cloudflare:", cloudflare_url or f"Unavailable ({cloudflare_error})")
+        print("Gradio Live:", gradio_url or f"Unavailable ({gradio_error})")
+
+
+def launch_yf_recap_dual_links():
+    """Run one local YF Recap server with Cloudflare + Gradio Live tunnels."""
     import gradio.utils as gr_utils
     import gradio.networking as gr_networking
 
-    # Gradio 6 treats Colab as a hosted notebook and may try its own
-    # gradio.live tunnel / localhost iframe. We use Cloudflare instead,
-    # so disable hosted-notebook detection only while launching locally.
     original_colab_check = gr_utils.colab_check
     original_hosted_check = gr_utils.is_hosted_notebook
     original_url_ok = gr_networking.url_ok
@@ -2749,20 +3294,20 @@ def launch_yf_recap_cloudflare():
 
     try:
         demo.queue(
-            status_update_rate=5.0,     # fewer streaming status packets through Quick Tunnel
+            status_update_rate=5.0,
             api_open=False,
             max_size=6,
             default_concurrency_limit=1,
         ).launch(
             server_name="127.0.0.1",
             server_port=PUBLIC_PORT,
-            share=False,                 # never use gradio.live
-            inline=False,                # never show Colab localhost iframe
+            share=False,
+            inline=False,
             inbrowser=False,
             debug=False,
             prevent_thread_lock=True,
             show_error=True,
-            quiet=True,                  # hide localhost/share messages
+            quiet=True,
             ssl_keyfile=None,
             ssl_certfile=None,
             theme=getattr(demo, "_yf_theme", None),
@@ -2777,58 +3322,102 @@ def launch_yf_recap_cloudflare():
         gr_utils.is_hosted_notebook = original_hosted_check
         gr_networking.url_ok = original_url_ok
 
-    # Cloudflare connects privately to this origin. Users never see it.
     local_origin = f"http://127.0.0.1:{PUBLIC_PORT}"
-
     if not _wait_for_port("127.0.0.1", PUBLIC_PORT, timeout=60):
         raise RuntimeError(
             f"YF Recap local server did not start on port {PUBLIC_PORT}. "
             "Check the Python traceback above."
         )
 
-    tunnel_process, public_url, _log_thread = start_cloudflare_tunnel(local_origin)
-
-    # After successful startup, clear Colab logs and show only the
-    # Cloudflare public link.
+    # A) Cloudflare tunnel
+    cloudflare_process = None
+    cloudflare_url = ""
+    cloudflare_error = ""
     try:
-        from IPython.display import clear_output, display, HTML
-        clear_output(wait=True)
-        html = (
-            '<div style="font-family:Arial,sans-serif;padding:18px 0;">'
-            '<div style="font-size:15px;font-weight:800;margin-bottom:8px;">YF RECAP LIVE LINK</div>'
-            f'<a href="{public_url}" target="_blank" style="font-size:18px;font-weight:800;word-break:break-all;">{public_url}</a>'
-            '</div>'
-        )
-        display(HTML(html))
-    except Exception:
-        print(public_url, flush=True)
+        cloudflare_process, cloudflare_url, _cf_log_thread = start_cloudflare_tunnel(local_origin)
+    except Exception as exc:
+        cloudflare_error = str(exc)
 
-    # Keep Gradio + Cloudflare alive without recurring output.
+    # B) Gradio share tunnel
+    gradio_url, gradio_tunnel, gradio_error = _start_gradio_share_tunnel(demo)
+
+    if not cloudflare_url and not gradio_url:
+        try:
+            demo.close()
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Cloudflare နှင့် Gradio Live tunnel နှစ်ခုလုံး မဖန်တီးနိုင်ပါ။\n"
+            f"Cloudflare: {cloudflare_error}\nGradio: {gradio_error}"
+        )
+
+    _display_dual_links(
+        cloudflare_url,
+        gradio_url,
+        cloudflare_error=cloudflare_error,
+        gradio_error=gradio_error,
+    )
+
+    last_state = None
     try:
         while True:
-            if tunnel_process.poll() is not None:
-                raise RuntimeError(
-                    f"Cloudflare tunnel disconnected (exit={tunnel_process.returncode}). "
-                    "Run this cell again to create a new Cloudflare link."
-                )
             if not _wait_for_port("127.0.0.1", PUBLIC_PORT, timeout=2):
                 raise RuntimeError(
                     "YF Recap local server stopped responding. "
                     "The Colab runtime may have restarted or run out of RAM/VRAM."
                 )
+
+            cf_alive = bool(
+                cloudflare_url
+                and cloudflare_process is not None
+                and cloudflare_process.poll() is None
+            )
+            gr_alive = bool(
+                gradio_url
+                and gradio_tunnel is not None
+                and getattr(gradio_tunnel, "proc", None) is not None
+                and gradio_tunnel.proc.poll() is None
+            )
+
+            state = (cf_alive, gr_alive)
+            if state != last_state:
+                _display_dual_links(
+                    cloudflare_url if cf_alive else "",
+                    gradio_url if gr_alive else "",
+                    cloudflare_error=(
+                        "Tunnel disconnected" if cloudflare_url and not cf_alive else cloudflare_error
+                    ),
+                    gradio_error=(
+                        "Tunnel disconnected" if gradio_url and not gr_alive else gradio_error
+                    ),
+                )
+                last_state = state
+
+            if not cf_alive and not gr_alive:
+                raise RuntimeError(
+                    "Public tunnels နှစ်ခုလုံး disconnected ဖြစ်သွားပါပြီ။ "
+                    "ဒီ Colab cell ကိုပြန် Run လုပ်ပြီး links အသစ်ထုတ်ပါ။"
+                )
+
             time.sleep(12)
+
     except KeyboardInterrupt:
         pass
     finally:
-        if tunnel_process.poll() is None:
-            tunnel_process.terminate()
+        if cloudflare_process is not None and cloudflare_process.poll() is None:
+            cloudflare_process.terminate()
+        if gradio_tunnel is not None:
+            try:
+                gradio_tunnel.kill()
+            except Exception:
+                pass
         try:
             demo.close()
         except Exception:
             pass
 
-    return public_url
+    return cloudflare_url, gradio_url
 
 
 if __name__ == "__main__":
-    launch_yf_recap_cloudflare()
+    launch_yf_recap_dual_links()
