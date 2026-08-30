@@ -1395,7 +1395,7 @@ def logout_vip():
 # ================================================================
 # 10) MAIN APP INTERFACE
 # ================================================================
-def create_app():
+def create_app_legacy():
     css = """
     :root {
       --bg-0:#050713; --bg-1:#090d1d; --panel:rgba(13,18,38,.88);
@@ -1460,9 +1460,81 @@ def create_app():
     """
     theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
 
+    # Browser-side guard for temporary Quick-Tunnel reconnects.
+    # It keeps the page warm, shows a small connection indicator, and removes only
+    # Gradio's transient reconnect toast (real app errors are left untouched).
+    connection_js = r"""
+    () => {
+      if (window.__YF_RECAP_CONNECTION_GUARD__) return;
+      window.__YF_RECAP_CONNECTION_GUARD__ = true;
+
+      const badge = document.createElement('div');
+      badge.id = 'yf-connection-badge';
+      badge.style.cssText = [
+        'position:fixed','right:14px','bottom:14px','z-index:99999',
+        'padding:7px 11px','border-radius:999px','font-size:11px','font-weight:800',
+        'font-family:Arial,sans-serif','backdrop-filter:blur(12px)',
+        'border:1px solid rgba(52,211,153,.28)','background:rgba(6,24,30,.82)',
+        'color:#a7f3d0','box-shadow:0 8px 24px rgba(0,0,0,.22)'
+      ].join(';');
+      badge.textContent = '● YF Cloud Connected';
+      document.body.appendChild(badge);
+
+      const setBadge = (ok) => {
+        if (ok) {
+          badge.textContent = '● YF Cloud Connected';
+          badge.style.color = '#a7f3d0';
+          badge.style.borderColor = 'rgba(52,211,153,.28)';
+          badge.style.background = 'rgba(6,24,30,.82)';
+        } else {
+          badge.textContent = '● Reconnecting…';
+          badge.style.color = '#fde68a';
+          badge.style.borderColor = 'rgba(245,158,11,.35)';
+          badge.style.background = 'rgba(40,25,8,.88)';
+        }
+      };
+
+      async function pingYF() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 7000);
+        try {
+          const r = await fetch(location.origin + '/', {
+            method: 'HEAD', cache: 'no-store', credentials: 'same-origin', signal: controller.signal
+          });
+          setBadge(r.ok || r.status < 500);
+        } catch (_) {
+          setBadge(false);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      // Keep the Quick Tunnel path active without hammering the server.
+      pingYF();
+      setInterval(pingYF, 20000);
+
+      // Gradio retries automatically. Hide only the temporary reconnect toast so
+      // the editor is not covered by a large error popup during a short reconnect.
+      setInterval(() => {
+        document.querySelectorAll('[role="alert"]').forEach((el) => {
+          const t = (el.innerText || '').toLowerCase();
+          if (t.includes('connection to the server was lost') && t.includes('attempting reconnection')) {
+            const buttons = el.querySelectorAll('button');
+            if (buttons.length) {
+              buttons[buttons.length - 1].click();
+            } else {
+              el.style.display = 'none';
+            }
+          }
+        });
+      }, 1200);
+    }
+    """
+
     with gr.Blocks(title="⚡ YF Recap • VoxCPM2 Full Voice Studio") as app:
         app._yf_theme = theme
         app._yf_css = css
+        app._yf_js = connection_js
         session_id_state = gr.State(lambda: str(uuid.uuid4()))
         vip_access_state = gr.State({"authenticated": False})
 
@@ -1730,6 +1802,765 @@ def create_app():
 
 
 # ================================================================
+# YF RECAP V3 — STAGED STUDIO WORKFLOW
+# Upload -> Analyze -> Script -> Voice -> Layout -> Mixer -> Render
+# ================================================================
+
+def _fmt_clock(seconds):
+    seconds = max(0.0, float(seconds or 0.0))
+    m = int(seconds // 60)
+    s = seconds - m * 60
+    return f"{m:02d}:{s:05.2f}"
+
+
+def _srt_clock(seconds):
+    seconds = max(0.0, float(seconds or 0.0))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms >= 1000:
+        s += 1; ms -= 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def group_transcript_scenes(raw_segments, max_scene_seconds=28.0, silence_gap=2.8):
+    """Fast narrative-scene grouping from Whisper timing; avoids a second full video decode."""
+    scenes, current = [], []
+    for seg in raw_segments:
+        if not current:
+            current = [seg]
+            continue
+        gap = float(seg["start"]) - float(current[-1]["end"])
+        span = float(seg["end"]) - float(current[0]["start"])
+        if gap >= silence_gap or span >= max_scene_seconds:
+            scenes.append(current)
+            current = [seg]
+        else:
+            current.append(seg)
+    if current:
+        scenes.append(current)
+
+    out = []
+    for i, items in enumerate(scenes, 1):
+        text = " ".join((x.get("text") or "").strip() for x in items).strip()
+        if not text:
+            continue
+        out.append({
+            "scene": i,
+            "start": float(items[0]["start"]),
+            "end": float(items[-1]["end"]),
+            "text": text,
+        })
+    return out
+
+
+def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_tqdm=False)):
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        raise gr.Error("🎬 Movie/Video upload လုပ်ပါ။")
+    if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        raise gr.Error("🔒 VIP Code ဖြင့် Login ဝင်ပါ။")
+
+    progress(0.08, desc="🎙️ Speech & dialogue ကို Analyze လုပ်နေသည်...")
+    segments_raw, info = whisper_model.transcribe(
+        video_path, beam_size=1, vad_filter=True, condition_on_previous_text=False
+    )
+    raw_segments = [
+        {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+        for s in segments_raw if (s.text or "").strip()
+    ]
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    duration = (frame_count / fps) if fps > 0 else (raw_segments[-1]["end"] if raw_segments else 0.0)
+
+    if not raw_segments:
+        raise gr.Error("🎙️ Video ထဲက speech/dialogue ကို ဖတ်မရပါ။ Audio ပါ/မပါ စစ်ပါ။")
+
+    progress(0.72, desc="🧠 Narrative scenes ခွဲနေသည်...")
+    scenes = group_transcript_scenes(raw_segments)
+    lang = getattr(info, "language", None) or "en"
+
+    state = {
+        "video_path": video_path,
+        "duration": float(duration),
+        "fps": float(fps),
+        "width": width,
+        "height": height,
+        "language": lang,
+        "raw_segments": raw_segments,
+        "scenes": scenes,
+        "analyzed_at": time.time(),
+    }
+
+    rows = []
+    for sc in scenes[:160]:
+        preview = sc["text"].replace("\n", " ")
+        if len(preview) > 150:
+            preview = preview[:147] + "..."
+        rows.append([sc["scene"], _fmt_clock(sc["start"]), _fmt_clock(sc["end"]), preview])
+
+    progress(1.0, desc="✅ Analyze ပြီးပါပြီ")
+    summary = (
+        f"### ✅ Movie Analysis Ready\n"
+        f"**Duration:** {_fmt_clock(duration)}  ·  **Detected Language:** `{lang}`  ·  "
+        f"**Narrative Scenes:** {len(scenes)}  ·  **Speech Chunks:** {len(raw_segments)}\n\n"
+        "အောက်က **Generate Viral Recap Script** ကိုနှိပ်ပြီး script ဖန်တီးပါ။"
+    )
+    return state, summary, rows
+
+
+def _target_seconds(choice, source_duration):
+    mapping = {
+        "⚡ 1 Minute Short": 60,
+        "🎬 3 Minute Recap": 180,
+        "🔥 5 Minute Recap": 300,
+        "🍿 10 Minute Recap": 600,
+    }
+    if choice in mapping:
+        return mapping[choice]
+    return min(max(90, source_duration * 0.20), 720)
+
+
+def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_length,
+                             progress=gr.Progress(track_tqdm=False)):
+    if not isinstance(analysis_state, dict) or not analysis_state.get("scenes"):
+        raise gr.Error("🧠 အရင်ဆုံး Analyze Movie ကိုနှိပ်ပါ။")
+
+    scenes = analysis_state["scenes"]
+    source_duration = float(analysis_state.get("duration", 0.0))
+    target_sec = _target_seconds(recap_length, source_duration)
+    progress(0.08, desc="✍️ Viral recap structure စီနေသည်...")
+
+    # Keep prompt payload bounded while retaining chronology.
+    max_scenes = 110
+    if len(scenes) > max_scenes:
+        stride = len(scenes) / max_scenes
+        selected = [scenes[min(len(scenes)-1, int(i * stride))] for i in range(max_scenes)]
+    else:
+        selected = scenes
+
+    payload = [
+        {
+            "scene": int(s["scene"]),
+            "start": round(float(s["start"]), 2),
+            "end": round(float(s["end"]), 2),
+            "source": s["text"][:1300],
+        }
+        for s in selected
+    ]
+
+    script_segments = []
+    api_key = (user_api_key or "").strip()
+    if api_key:
+        prompt = f"""
+You are editing a Burmese viral movie recap.
+Create a coherent narrator script from the chronological SOURCE SCENES below.
+
+Narrative tone: {tone_style}
+Approximate final narration target: {int(target_sec)} seconds.
+
+CRITICAL STORY RULES:
+- Retell the story like a skilled Burmese YouTube/TikTok movie recap narrator.
+- Use Hook -> clear event explanation -> tension/emotion -> natural transition -> next event.
+- Do NOT translate dialogue line by line.
+- Select important scenes; skip repetition and filler.
+- Never invent unsupported plot facts, motives, characters, objects, or endings.
+- Natural spoken Burmese; concise enough for narration.
+- Suspense phrases should be used sparingly, only when they fit.
+- Every output item MUST use start/end values that come from (or stay inside) a supplied source scene.
+- Keep chronological order.
+
+Return VALID JSON ONLY in exactly this shape:
+{{"segments":[{{"start":0.0,"end":8.2,"text":"Burmese narration"}}]}}
+No markdown and no extra keys.
+
+SOURCE SCENES:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+        try:
+            progress(0.25, desc="✨ Gemini က Viral Recap Script ရေးနေသည်...")
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config={"system_instruction": SYSTEM_INSTRUCTION, "temperature": 0.72},
+            )
+            raw = (response.text or "").strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            parsed = json.loads(raw)
+            for item in parsed.get("segments", []):
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                st = max(0.0, float(item.get("start", 0.0)))
+                en = max(st + 0.35, float(item.get("end", st + 3.0)))
+                en = min(max(en, st + 0.35), source_duration if source_duration > 0 else en)
+                script_segments.append({"start": st, "end": en, "text": text})
+        except Exception as exc:
+            print("⚠️ V3 script Gemini fallback:", exc)
+
+    if not script_segments:
+        progress(0.35, desc="📝 Backup recap script ပြင်ဆင်နေသည်...")
+        # Fallback: use the most informative chronological scenes and translate them.
+        desired_count = max(4, min(len(selected), int(target_sec / 12)))
+        if len(selected) > desired_count:
+            stride = len(selected) / desired_count
+            fallback_scenes = [selected[min(len(selected)-1, int(i * stride))] for i in range(desired_count)]
+        else:
+            fallback_scenes = selected
+        temp = [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in fallback_scenes]
+        translated = translate_segments_batch(
+            temp, api_key, source_lang=analysis_state.get("language", "en"), tone_style=tone_style
+        )
+        script_segments = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": (s.get("mm_text") or s["text"]).strip()}
+            for s in translated if (s.get("mm_text") or s.get("text"))
+        ]
+
+    # Keep clean chronology and cap pathological responses.
+    script_segments = sorted(script_segments, key=lambda x: x["start"])[:120]
+    editor_lines = []
+    for i, s in enumerate(script_segments, 1):
+        editor_lines.append(
+            f"#{i:03d} [{s['start']:.2f} --> {s['end']:.2f}] | {s['text']}"
+        )
+    editor_text = "\n".join(editor_lines)
+    approx_chars = sum(len(s["text"]) for s in script_segments)
+    progress(1.0, desc="✅ Script Ready — Review/Edit လုပ်နိုင်ပါပြီ")
+    status = (
+        f"### ✏️ Script Ready for Review\n"
+        f"**Selected scenes:** {len(script_segments)} · **Target:** ~{int(target_sec/60)} min · **Characters:** {approx_chars:,}\n\n"
+        "`|` နောက်က Burmese narration ကို လိုသလိုပြင်နိုင်ပါတယ်။ Timestamp ကို မဖျက်ပါနဲ့။"
+    )
+    return editor_text, status
+
+
+_SCRIPT_LINE_RE = re.compile(
+    r"^\s*#?\d*\s*\[\s*([0-9.]+)\s*-->\s*([0-9.]+)\s*\]\s*\|\s*(.+?)\s*$"
+)
+
+
+def parse_script_editor(text):
+    segments = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _SCRIPT_LINE_RE.match(line)
+        if not m:
+            continue
+        st, en, narration = float(m.group(1)), float(m.group(2)), m.group(3).strip()
+        if narration and en > st:
+            segments.append({"start": st, "end": en, "text": narration})
+    return segments
+
+
+def write_srt_file(subtitle_segments, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for i, s in enumerate(subtitle_segments, 1):
+            f.write(f"{i}\n{_srt_clock(s['start'])} --> {_srt_clock(s['end'])}\n{s['text']}\n\n")
+    return path
+
+
+def video_has_audio(path):
+    r = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=index", "-of", "csv=p=0", path
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    return bool((r.stdout or "").strip())
+
+
+def _atempo_filters(rate):
+    rate = max(0.05, min(20.0, float(rate)))
+    vals = []
+    while rate > 2.0:
+        vals.append(2.0); rate /= 2.0
+    while rate < 0.5:
+        vals.append(0.5); rate /= 0.5
+    vals.append(rate)
+    return ",".join(f"atempo={v:.6f}" for v in vals)
+
+
+def build_original_story_audio(video_path, source_segments, voice_durations, output_path):
+    if not video_has_audio(video_path) or not source_segments:
+        return None
+    parts, labels = [], []
+    for i, (seg, out_dur) in enumerate(zip(source_segments, voice_durations)):
+        st, en = float(seg["start"]), float(seg["end"])
+        src_dur = max(0.15, en - st)
+        target = max(0.15, float(out_dur))
+        rate = src_dur / target
+        label = f"oa{i}"
+        parts.append(
+            f"[0:a]atrim=start={st:.3f}:end={en:.3f},asetpts=PTS-STARTPTS,{_atempo_filters(rate)}[{label}]"
+        )
+        labels.append(f"[{label}]")
+    parts.append("".join(labels) + f"concat=n={len(labels)}:v=0:a=1[origstory]")
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_path,
+        "-filter_complex", ";".join(parts), "-map", "[origstory]",
+        "-c:a", "aac", "-b:a", "160k", output_path,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode == 0 and os.path.exists(output_path):
+        return output_path
+    print("⚠️ Original story audio unavailable:", r.stderr[-500:] if r.stderr else "")
+    return None
+
+
+def mix_story_audio(voice_path, original_path, bgm_path, narration_volume, original_volume,
+                    bgm_volume, auto_duck_bgm, output_path):
+    inputs = ["-i", voice_path]
+    orig_idx = None; bgm_idx = None; idx = 1
+    if original_path and os.path.exists(original_path) and float(original_volume) > 0:
+        orig_idx = idx; inputs += ["-i", original_path]; idx += 1
+    if bgm_path and os.path.exists(bgm_path) and float(bgm_volume) > 0:
+        bgm_idx = idx; inputs += ["-stream_loop", "-1", "-i", bgm_path]; idx += 1
+
+    nv = max(0.0, min(2.0, float(narration_volume) / 100.0))
+    ov = max(0.0, min(1.0, float(original_volume) / 100.0))
+    bv = max(0.0, min(1.0, float(bgm_volume) / 100.0))
+    if bgm_idx is not None and auto_duck_bgm:
+        filters = [f"[0:a]volume={nv:.4f},asplit=2[voicemix][voicesc]"]
+        mix_labels = ["[voicemix]"]
+    else:
+        filters = [f"[0:a]volume={nv:.4f}[voice]"]
+        mix_labels = ["[voice]"]
+    if orig_idx is not None:
+        filters.append(f"[{orig_idx}:a]volume={ov:.4f}[orig]")
+        mix_labels.append("[orig]")
+    if bgm_idx is not None:
+        filters.append(f"[{bgm_idx}:a]volume={bv:.4f}[bgmraw]")
+        if auto_duck_bgm:
+            filters.append("[bgmraw][voicesc]sidechaincompress=threshold=0.015:ratio=10:attack=12:release=350[bgm]")
+        else:
+            filters.append("[bgmraw]anull[bgm]")
+        mix_labels.append("[bgm]")
+    filters.append("".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=2,alimiter=limit=0.95[aout]")
+
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
+        "-filter_complex", ";".join(filters), "-map", "[aout]",
+        "-c:a", "aac", "-b:a", "192k", output_path,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError("Audio mixer failed: " + (r.stderr or "Unknown error")[-700:])
+    return output_path
+
+
+def build_story_video_filter_graph(source_segments, voice_durations, target_w, target_h, render_fps,
+                                   total_duration, background_fill, enable_zoom, zoom_level,
+                                   mirror_flip, filter_color, blur_y_percent, blur_height_percent,
+                                   blur_strength, ass_path, logo_input_index=None):
+    parts, clip_labels = [], []
+    for i, (seg, out_dur) in enumerate(zip(source_segments, voice_durations)):
+        st, en = float(seg["start"]), float(seg["end"])
+        src_dur = max(0.15, en - st)
+        out_dur = max(0.15, float(out_dur))
+        factor = out_dur / src_dur
+        label = f"clip{i}"
+        parts.append(
+            f"[0:v]trim=start={st:.3f}:end={en:.3f},setpts=(PTS-STARTPTS)*{factor:.8f},fps={render_fps}[{label}]"
+        )
+        clip_labels.append(f"[{label}]")
+    parts.append("".join(clip_labels) + f"concat=n={len(clip_labels)}:v=1:a=0[storysrc]")
+
+    z = max(1.0, float(zoom_level))
+    fg_filters = []
+    if enable_zoom and z > 1.001:
+        fg_filters.append(f"crop=iw/{z:.4f}:ih/{z:.4f}")
+    if mirror_flip:
+        fg_filters.append("hflip")
+    if filter_color == "Chrome Cool":
+        fg_filters.append("eq=brightness=0.045:contrast=1.03:saturation=0.92")
+    elif filter_color == "Warm Cinema":
+        fg_filters.append("eq=brightness=0.025:contrast=1.06:saturation=1.10")
+    fg_filters += [f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease", "setsar=1"]
+    fg_chain = ",".join(fg_filters)
+
+    if background_fill == "Blur Background":
+        parts.append("[storysrc]split=2[vbgsrc][vfgsrc]")
+        bg_w, bg_h = max(160, target_w // 4), max(160, target_h // 4)
+        parts.append(
+            f"[vbgsrc]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,crop={bg_w}:{bg_h},"
+            f"boxblur=10:1,scale={target_w}:{target_h},setsar=1[bg]"
+        )
+        parts.append(f"[vfgsrc]{fg_chain}[fg]")
+        parts.append("[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[base]")
+    else:
+        parts.append(f"color=c=0x050713:s={target_w}x{target_h}:r={render_fps}:d={total_duration:.3f}[bg]")
+        parts.append(f"[storysrc]{fg_chain}[fg]")
+        parts.append("[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[base]")
+
+    blur_h = max(8, int(target_h * (float(blur_height_percent) / 100.0)))
+    center_y = int(target_h * (float(blur_y_percent) / 100.0))
+    blur_y = max(0, min(center_y - blur_h // 2, target_h - blur_h))
+    radius = max(2, min(32, int(float(blur_strength) / 6)))
+    parts.append("[base]split=2[main][bandsrc]")
+    parts.append(f"[bandsrc]crop={target_w}:{blur_h}:0:{blur_y},boxblur={radius}:1[band]")
+    parts.append(f"[main][band]overlay=0:{blur_y}[blurred]")
+    current = "blurred"
+    if logo_input_index is not None:
+        logo_w = max(72, int(target_w * 0.16))
+        parts.append(f"[{logo_input_index}:v]scale={logo_w}:-1[logo]")
+        parts.append(f"[{current}][logo]overlay=W-w-24:24:format=auto[withlogo]")
+        current = "withlogo"
+    ass_escaped = ffmpeg_filter_escape(ass_path)
+    font_dir = ffmpeg_filter_escape(os.path.dirname(FONT_PATH) if FONT_PATH else "/usr/share/fonts")
+    parts.append(f"[{current}]ass=filename='{ass_escaped}':fontsdir='{font_dir}',format=yuv420p[vout]")
+    return ";\n".join(parts)
+
+
+def render_reviewed_script_v3(
+    analysis_state, script_editor,
+    ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
+    bgm_value, narration_volume, original_volume, bgm_volume, auto_duck_bgm,
+    mirror_flip, filter_color,
+    voice_engine, edge_voice_name, voice_preset, custom_voice_description,
+    clone_reference, clone_transcript, clone_consent,
+    voxcpm_cfg, voxcpm_steps, voxcpm_seed,
+    text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
+    sub_pos_percent, subtitle_size_percent, desired_speed, render_mode,
+    session_id, vip_access_state,
+    progress=gr.Progress(track_tqdm=False)
+):
+    if not isinstance(analysis_state, dict) or not analysis_state.get("video_path"):
+        raise gr.Error("🧠 အရင် Analyze Movie လုပ်ပါ။")
+    script_segments = parse_script_editor(script_editor)
+    if not script_segments:
+        raise gr.Error("✏️ Script Editor ထဲမှာ valid script မရှိပါ။ Generate Script ပြန်လုပ်ပါ။")
+    if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        raise gr.Error("🔒 VIP Login ပြန်ဝင်ပါ။")
+
+    video_path = analysis_state["video_path"]
+    logo_path = normalize_file_path(logo_value)
+    bgm_path = normalize_file_path(bgm_value)
+    clone_reference_path = normalize_file_path(clone_reference)
+    if "Voice Clone" in str(voice_engine):
+        if not clone_consent:
+            raise gr.Error("🎙️ Voice Clone permission checkbox ကို အမှန်ခြစ်ပါ။")
+        if not clone_reference_path or not os.path.exists(clone_reference_path):
+            raise gr.Error("🎙️ Reference MP3/WAV upload လုပ်ပါ။")
+
+    work_dir = tempfile.mkdtemp(prefix=f"yf_v3_{str(session_id)[:8]}_")
+    voice_files, subtitle_segments, voice_durations, successful_source_segments = [], [], [], []
+    timeline = 0.0
+    total = len(script_segments)
+
+    progress(0.03, desc="🎙️ Reviewed script ကနေ narration ထုတ်နေသည်...")
+    for idx, seg in enumerate(script_segments):
+        text = seg["text"].strip()
+        src_dur = max(0.3, seg["end"] - seg["start"])
+        if "Edge TTS" in str(voice_engine):
+            audio = os.path.join(work_dir, f"voice_{idx:03d}.mp3")
+            voice_id = EDGE_VOICES.get(edge_voice_name, "my-MM-NilarNeural")
+            generate_voice_sync(text, voice_id, audio, desired_tts_rate=desired_speed, target_duration_sec=src_dur)
+        else:
+            audio = os.path.join(work_dir, f"voice_{idx:03d}.wav")
+            generate_voxcpm_audio(
+                text, audio,
+                mode="clone" if "Voice Clone" in str(voice_engine) else "design",
+                voice_preset=voice_preset, custom_voice_description=custom_voice_description,
+                reference_wav_path=clone_reference_path, reference_transcript=clone_transcript,
+                desired_speed=desired_speed, cfg_value=voxcpm_cfg,
+                inference_timesteps=voxcpm_steps, seed=(int(voxcpm_seed or 42) + idx),
+            )
+        if not os.path.exists(audio) or os.path.getsize(audio) == 0:
+            continue
+        dur = max(0.15, probe_duration(audio, fallback=src_dur))
+        voice_files.append(audio)
+        voice_durations.append(dur)
+        successful_source_segments.append({"start": float(seg["start"]), "end": float(seg["end"]), "text": text})
+        subtitle_segments.append({"start": timeline, "end": timeline + dur, "text": text})
+        timeline += dur
+        progress(0.04 + 0.37 * ((idx + 1) / total), desc=f"🎙️ Narration {idx+1}/{total}")
+
+    if not voice_files:
+        raise gr.Error("Voice narration ထုတ်မရပါ။")
+    # Ensure source list matches exactly the voice clips that succeeded.
+    source_segments = successful_source_segments
+
+    concat_list = os.path.join(work_dir, "voice_concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for p in voice_files:
+            f.write("file '" + p.replace("'", "'\\''") + "'\n")
+    merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+        "-i", concat_list, "-c:a", "aac", "-b:a", "192k", merged_voice
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0 or not os.path.exists(merged_voice):
+        raise RuntimeError("Narration merge failed: " + (r.stderr or "Unknown")[-600:])
+
+    narration_mp3 = os.path.join(work_dir, "YF_Recap_Narration.mp3")
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", merged_voice,
+                    "-c:a", "libmp3lame", "-b:a", "192k", narration_mp3], check=False)
+
+    progress(0.45, desc="🎚️ Original Audio + BGM Mixer ပြင်နေသည်...")
+    original_story = None
+    if float(original_volume) > 0:
+        original_story = build_original_story_audio(
+            video_path, source_segments, voice_durations, os.path.join(work_dir, "original_story.m4a")
+        )
+    final_audio = mix_story_audio(
+        merged_voice, original_story, bgm_path, narration_volume, original_volume,
+        bgm_volume, auto_duck_bgm, os.path.join(work_dir, "final_mix.m4a")
+    )
+
+    target_w, target_h = (720, 1280) if ratio_select == "9:16 (TikTok/Reels)" else (1280, 720)
+    render_fps = 24 if "Turbo" in str(render_mode) else 30
+    ass_path = os.path.join(work_dir, "YF_Recap_Subtitles.ass")
+    build_ass_subtitles(subtitle_segments, ass_path, target_w, target_h,
+                        subtitle_size_percent, sub_pos_percent, text_color, stroke_color)
+    srt_path = write_srt_file(subtitle_segments, os.path.join(work_dir, "YF_Recap_Subtitles.srt"))
+    script_path = os.path.join(work_dir, "YF_Recap_Script.txt")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_editor.strip() + "\n")
+
+    progress(0.58, desc=f"⚡ Scene-aligned Fast Render — {RENDER_ENGINE_LABEL}")
+    input_args = ["-i", video_path]
+    logo_idx = None; next_idx = 1
+    if logo_path and os.path.exists(logo_path):
+        logo_idx = next_idx
+        input_args += ["-loop", "1", "-i", logo_path]
+        next_idx += 1
+    audio_idx = next_idx
+    input_args += ["-i", final_audio]
+
+    graph = build_story_video_filter_graph(
+        source_segments, voice_durations, target_w, target_h, render_fps, timeline,
+        background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
+        blur_y_percent, blur_height_percent, blur_strength, ass_path, logo_idx
+    )
+    graph_path = os.path.join(work_dir, "story_filters.txt")
+    Path(graph_path).write_text(graph, encoding="utf-8")
+    out_video = os.path.join(work_dir, "YF_Recap_Final.mp4")
+    base = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *input_args,
+        "-filter_complex_script", graph_path, "-map", "[vout]", "-map", f"{audio_idx}:a:0",
+        "-t", f"{timeline:.3f}", "-r", str(render_fps), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+    ]
+    if HAS_NVENC:
+        cmd = base + ["-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23", "-b:v", "0", out_video]
+        try:
+            run_ffmpeg_with_progress(cmd, timeline, progress, 0.60, 0.97, "⚡ GPU Story Render")
+        except Exception as exc:
+            print("⚠️ NVENC fallback:", exc)
+            cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
+            run_ffmpeg_with_progress(cmd, timeline, progress, 0.60, 0.97, "🚀 CPU Story Render")
+    else:
+        cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
+        run_ffmpeg_with_progress(cmd, timeline, progress, 0.60, 0.97, "🚀 CPU Story Render")
+
+    if not os.path.exists(out_video):
+        raise RuntimeError("Final MP4 was not created.")
+    progress(1.0, desc="✅ YF Recap V3 Complete")
+    return out_video, srt_path, narration_mp3, script_path, "### ✅ Export Complete\nMP4 + SRT + MP3 + Script အားလုံးအဆင်သင့်ဖြစ်ပါပြီ။"
+
+
+# ---- Combined manual layout editor: Blur band + Subtitle vertical position ----
+def sync_layout_editor(evt: gr.EventData):
+    try:
+        center = float(evt.center)
+        height = float(evt.height)
+        subtitle_bottom = float(evt.subtitleBottom)
+    except Exception:
+        return 78.0, 12.0, 15.0
+    height = max(3.0, min(45.0, height))
+    center = max(height/2, min(100-height/2, center))
+    subtitle_bottom = max(2.0, min(65.0, subtitle_bottom))
+    return round(center, 2), round(height, 2), round(subtitle_bottom, 2)
+
+
+LAYOUT_EDITOR_TEMPLATE = r"""
+<div class="yf-layout-editor">
+  <div class="yf-layout-head"><div><b>✋ Drag Layout Editor</b><small>Purple = Blur • Yellow = Subtitle position</small></div><button type="button" class="yf-reset">Reset</button></div>
+  <div class="yf-stage">
+    <img class="yf-img" src="${value}" draggable="false">
+    <div class="yf-empty">🎬 Video upload ပြီး Blur + Subtitle ကို mouse နဲ့တိုက်ရိုက်ညှိပါ</div>
+    <div class="yf-blur"><i class="yf-top"></i><span>⋮⋮ DRAG BLUR ⋮⋮</span><i class="yf-bottom"></i></div>
+    <div class="yf-sub"><span>SUBTITLE • DRAG UP / DOWN</span></div>
+  </div>
+  <div class="yf-read"><span>Blur <b class="yc">78%</b></span><span>Height <b class="yh">12%</b></span><span>Subtitle Bottom <b class="ys">15%</b></span><em>✓ Final render synced</em></div>
+</div>
+"""
+
+LAYOUT_EDITOR_CSS = r"""
+.yf-layout-editor{width:100%;color:#eef2ff;user-select:none}.yf-layout-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.yf-layout-head b{font-size:14px}.yf-layout-head small{display:block;color:#8896b7;margin-top:3px}.yf-reset{border:1px solid #554c88;background:#17152d;color:#ddd6fe;border-radius:10px;padding:7px 11px;cursor:pointer}.yf-stage{position:relative;overflow:hidden;min-height:280px;border-radius:18px;border:1px solid #34345e;background:#050713;touch-action:none}.yf-img{display:block;width:100%;height:auto;min-height:280px;max-height:620px;object-fit:contain;pointer-events:none}.yf-empty{position:absolute;inset:0;display:grid;place-items:center;color:#71809f;background:#090d1df0;padding:20px;text-align:center}.yf-stage.ready .yf-empty{display:none}.yf-blur{position:absolute;left:0;top:72%;height:12%;width:100%;min-height:25px;border-top:2px solid #a78bfa;border-bottom:2px solid #22d3ee;background:#7c3aed18;backdrop-filter:blur(9px);cursor:grab}.yf-blur span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#080b19d9;border:1px solid #a78bfa66;padding:6px 11px;border-radius:999px;font-size:10px;font-weight:900}.yf-blur i{position:absolute;left:50%;width:80px;height:12px;transform:translateX(-50%);cursor:ns-resize}.yf-blur i:after{content:"";position:absolute;left:18px;right:18px;top:4px;height:4px;background:white;border-radius:999px}.yf-top{top:-7px}.yf-bottom{bottom:-7px}.yf-sub{position:absolute;left:6%;right:6%;top:82%;height:34px;border:2px dashed #facc15;background:#facc1517;border-radius:10px;display:grid;place-items:center;cursor:ns-resize;box-shadow:0 0 24px #facc1518}.yf-sub span{background:#0b0d18de;color:#fde68a;padding:5px 9px;border-radius:8px;font-size:10px;font-weight:900}.yf-read{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;font-size:11px}.yf-read span,.yf-read em{padding:6px 9px;border-radius:9px;background:#0f142a;border:1px solid #25304b;font-style:normal}.yf-read em{color:#86efac}.yf-read b{color:white}@media(max-width:720px){.yf-stage,.yf-img{min-height:220px}}
+"""
+
+LAYOUT_EDITOR_JS = r"""
+const stage=element.querySelector('.yf-stage'), img=element.querySelector('.yf-img'), blur=element.querySelector('.yf-blur'), topH=element.querySelector('.yf-top'), botH=element.querySelector('.yf-bottom'), sub=element.querySelector('.yf-sub'), reset=element.querySelector('.yf-reset');
+const yc=element.querySelector('.yc'),yh=element.querySelector('.yh'),ys=element.querySelector('.ys');
+let center=78,height=12,subBottom=15,mode=null,startY=0,sc=center,sh=height,sb=subBottom;
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function ready(){const ok=!!img.getAttribute('src')&&img.naturalWidth>0;stage.classList.toggle('ready',ok);return ok}
+function norm(){height=clamp(height,3,45);center=clamp(center,height/2,100-height/2);subBottom=clamp(subBottom,2,65)}
+function draw(){norm();blur.style.top=`${center-height/2}%`;blur.style.height=`${height}%`;sub.style.top=`${100-subBottom-7}%`;yc.textContent=`${center.toFixed(1)}%`;yh.textContent=`${height.toFixed(1)}%`;ys.textContent=`${subBottom.toFixed(1)}%`}
+function emit(){norm();trigger('change',{center:+center.toFixed(2),height:+height.toFixed(2),subtitleBottom:+subBottom.toFixed(2)})}
+function pct(e){const r=stage.getBoundingClientRect();return((e.clientY-r.top)/Math.max(1,r.height))*100}
+function begin(e,m){if(!ready())return;e.preventDefault();e.stopPropagation();mode=m;startY=pct(e);sc=center;sh=height;sb=subBottom;stage.setPointerCapture?.(e.pointerId)}
+blur.addEventListener('pointerdown',e=>{if(e.target===topH||e.target===botH)return;begin(e,'move')});topH.addEventListener('pointerdown',e=>begin(e,'top'));botH.addEventListener('pointerdown',e=>begin(e,'bottom'));sub.addEventListener('pointerdown',e=>begin(e,'sub'));
+stage.addEventListener('pointermove',e=>{if(!mode)return;e.preventDefault();const d=pct(e)-startY;if(mode==='move')center=sc+d;else if(mode==='top'){const b=sc+sh/2,t=clamp(sc-sh/2+d,0,b-3);height=b-t;center=(b+t)/2}else if(mode==='bottom'){const t=sc-sh/2,b=clamp(sc+sh/2+d,t+3,100);height=b-t;center=(b+t)/2}else if(mode==='sub')subBottom=sb-d;draw()});
+function end(e){if(!mode)return;mode=null;try{stage.releasePointerCapture?.(e.pointerId)}catch(_){ }draw();emit()}stage.addEventListener('pointerup',end);stage.addEventListener('pointercancel',end);reset.addEventListener('click',e=>{e.preventDefault();center=78;height=12;subBottom=15;draw();emit()});img.addEventListener('load',()=>{ready();draw()});img.addEventListener('error',()=>stage.classList.remove('ready'));ready();draw();
+"""
+
+
+def create_app():
+    css = r"""
+    :root{--bg:#050713;--panel:#0e1429;--panel2:#111a35;--line:#29345a;--violet:#8b5cf6;--cyan:#22d3ee;--gold:#facc15;--text:#f8fafc;--muted:#8f9abb;--green:#34d399}
+    body,.gradio-container{background:radial-gradient(circle at 10% 0,#172554 0,transparent 28%),radial-gradient(circle at 92% 3%,#3b1768 0,transparent 26%),linear-gradient(180deg,#090d1d,#050713)!important}.gradio-container{max-width:1360px!important;margin:auto!important;color:var(--text)!important}.yf-hero{padding:26px 28px;border:1px solid #38436b;border-radius:26px;background:linear-gradient(135deg,#161f43f2,#0d1228f5);box-shadow:0 22px 70px #0006;margin:8px 0 18px}.yf-brand{display:flex;align-items:center;gap:14px}.yf-logo{width:62px;height:62px;border-radius:20px;display:grid;place-items:center;font-size:24px;font-weight:950;background:linear-gradient(135deg,#7c3aed,#06b6d4);box-shadow:0 12px 35px #22d3ee2c}.yf-name{font-size:27px;font-weight:950}.yf-tag{font-size:12px;color:var(--muted)}.yf-flow{display:flex;gap:7px;flex-wrap:wrap;margin-top:18px}.yf-flow span{padding:7px 9px;border:1px solid #2b365b;background:#080d20b8;border-radius:10px;font-size:10px;font-weight:800;color:#c7d2fe}.glass-card{border:1px solid #263252!important;background:linear-gradient(180deg,#121a35eb,#0a1025f2)!important;border-radius:20px!important;padding:16px!important;box-shadow:0 13px 40px #0003}.step-head{display:flex;align-items:center;gap:9px;font-weight:950;margin-bottom:10px}.step-no{width:28px;height:28px;display:grid;place-items:center;border-radius:9px;background:#7c3aed2b;border:1px solid #8b5cf655;color:#ddd6fe}.hint{font-size:11px;color:#8492b3;line-height:1.5}.login-shell-pro{max-width:620px;margin:26px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:26px!important}.login-head{text-align:center;font-size:24px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:12px;margin:6px 0 15px}.member-strip{padding:12px 15px;border:1px solid #34d39945;background:#34d3990d;border-radius:15px;margin-bottom:10px}.member-name{font-weight:900}.member-small{font-size:10px;color:#7dd3fc}.quota-badge{font-size:10px;color:#fde68a}.clone-always-card{border:1px solid #7c3aed48!important;border-radius:16px!important;padding:12px!important;background:#7c3aed0b!important}#analyze-btn,#script-btn,#render-btn{min-height:52px!important;border:0!important;border-radius:14px!important;font-weight:950!important}#analyze-btn{background:linear-gradient(90deg,#2563eb,#06b6d4)!important}#script-btn{background:linear-gradient(90deg,#7c3aed,#a855f7)!important}#render-btn{background:linear-gradient(90deg,#7c3aed,#06b6d4)!important;min-height:60px!important;font-size:17px!important}.export-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.footer-note{text-align:center;color:#5f6d8d;font-size:10px;padding:18px}@media(max-width:800px){.export-grid{grid-template-columns:1fr 1fr}.yf-hero{padding:20px 17px}}
+    """
+    theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
+    connection_js = r"""
+    (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 10px Arial';d.textContent='● YF Cloud Connected';document.body.appendChild(d);})();
+    """
+
+    with gr.Blocks(title="YF Recap V3 • Story Studio") as app:
+        app._yf_theme=theme; app._yf_css=css; app._yf_js=connection_js
+        session_id_state=gr.State(lambda:str(uuid.uuid4()))
+        vip_access_state=gr.State({"authenticated":False})
+        analysis_state=gr.State({})
+
+        gr.HTML("""<section class='yf-hero'><div class='yf-brand'><div class='yf-logo'>YF</div><div><div class='yf-name'>YF Recap V3</div><div class='yf-tag'>Story Studio • Review before render • VoxCPM2 • Scene-aligned export</div></div></div><div class='yf-flow'><span>1 Upload</span><span>2 Analyze Scenes</span><span>3 Viral Script</span><span>4 Review/Edit</span><span>5 Voice</span><span>6 Drag Layout</span><span>7 Audio Mixer</span><span>8 Fast Render</span><span>9 Export</span></div></section>""")
+
+        with gr.Column(visible=True,elem_classes=["login-shell-pro"]) as login_panel:
+            with gr.Column(elem_classes=["login-card-pro"]):
+                gr.HTML("<div class='login-head'>YF Recap Access</div><div class='login-copy'>Admin Portal မှ ထုတ်ထားသော Video Recap VIP Code ကို ထည့်ပါ</div>")
+                vip_code_input=gr.Textbox(label="VIP ACCESS CODE",placeholder="VIP-XXXX-XXXX-XXXX",type="password")
+                unlock_btn=gr.Button("🔓 ENTER YF RECAP",variant="primary")
+                login_status=gr.HTML()
+
+        with gr.Column(visible=False) as main_panel:
+            with gr.Row():
+                with gr.Column(scale=9): member_status_html=gr.HTML()
+                with gr.Column(scale=1,min_width=100): logout_btn=gr.Button("Logout")
+
+            # STEP 1 + 2
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=7,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>1</span> Upload Movie</div>")
+                    video_input=gr.Video(label="Original Movie / Clip",sources=["upload"])
+                    analyze_btn=gr.Button("🧠 ANALYZE MOVIE & SCENES",variant="primary",elem_id="analyze-btn")
+                with gr.Column(scale=5,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>2</span> Analyze Scenes</div><div class='hint'>Whisper speech timing ကိုသုံးပြီး narrative scene blocks ခွဲပေးပါတယ်။ Full visual re-decode မလုပ်လို့ Colab မှာ ပိုမြန်ပါတယ်။</div>")
+                    analysis_status=gr.Markdown("Movie upload ပြီး Analyze ကိုနှိပ်ပါ။")
+                    scene_table=gr.Dataframe(headers=["Scene","Start","End","Speech / Context"],datatype=["number","str","str","str"],interactive=False,wrap=True,value=[])
+
+            # STEP 3 + 4
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=4,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>3</span> Generate Viral Recap Script</div>")
+                    user_api_key=gr.Textbox(label="Gemini API Key",type="password",placeholder="Best storytelling quality အတွက်ထည့်ပါ")
+                    tone_style=gr.Dropdown(choices=["Viral Story Recap","Thriller","Comedy","Dramatic","Action/Epic","Neutral"],value="Viral Story Recap",label="Narrative Tone")
+                    recap_length=gr.Dropdown(choices=["⚡ 1 Minute Short","🎬 3 Minute Recap","🔥 5 Minute Recap","🍿 10 Minute Recap","🧠 Auto Smart Length"],value="🔥 5 Minute Recap",label="Target Recap Length")
+                    script_btn=gr.Button("✨ GENERATE VIRAL RECAP SCRIPT",variant="primary",elem_id="script-btn")
+                    script_status=gr.Markdown()
+                with gr.Column(scale=8,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>4</span> User Review / Edit Script</div><div class='hint'>`|` နောက်က Burmese narration ကို ပြင်ပါ။ `[start --> end]` timestamp ကို မဖျက်ပါနဲ့ — final scene alignment အတွက်သုံးပါတယ်။</div>")
+                    script_editor=gr.Textbox(label="Editable Recap Script",lines=18,placeholder="#001 [0.00 --> 12.20] | ဒီနေရာမှာ recap narration ပေါ်လာပါမယ်...")
+
+            # STEP 5 voice
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=7,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Choose Voice / VoxCPM2 Clone</div>")
+                    voice_engine=gr.Radio(choices=["⚡ Edge TTS • Fast","🎨 VoxCPM2 Voice Design","🎙️ VoxCPM2 Voice Clone"],value="⚡ Edge TTS • Fast",label="Voice Engine")
+                    with gr.Row():
+                        edge_voice_select=gr.Dropdown(choices=list(EDGE_VOICES.keys()),value="👩 Myanmar Female • Nilar",label="Edge Voice")
+                        voice_preset=gr.Dropdown(choices=list(VOXCPM_VOICE_PRESETS.keys()),value="🎬 Deep Male Movie Narrator",label="VoxCPM2 Voice Style")
+                    custom_voice_description=gr.Textbox(label="Custom Voice Description",lines=2)
+                    with gr.Column(elem_classes=["clone-always-card"]):
+                        gr.Markdown("**🎙 External Reference Voice — always visible** · MP3/WAV upload သို့ microphone record လုပ်နိုင်ပါတယ်။")
+                        clone_reference=gr.Audio(label="Reference Voice",sources=["upload","microphone"],type="filepath")
+                        clone_reference_status=gr.HTML("<div>Reference voice မထည့်ရသေးပါ။</div>")
+                        clone_check_btn=gr.Button("✓ Check Reference")
+                        clone_transcript=gr.Textbox(label="Reference Transcript (Optional)",lines=2)
+                        clone_consent=gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
+                    desired_speed=gr.Slider(0.9,1.6,value=1.22,step=.05,label="Voice Pace")
+                    with gr.Accordion("VoxCPM2 Quality",open=False):
+                        voxcpm_cfg=gr.Slider(1.0,3.0,value=2.0,step=.1,label="CFG")
+                        voxcpm_steps=gr.Slider(4,20,value=10,step=1,label="Steps")
+                        voxcpm_seed=gr.Number(value=42,precision=0,label="Seed")
+                    voice_preview_btn=gr.Button("▶ VOICE PREVIEW")
+                    voice_preview_audio=gr.Audio(label="Preview",interactive=False)
+                with gr.Column(scale=5,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>6</span> Subtitle + Blur by Drag</div>")
+                    layout_editor=gr.HTML(value=video_first_frame_data_uri,inputs=[video_input],html_template=LAYOUT_EDITOR_TEMPLATE,css_template=LAYOUT_EDITOR_CSS,js_on_load=LAYOUT_EDITOR_JS,apply_default_css=False,container=False)
+                    blur_y_percent=gr.Number(value=78,visible=False); blur_height_percent=gr.Number(value=12,visible=False); sub_pos_percent=gr.Number(value=15,visible=False)
+                    with gr.Row():
+                        text_color=gr.ColorPicker(label="Subtitle Text",value="#FFFF00")
+                        stroke_color=gr.ColorPicker(label="Outline",value="#000000")
+                    with gr.Row():
+                        subtitle_size=gr.Slider(2.0,7.0,value=3.8,step=.1,label="Font Size")
+                        blur_strength=gr.Slider(5,151,value=51,step=2,label="Blur Strength")
+
+            # STEP 7 mixer + visual options
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=6,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>7</span> Original Audio + BGM Mixer</div>")
+                    bgm_file=gr.Audio(label="Background Music",type="filepath")
+                    narration_vol=gr.Slider(0,150,value=100,step=1,label="Narration Volume %")
+                    original_vol=gr.Slider(0,60,value=10,step=1,label="Original Movie Audio %")
+                    bgm_vol=gr.Slider(0,50,value=12,step=1,label="BGM Volume %")
+                    auto_duck=gr.Checkbox(label="Auto Duck BGM while Narrator speaks",value=True)
+                with gr.Column(scale=6,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>8</span> Fast Render Settings</div>")
+                    with gr.Row():
+                        ratio_select=gr.Dropdown(choices=["9:16 (TikTok/Reels)","16:9 (Landscape)"],value="9:16 (TikTok/Reels)",label="Output Ratio")
+                        render_mode=gr.Radio(choices=["⚡ Turbo 24 FPS (Recommended)","🎬 Balanced 30 FPS"],value="⚡ Turbo 24 FPS (Recommended)",label="Render Mode")
+                    background_fill=gr.Radio(choices=["Blur Background","Black Background"],value="Blur Background",label="Background")
+                    with gr.Row():
+                        logo_file=gr.File(label="YF / Brand Logo PNG",file_types=["image"])
+                        filter_color=gr.Dropdown(choices=["None","Chrome Cool","Warm Cinema"],value="None",label="Color Look")
+                    with gr.Row():
+                        enable_zoom=gr.Checkbox(label="Zoom & Crop",value=False)
+                        zoom_level=gr.Slider(1.0,3.0,value=1.0,step=.1,label="Zoom")
+                        mirror_flip=gr.Checkbox(label="Mirror Flip",value=False)
+
+            render_btn=gr.Button("⚡ RENDER REVIEWED YF RECAP",variant="primary",elem_id="render-btn")
+            render_status=gr.Markdown()
+
+            # STEP 9 exports
+            with gr.Column(elem_classes=["glass-card"]):
+                gr.HTML("<div class='step-head'><span class='step-no'>9</span> MP4 + SRT + MP3 + Script</div>")
+                final_video=gr.Video(label="Final YF Recap")
+                with gr.Row():
+                    srt_file=gr.File(label="SRT Subtitle")
+                    mp3_file=gr.File(label="Narration MP3")
+                    script_file=gr.File(label="Reviewed Script")
+            gr.HTML("<div class='footer-note'>YF RECAP V3 • Story-first workflow • Review before Render • VoxCPM2 • Scene-aligned video • Cloudflare</div>")
+
+        unlock_btn.click(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
+        vip_code_input.submit(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
+        logout_btn.click(logout_vip,[],[vip_access_state,login_panel,main_panel,login_status,member_status_html,vip_code_input])
+
+        analyze_btn.click(analyze_movie_v3,[video_input,vip_access_state],[analysis_state,analysis_status,scene_table])
+        script_btn.click(generate_recap_script_v3,[analysis_state,user_api_key,tone_style,recap_length],[script_editor,script_status])
+        clone_check_btn.click(inspect_clone_reference,[clone_reference],[clone_reference_status])
+        clone_reference.change(inspect_clone_reference,[clone_reference],[clone_reference_status])
+        voice_preview_btn.click(generate_voice_preview,[voice_engine,edge_voice_select,voice_preset,custom_voice_description,clone_reference,clone_transcript,clone_consent,desired_speed,voxcpm_cfg,voxcpm_steps,voxcpm_seed],voice_preview_audio)
+        layout_editor.change(sync_layout_editor,outputs=[blur_y_percent,blur_height_percent,sub_pos_percent],queue=False,show_progress="hidden")
+
+        render_btn.click(
+            render_reviewed_script_v3,
+            inputs=[analysis_state,script_editor,ratio_select,background_fill,enable_zoom,zoom_level,logo_file,
+                    bgm_file,narration_vol,original_vol,bgm_vol,auto_duck,mirror_flip,filter_color,
+                    voice_engine,edge_voice_select,voice_preset,custom_voice_description,clone_reference,clone_transcript,clone_consent,
+                    voxcpm_cfg,voxcpm_steps,voxcpm_seed,text_color,stroke_color,blur_y_percent,blur_height_percent,blur_strength,
+                    sub_pos_percent,subtitle_size,desired_speed,render_mode,session_id_state,vip_access_state],
+            outputs=[final_video,srt_file,mp3_file,script_file,render_status]
+        )
+    return app
+
+
+# ================================================================
 # 11) COLAB PUBLIC LAUNCH — CLOUDFLARE (NO gradio.live)
 # ================================================================
 # This launcher keeps the Gradio UI local (share=False) and exposes it
@@ -1794,7 +2625,9 @@ def start_cloudflare_tunnel(origin_url):
         binary,
         "tunnel",
         "--no-autoupdate",
-        "--protocol", "http2",
+        "--protocol", "http2",      # avoid QUIC/UDP instability in Colab
+        "--edge-ip-version", "4",  # force IPv4 path
+        "--loglevel", "error",     # keep Colab output clean
         "--url", local_url,
     ]
 
@@ -1829,6 +2662,16 @@ def start_cloudflare_tunnel(origin_url):
                     url_ready.set()
 
                 lower = clean.lower()
+
+                # Quick Tunnel may cancel/reopen Gradio streaming requests.
+                # These lines are noisy but usually non-fatal, so do not flood Colab.
+                transient_cancel = (
+                    "context canceled" in lower
+                    or "failed to serve incoming request" in lower
+                )
+                if transient_cancel:
+                    continue
+
                 if " error" in lower or "err " in lower or "failed" in lower:
                     state["last_error"] = clean
                     print("Cloudflare:", clean)
@@ -1905,7 +2748,12 @@ def launch_yf_recap_cloudflare():
     demo = create_app()
 
     try:
-        demo.queue(default_concurrency_limit=1).launch(
+        demo.queue(
+            status_update_rate=5.0,     # fewer streaming status packets through Quick Tunnel
+            api_open=False,
+            max_size=6,
+            default_concurrency_limit=1,
+        ).launch(
             server_name="127.0.0.1",
             server_port=PUBLIC_PORT,
             share=False,                 # never use gradio.live
@@ -1919,6 +2767,10 @@ def launch_yf_recap_cloudflare():
             ssl_certfile=None,
             theme=getattr(demo, "_yf_theme", None),
             css=getattr(demo, "_yf_css", None),
+            js=getattr(demo, "_yf_js", None),
+            max_threads=12,
+            state_session_capacity=300,
+            pwa=True,
         )
     finally:
         gr_utils.colab_check = original_colab_check
@@ -1964,7 +2816,7 @@ def launch_yf_recap_cloudflare():
                     "YF Recap local server stopped responding. "
                     "The Colab runtime may have restarted or run out of RAM/VRAM."
                 )
-            time.sleep(5)
+            time.sleep(12)
     except KeyboardInterrupt:
         pass
     finally:
