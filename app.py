@@ -6,6 +6,10 @@
 
 import os, sys, subprocess, importlib.util, shutil
 import base64
+import socket
+import platform
+import urllib.request
+
 
 # ----------------------------------------------------------------
 # 0) AUTO INSTALL DEPENDENCIES
@@ -112,8 +116,14 @@ VOXCPM_VOICE_PRESETS = {
 MAX_SUBTITLE_DURATION_SECONDS = 7.0
 MODEL_NAME = "gemini-2.5-flash"
 SYSTEM_INSTRUCTION = (
-    "You are a professional movie recap writer. Translate and summarize movie subtitle lines "
-    "into natural, engaging, thrilling Burmese recap style. Keep sentences clear and concise for speech."
+    "You are a professional Burmese movie-recap narrator and story editor. "
+    "Do NOT translate dialogue line-by-line. Re-tell the events as a coherent narrator who already understands the scene. "
+    "Use natural spoken Burmese that sounds like a skilled YouTube/TikTok movie recap storyteller. "
+    "Follow this rhythm when appropriate: Hook -> explain what is happening -> build tension or emotion -> smooth transition -> next event. "
+    "Keep chronology and factual meaning faithful to the supplied subtitle content. Do not invent characters, motives, objects, or plot events that are not supported. "
+    "Use suspense transitions only where they fit naturally; do not repeat stock phrases in every line. "
+    "Avoid literal subtitle phrasing, stiff translation, excessive slang, and over-dramatization. "
+    "Keep each output concise enough for voice narration and synchronized recap video."
 )
 
 USER_LIMIT_TRACKER = {}
@@ -450,16 +460,39 @@ def translate_segments_batch(segments, user_api_key, source_lang="en", tone_styl
     large_prompt_text = json.dumps(payload_dict, ensure_ascii=False, indent=2)
 
     prompt = f"""
-Translate the following subtitle lines from '{source_lang}' into natural Burmese movie recap narration.
-Tone Style: {tone_style}. Keep sentences concise for speech timing.
+Rewrite the following chronological subtitle chunks from '{source_lang}' as connected Burmese MOVIE RECAP NARRATION.
+Narrative Mode: {tone_style}
 
-CRITICAL RULES:
+STORYTELLING TARGET:
+- Sound like one narrator retelling the movie, NOT actors speaking dialogue and NOT a literal translator.
+- Preserve the actual sequence and meaning of the supplied chunks.
+- Turn dialogue into narration where possible: who does what, what changes, what the viewer needs to understand next.
+- Use a strong hook or curiosity line only when the scene supports it.
+- Build suspense/emotion gradually, then use a short natural transition into the next event.
+- Examples of transition style (use sparingly, not repeatedly):
+  “ဒါပေမယ့် သူမသိသေးတာတစ်ခုရှိနေပါတယ်…”
+  “အဲဒီအချိန်မှာပဲ မထင်မှတ်ထားတဲ့အရာတစ်ခု ဖြစ်လာပါတယ်…”
+  “ဒီဖြစ်ရပ်က နောက်ထပ်ပြဿနာကြီးတစ်ခုရဲ့ အစပဲဖြစ်ပါတယ်…”
+- Do not invent unsupported plot details. If the subtitle context is uncertain, narrate conservatively.
+- Avoid repeating names/pronouns unnecessarily.
+- Keep Burmese natural, spoken, clear, and engaging for AI voiceover.
+- Keep each value reasonably concise so timing remains usable.
+
+TONE GUIDE:
+- Viral Story Recap: fast, gripping, natural storyteller flow with controlled suspense.
+- Thriller: tense, mysterious, darker suspense.
+- Comedy: light, witty, playful without changing facts.
+- Dramatic: emotional, cinematic, serious.
+- Action/Epic: energetic, urgent, high-impact.
+- Neutral: clean documentary-style recap.
+
+OUTPUT RULES:
 1. Return VALID JSON ONLY.
-2. Keep keys identical (0, 1, 2...).
-3. Values must be natural Burmese translations.
-4. No markdown formatting.
+2. Keep every input key identical (0, 1, 2...).
+3. Each value must be Burmese recap narration corresponding to that chunk, while maintaining continuity with nearby chunks.
+4. No markdown, notes, explanations, or extra keys.
 
-Input JSON:
+Chronological subtitle JSON:
 {large_prompt_text}
 """
     translated_map = {}
@@ -468,7 +501,7 @@ Input JSON:
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
-            config={"system_instruction": SYSTEM_INSTRUCTION, "temperature": 0.3}
+            config={"system_instruction": SYSTEM_INSTRUCTION, "temperature": 0.65}
         )
         res_text = (response.text or "").strip()
         res_text = re.sub(r"^```(?:json)?\s*", "", res_text)
@@ -1427,7 +1460,9 @@ def create_app():
     """
     theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
 
-    with gr.Blocks(css=css, theme=theme, title="⚡ YF Recap • VoxCPM2 Full Voice Studio") as app:
+    with gr.Blocks(title="⚡ YF Recap • VoxCPM2 Full Voice Studio") as app:
+        app._yf_theme = theme
+        app._yf_css = css
         session_id_state = gr.State(lambda: str(uuid.uuid4()))
         vip_access_state = gr.State({"authenticated": False})
 
@@ -1494,11 +1529,11 @@ def create_app():
                         gr.HTML('<div class="section-cap"><span>🧠</span> AI Recap</div>')
                         user_api_key = gr.Textbox(
                             label="Gemini API Key (Optional)", type="password",
-                            placeholder="မထည့်ပါက Google Translate backup သုံးမည်"
+                            placeholder="Story Recap quality အတွက် Gemini API Key ထည့်ပါ — မထည့်ပါက literal Google Translate backup သုံးမည်"
                         )
                         tone_style = gr.Dropdown(
-                            choices=["Thriller", "Comedy", "Dramatic", "Action/Epic", "Neutral"],
-                            value="Thriller", label="Narrative Tone"
+                            choices=["Viral Story Recap", "Thriller", "Comedy", "Dramatic", "Action/Epic", "Neutral"],
+                            value="Viral Story Recap", label="Narrative Tone"
                         )
                         with gr.Column(elem_classes=["voice-engine-shell"]):
                             voice_engine = gr.Radio(
@@ -1695,8 +1730,253 @@ def create_app():
 
 
 # ================================================================
-# 11) LAUNCH — FAST UI EDITION
+# 11) COLAB PUBLIC LAUNCH — CLOUDFLARE (NO gradio.live)
 # ================================================================
-if __name__ == "__main__":
+# This launcher keeps the Gradio UI local (share=False) and exposes it
+# through a Cloudflare Quick Tunnel. No Gradio share link is created.
+
+PUBLIC_PORT = int(os.getenv("YF_RECAP_PORT", "7860"))
+
+
+def _wait_for_port(host="127.0.0.1", port=7860, timeout=45):
+    """Wait until the local Gradio server is accepting TCP connections."""
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def _cloudflared_download_url():
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        asset = "cloudflared-linux-amd64"
+    elif machine in ("aarch64", "arm64"):
+        asset = "cloudflared-linux-arm64"
+    else:
+        raise RuntimeError(f"Unsupported CPU architecture for cloudflared: {machine}")
+    return f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+
+
+def ensure_cloudflared():
+    """Download cloudflared once in the Colab/runtime filesystem."""
+    preferred_dir = "/content" if os.path.isdir("/content") else tempfile.gettempdir()
+    binary = os.path.join(preferred_dir, "cloudflared")
+
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        return binary
+
+    print("☁️ Installing Cloudflare Tunnel...")
+    url = _cloudflared_download_url()
+    try:
+        urllib.request.urlretrieve(url, binary)
+    except Exception:
+        # wget is often more resilient in Colab, so keep it as a fallback.
+        subprocess.run(["wget", "-q", "-O", binary, url], check=True)
+
+    os.chmod(binary, 0o755)
+    print("✅ cloudflared ready:", binary)
+    return binary
+
+
+def start_cloudflare_tunnel(origin_url):
+    """Start a stable Cloudflare Quick Tunnel and keep draining logs."""
+    import threading
+
+    binary = ensure_cloudflared()
+    local_url = str(origin_url).rstrip("/")
+
+    # Force HTTP/2 because QUIC/UDP can be unstable or blocked in Colab.
+    cmd = [
+        binary,
+        "tunnel",
+        "--no-autoupdate",
+        "--protocol", "http2",
+        "--url", local_url,
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    url_pattern = re.compile(r"https://[-a-zA-Z0-9]+\.trycloudflare\.com")
+    state = {"url": None, "last_error": ""}
+    url_ready = threading.Event()
+
+    print("☁️ Creating YF Recap public link...")
+    print("ℹ️ Gradio share=False — gradio.live is NOT being used.")
+    print("ℹ️ Cloudflare transport: HTTP/2 (Colab stable mode)")
+
+    def _drain_cloudflare_logs():
+        """Continuously read cloudflared stdout so its pipe never blocks."""
+        try:
+            if process.stdout is None:
+                return
+            for raw_line in iter(process.stdout.readline, ""):
+                if not raw_line:
+                    break
+                clean = raw_line.strip()
+                match = url_pattern.search(clean)
+                if match and state["url"] is None:
+                    state["url"] = match.group(0)
+                    url_ready.set()
+
+                lower = clean.lower()
+                if " error" in lower or "err " in lower or "failed" in lower:
+                    state["last_error"] = clean
+                    print("Cloudflare:", clean)
+        except Exception as exc:
+            state["last_error"] = str(exc)
+        finally:
+            # Wake the waiter if cloudflared exits before URL creation.
+            url_ready.set()
+
+    log_thread = threading.Thread(
+        target=_drain_cloudflare_logs,
+        name="cloudflared-log-reader",
+        daemon=True,
+    )
+    log_thread.start()
+
+    # Wait for URL without stopping the background stdout reader.
+    deadline = time.time() + 75
+    while time.time() < deadline:
+        if state["url"]:
+            public_url = state["url"]
+            print("\n" + "=" * 66)
+            print("🚀 YF RECAP PUBLIC LINK")
+            print(public_url)
+            print("=" * 66 + "\n")
+            print("📌 ဒီ Colab cell run နေသရွေ့ link အလုပ်လုပ်ပါမယ်။")
+            print("📌 Runtime disconnect/restart ဖြစ်ရင် link အသစ်ထွက်ပါမယ်။\n")
+            return process, public_url, log_thread
+
+        if process.poll() is not None:
+            raise RuntimeError(
+                "Cloudflare tunnel stopped before producing a URL. "
+                + (state["last_error"] or f"exit={process.returncode}")
+            )
+        time.sleep(0.2)
+
+    if process.poll() is None:
+        process.terminate()
+    raise RuntimeError(
+        "Cloudflare public URL 75 seconds အတွင်း မရပါ။ "
+        + (state["last_error"] or "Colab network ကိုစစ်ပြီး ပြန် Run ပါ။")
+    )
+
+
+def launch_yf_recap_cloudflare():
+    """Run YF Recap in Colab with Cloudflare ONLY (no gradio.live, no localhost iframe)."""
+    import gradio.utils as gr_utils
+    import gradio.networking as gr_networking
+
+    # Gradio 6 treats Colab as a hosted notebook and may try its own
+    # gradio.live tunnel / localhost iframe. We use Cloudflare instead,
+    # so disable hosted-notebook detection only while launching locally.
+    original_colab_check = gr_utils.colab_check
+    original_hosted_check = gr_utils.is_hosted_notebook
+    original_url_ok = gr_networking.url_ok
+
+    def _not_colab():
+        return False
+
+    def _local_url_ok(url):
+        u = str(url or "")
+        if (
+            u.startswith("http://127.0.0.1:")
+            or u.startswith("http://localhost:")
+            or u.startswith("http://0.0.0.0:")
+        ):
+            return True
+        return original_url_ok(url)
+
+    gr_utils.colab_check = _not_colab
+    gr_utils.is_hosted_notebook = _not_colab
+    gr_networking.url_ok = _local_url_ok
+
     demo = create_app()
-    demo.queue(default_concurrency_limit=1).launch(share=True, debug=True)
+
+    try:
+        demo.queue(default_concurrency_limit=1).launch(
+            server_name="127.0.0.1",
+            server_port=PUBLIC_PORT,
+            share=False,                 # never use gradio.live
+            inline=False,                # never show Colab localhost iframe
+            inbrowser=False,
+            debug=False,
+            prevent_thread_lock=True,
+            show_error=True,
+            quiet=True,                  # hide localhost/share messages
+            ssl_keyfile=None,
+            ssl_certfile=None,
+            theme=getattr(demo, "_yf_theme", None),
+            css=getattr(demo, "_yf_css", None),
+        )
+    finally:
+        gr_utils.colab_check = original_colab_check
+        gr_utils.is_hosted_notebook = original_hosted_check
+        gr_networking.url_ok = original_url_ok
+
+    # Cloudflare connects privately to this origin. Users never see it.
+    local_origin = f"http://127.0.0.1:{PUBLIC_PORT}"
+
+    if not _wait_for_port("127.0.0.1", PUBLIC_PORT, timeout=60):
+        raise RuntimeError(
+            f"YF Recap local server did not start on port {PUBLIC_PORT}. "
+            "Check the Python traceback above."
+        )
+
+    tunnel_process, public_url, _log_thread = start_cloudflare_tunnel(local_origin)
+
+    # After successful startup, clear Colab logs and show only the
+    # Cloudflare public link.
+    try:
+        from IPython.display import clear_output, display, HTML
+        clear_output(wait=True)
+        html = (
+            '<div style="font-family:Arial,sans-serif;padding:18px 0;">'
+            '<div style="font-size:15px;font-weight:800;margin-bottom:8px;">YF RECAP LIVE LINK</div>'
+            f'<a href="{public_url}" target="_blank" style="font-size:18px;font-weight:800;word-break:break-all;">{public_url}</a>'
+            '</div>'
+        )
+        display(HTML(html))
+    except Exception:
+        print(public_url, flush=True)
+
+    # Keep Gradio + Cloudflare alive without recurring output.
+    try:
+        while True:
+            if tunnel_process.poll() is not None:
+                raise RuntimeError(
+                    f"Cloudflare tunnel disconnected (exit={tunnel_process.returncode}). "
+                    "Run this cell again to create a new Cloudflare link."
+                )
+            if not _wait_for_port("127.0.0.1", PUBLIC_PORT, timeout=2):
+                raise RuntimeError(
+                    "YF Recap local server stopped responding. "
+                    "The Colab runtime may have restarted or run out of RAM/VRAM."
+                )
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tunnel_process.poll() is None:
+            tunnel_process.terminate()
+        try:
+            demo.close()
+        except Exception:
+            pass
+
+    return public_url
+
+
+if __name__ == "__main__":
+    launch_yf_recap_cloudflare()
