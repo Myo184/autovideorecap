@@ -1248,8 +1248,18 @@ def build_ass_subtitles(
 ):
     selected_font_path = resolve_subtitle_font(font_style)
     selected_font_family = detect_font_family(selected_font_path) if selected_font_path else ASS_FONT_FAMILY
-    font_size = max(22, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.86))
-    outline = max(2, int(font_size * 0.07))
+    # V6.8.3: TRUE subtitle size control.
+    # The previous formula used target_h plus a hard 22px minimum. On 16:9
+    # (720px high), many slider values collapsed to the same 22px size, so
+    # moving the slider appeared to do nothing.  Use a 1–10 visual scale and
+    # map it against the SHORT side of the output frame.  This keeps the same
+    # perceived size in both 9:16 and 16:9 and makes every slider movement
+    # materially change the ASS font size.
+    size_setting = max(1.0, min(10.0, float(subtitle_size_percent)))
+    short_side = float(min(target_w, target_h))
+    size_norm = (size_setting - 1.0) / 9.0
+    font_size = max(18, int(round(short_side * (0.030 + (0.070 * size_norm)))))
+    outline = max(2, int(round(font_size * 0.075)))
     # sub_pos_percent now means exact subtitle CENTER Y from the top of the final frame.
     subtitle_y_percent = max(3.0, min(97.0, float(sub_pos_percent)))
     subtitle_x = int(target_w * 0.50)
@@ -1933,7 +1943,133 @@ def create_app_legacy():
       #auto-recap-btn{font-size:16px!important}
     }
     """
-    theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
+    # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
+    # older V6.8.2 palette while keeping all backend/component IDs intact.
+    css += r"""
+    :root{
+      --aurora-bg:#05060b;--aurora-panel:#0d1019cc;--aurora-panel2:#111725d9;
+      --aurora-line:#28354d;--aurora-mint:#56f2c7;--aurora-cyan:#43d9ff;
+      --aurora-purple:#9b6cff;--aurora-pink:#ff5fb7;--aurora-text:#f7fbff;
+      --aurora-muted:#96a6be;--aurora-warning:#ffd166;--aurora-danger:#ff6b83;
+    }
+    html,body{background:#05060b!important}
+    body,.gradio-container{
+      background:
+        radial-gradient(900px 460px at -5% -5%,#00d4a91f 0%,transparent 62%),
+        radial-gradient(820px 430px at 105% 2%,#9b6cff20 0%,transparent 60%),
+        radial-gradient(650px 360px at 50% 105%,#ff5fb714 0%,transparent 70%),
+        linear-gradient(180deg,#070913 0%,#05060b 60%,#04050a 100%)!important;
+      color:var(--aurora-text)!important;
+    }
+    .gradio-container{max-width:1020px!important;padding:12px 14px 88px!important}
+
+    /* Hero */
+    .wiz-hero{
+      border:1px solid #ffffff12!important;
+      border-radius:30px!important;
+      background:linear-gradient(145deg,#111522e8,#0a0d16e8)!important;
+      box-shadow:0 28px 90px #0009,inset 0 1px #ffffff0d!important;
+      backdrop-filter:blur(22px)!important;
+      padding:25px!important;
+    }
+    .wiz-hero:before{content:"";position:absolute;inset:-2px;border-radius:31px;padding:1px;background:linear-gradient(125deg,#56f2c780,#43d9ff30,#9b6cff60,#ff5fb730);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+    .wiz-hero:after{width:300px!important;height:300px!important;right:-100px!important;top:-150px!important;background:radial-gradient(circle,#9b6cff2a,transparent 67%)!important}
+    .wiz-logo{position:relative!important;isolation:isolate;width:62px!important;height:62px!important;flex-basis:62px!important;border-radius:20px!important;background:#0c1019!important;border:1px solid #56f2c744!important;box-shadow:0 0 0 5px #56f2c70a,0 14px 45px #43d9ff20!important;overflow:hidden}
+    .wiz-logo:before{content:"";position:absolute;inset:-45%;z-index:-1;background:conic-gradient(from 0deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7,#56f2c7);animation:yfLogoSpin 7s linear infinite}
+    .wiz-logo:after{content:"";position:absolute;inset:2px;z-index:-1;border-radius:18px;background:#0a0d14}
+    .wiz-logo span{font-weight:1000;letter-spacing:-.06em;background:linear-gradient(120deg,#fff,#b9fff0 45%,#d9c8ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+    @keyframes yfLogoSpin{to{transform:rotate(360deg)}}
+    .wiz-name{font-size:29px!important;letter-spacing:-.04em!important;background:linear-gradient(90deg,#fff,#c9fff2 43%,#d5c7ff 80%);-webkit-background-clip:text;background-clip:text;color:transparent}
+    .wiz-sub{color:#7f91aa!important;letter-spacing:.13em!important;font-size:9px!important;font-weight:850!important}
+    .wiz-note{color:#a6b4c8!important}.wiz-note b{color:#72f7d4!important}
+
+    /* Wizard progress */
+    .wiz-progress-wrap{background:linear-gradient(180deg,#05060bf2 72%,transparent)!important;backdrop-filter:blur(16px)!important}
+    .wiz-line{background:linear-gradient(90deg,#223047,#33415b)!important}
+    .wiz-node span{background:#0b0f18!important;border-color:#31405a!important;color:#71829c!important;transition:.25s ease!important}
+    .wiz-node.active span{background:linear-gradient(135deg,#0f6c64,#336bd8 55%,#7652d1)!important;border-color:#72f7d4!important;box-shadow:0 0 0 5px #56f2c70d,0 0 25px #43d9ff32!important;transform:scale(1.08)}
+    .wiz-node.done span{background:linear-gradient(135deg,#087a61,#0aa487)!important;border-color:#56f2c7!important;box-shadow:0 0 18px #56f2c725!important}
+    .wiz-step-label{color:#72f7d4!important}
+
+    /* Glass cards / fields */
+    .wizard-card,.login-card-pro{
+      border:1px solid #ffffff12!important;
+      background:linear-gradient(180deg,#101520d9,#090d15e8)!important;
+      box-shadow:0 24px 70px #0008,inset 0 1px #ffffff0b!important;
+      backdrop-filter:blur(22px)!important;
+      border-radius:25px!important;
+    }
+    .wizard-badge{border-color:#56f2c73d!important;background:linear-gradient(90deg,#56f2c711,#43d9ff0d)!important;color:#8dffe1!important;letter-spacing:.08em!important}
+    .wizard-title{color:#f8fbff!important;letter-spacing:-.025em!important}
+    .wizard-copy,.hint,.clone-copy{color:#95a6bd!important}
+    .engine-panel{background:linear-gradient(180deg,#0b1019d9,#0a0d15dd)!important;border-color:#2b3950!important}
+    .clone-panel{background:linear-gradient(145deg,#25153b8c,#0a1018dc)!important;border-color:#9b6cff52!important}
+    .generate-summary,.download-note{background:#070b12d9!important;border-color:#26354c!important;color:#9eacc0!important}
+    .clean-audio-badge{background:#56f2c70a!important;border-color:#56f2c738!important;color:#8affe0!important}
+
+    /* Gradio form controls */
+    .gradio-container input,.gradio-container textarea,.gradio-container select{
+      border-radius:13px!important;
+    }
+    .gradio-container input:focus,.gradio-container textarea:focus,.gradio-container select:focus{
+      outline:none!important;box-shadow:0 0 0 2px #56f2c72c,0 0 22px #43d9ff16!important;border-color:#56f2c778!important;
+    }
+    input[type=range]{accent-color:#56f2c7!important}
+
+    /* Subtitle live size preview */
+    .sub-size-preview{margin:8px 0 13px;padding:12px;border-radius:16px;border:1px solid #2b3a50;background:linear-gradient(145deg,#080c13,#0e1420);box-shadow:inset 0 1px #ffffff08}
+    .sub-size-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
+    .sub-size-meta span{font-size:8px;font-weight:950;letter-spacing:.14em;color:#72839b}.sub-size-meta b{font-size:11px;color:#72f7d4}
+    .sub-size-stage{min-height:78px;border-radius:12px;display:grid;place-items:center;text-align:center;padding:12px;background:radial-gradient(circle at 50% 120%,#9b6cff22,transparent 58%),#05070c;border:1px solid #ffffff0b;overflow:hidden}
+    .sub-size-stage span{font-family:"Noto Sans Myanmar",sans-serif;font-weight:900;line-height:1.3;color:#ffe66d;text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000;transition:font-size .22s ease}
+    .sub-size-preview small{display:block;margin-top:7px;color:#76879e;font-size:9px;line-height:1.45}
+
+    /* Live process card */
+    .process-card{border-color:#43d9ff35!important;background:linear-gradient(135deg,#07121ae8,#121326e8)!important;box-shadow:0 18px 46px #0006,inset 0 1px #ffffff09!important}
+    .process-spinner{border-color:#56f2c725!important;border-top-color:#56f2c7!important;border-right-color:#9b6cff!important;box-shadow:0 0 20px #43d9ff20!important}
+    .process-top strong{color:#72f7d4!important}.process-track{height:9px!important;background:#03060b!important;border-color:#243249!important}.process-track i{background:linear-gradient(90deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7)!important;background-size:220% 100%!important;animation:yfProgressFlow 2s linear infinite!important;box-shadow:0 0 18px #43d9ff54!important}
+    @keyframes yfProgressFlow{to{background-position:220% 0}}
+    .eta-card.ready{border-color:#56f2c732!important;background:linear-gradient(105deg,#56f2c70d,#43d9ff0c,#9b6cff0d)!important}.eta-icon{background:#56f2c70e!important;border-color:#56f2c72b!important}
+
+    /* Button system — hover lift + glow + press feedback + shimmer */
+    .gradio-container button,#yf-download-btn{
+      position:relative!important;overflow:hidden!important;isolation:isolate!important;
+      transition:transform .18s ease,box-shadow .22s ease,border-color .22s ease,filter .22s ease!important;
+      -webkit-tap-highlight-color:transparent!important;
+    }
+    .gradio-container button:hover,#yf-download-btn:hover{transform:translateY(-2px) scale(1.006)!important;filter:brightness(1.08)!important}
+    .gradio-container button:active,#yf-download-btn:active{transform:translateY(1px) scale(.985)!important;transition-duration:.07s!important}
+    .wiz-next{background:linear-gradient(105deg,#0e9f82,#178fb6 48%,#6f50d7)!important;border:1px solid #78f9d745!important;box-shadow:0 10px 28px #43d9ff1b!important}
+    .wiz-next:hover{box-shadow:0 15px 38px #43d9ff2d,0 0 0 1px #56f2c72c inset!important}
+    .wiz-back{background:linear-gradient(180deg,#121824,#0b1019)!important;border-color:#34425a!important;color:#c7d1df!important}.wiz-back:hover{border-color:#71839d!important;box-shadow:0 10px 26px #0005!important}
+
+    #auto-recap-btn{
+      min-height:68px!important;border-radius:18px!important;font-size:16px!important;letter-spacing:.015em!important;
+      background:linear-gradient(105deg,#0eaa87 0%,#158eb2 35%,#6651d6 67%,#d34b9b 100%)!important;
+      background-size:220% 100%!important;
+      border:1px solid #ffffff24!important;
+      box-shadow:0 18px 46px #43d9ff24,0 0 0 1px #56f2c71f inset!important;
+      animation:yfButtonFlow 5s ease infinite!important;
+    }
+    #auto-recap-btn:before,#yf-download-btn:before{content:"";position:absolute;z-index:-1;top:-100%;left:-40%;width:35%;height:300%;transform:rotate(20deg);background:linear-gradient(90deg,transparent,#ffffff35,transparent);animation:yfShine 3.6s ease-in-out infinite}
+    #auto-recap-btn:hover{box-shadow:0 22px 58px #43d9ff38,0 0 30px #9b6cff24!important}
+    @keyframes yfButtonFlow{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+    @keyframes yfShine{0%,65%{left:-55%;opacity:0}72%{opacity:1}100%{left:125%;opacity:0}}
+
+    #yf-download-btn{background:linear-gradient(105deg,#079b78,#0b8ba8,#4e61d8)!important;border-color:#56f2c74a!important;box-shadow:0 15px 38px #56f2c71d!important}
+    #yf-download-btn:hover{box-shadow:0 20px 48px #56f2c72d!important}
+
+    .final-stage{border-color:#56f2c72e!important;background:linear-gradient(145deg,#0a1417d9,#0d1020e8)!important}.final-badge{background:#56f2c70c!important;border-color:#56f2c738!important;color:#8affe0!important}
+    .footer-note{color:#4d5c72!important;letter-spacing:.05em!important}
+
+    @media(max-width:720px){
+      .gradio-container{padding:6px 7px 82px!important}.wiz-hero{padding:18px 14px!important;border-radius:22px!important}.wiz-logo{width:50px!important;height:50px!important;flex-basis:50px!important;border-radius:16px!important}.wiz-logo:after{border-radius:14px!important}.wiz-name{font-size:22px!important}.wizard-card{padding:13px!important;border-radius:19px!important}.wizard-title{font-size:18px!important}
+      #auto-recap-btn{min-height:64px!important;bottom:10px!important;border-radius:16px!important;font-size:15px!important}
+      .sub-size-stage{min-height:70px}.process-card{padding:12px!important}.process-main>span{font-size:9.5px!important}
+    }
+    @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
+    """
+    theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
 
     # Browser-side guard for temporary Quick-Tunnel reconnects.
     # It keeps the page warm, shows a small connection indicator, and removes only
@@ -2178,7 +2314,7 @@ def create_app_legacy():
                         text_color_input = gr.ColorPicker(label="Text", value="#FFFF00")
                         stroke_color_input = gr.ColorPicker(label="Outline", value="#000000")
                     sub_pos_percent = gr.Slider(4, 96, value=82, step=1, label="Subtitle Y Position (%)")
-                    subtitle_size_percent = gr.Slider(2.0, 7.0, value=3.8, step=0.1, label="Font Size (%)")
+                    subtitle_size_percent = gr.Slider(1.0, 10.0, value=5.5, step=0.5, label="Subtitle Size • 1 Small — 10 Large")
 
                 with gr.Column(elem_classes=["glass-card"]):
                     gr.HTML("""<div class="section-cap"><span>🌫</span> Blur Strength</div>
@@ -3533,6 +3669,22 @@ def _start_auto_recap_feedback(video_value, recap_length, voice_engine, render_m
     )
     return eta_html, status, _processing_status_html(session_id)
 
+def _subtitle_size_preview_html(size_value):
+    """Tiny live visual confirmation that the size slider is really changing."""
+    try:
+        s = max(1.0, min(10.0, float(size_value)))
+    except Exception:
+        s = 5.5
+    # UI preview px only; final ASS uses output-frame mapping in build_ass_subtitles().
+    preview_px = int(round(18 + ((s - 1.0) / 9.0) * 28))
+    return f"""
+    <div class='sub-size-preview'>
+      <div class='sub-size-meta'><span>LIVE SIZE PREVIEW</span><b>{s:g} / 10</b></div>
+      <div class='sub-size-stage'><span style='font-size:{preview_px}px'>စာတန်းထိုး နမူနာ</span></div>
+      <small>ဒီ slider value ကို Final ASS subtitle render မှာ တိုက်ရိုက်အသုံးပြုပါတယ်။</small>
+    </div>
+    """
+
 def create_app():
     css = r"""
     :root{--bg:#050812;--card:#0d1424;--card2:#111b31;--line:#263755;--cyan:#22d3ee;--blue:#2563eb;--violet:#7c3aed;--green:#34d399;--text:#f8fafc;--muted:#91a1bd;--gold:#facc15}
@@ -3555,12 +3707,138 @@ def create_app():
     @media(max-width:720px){.gradio-container{padding:5px 6px 74px!important}.wiz-hero{padding:17px 13px;border-radius:19px;margin-top:2px}.wiz-logo{width:48px;height:48px;flex-basis:48px;border-radius:15px;font-size:18px}.wiz-name{font-size:21px}.wiz-sub{font-size:9px}.wiz-note{font-size:10px;margin-top:10px}.wiz-progress{padding-left:0;padding-right:0}.wiz-node small{font-size:7px}.wiz-node span{width:27px;height:27px;font-size:9px}.wiz-line{top:22px}.wizard-card{padding:12px!important;border-radius:17px!important}.wizard-title{font-size:17px}.wizard-copy{font-size:10px}.mobile-stack{display:flex!important;flex-direction:column!important;gap:9px!important}.mobile-stack>*{width:100%!important;min-width:0!important}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.wiz-nav{display:flex!important;flex-direction:row!important;gap:8px!important}.wiz-nav>*{min-width:0!important;flex:1!important}#auto-recap-btn{position:sticky!important;bottom:8px!important;z-index:85!important;box-shadow:0 10px 34px #000b,0 0 24px #2563eb55!important}.gradio-container video{max-height:47vh!important}#yf-download-btn{min-height:55px!important}#yf-conn{right:7px!important;bottom:72px!important}}
     @media(max-width:390px){.wiz-node small{display:none}.wiz-progress{padding-bottom:0}.wizard-card{padding:10px!important}.wiz-name{font-size:19px}}
     """
-    theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
+    # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
+    # older V6.8.2 palette while keeping all backend/component IDs intact.
+    css += r"""
+    :root{
+      --aurora-bg:#05060b;--aurora-panel:#0d1019cc;--aurora-panel2:#111725d9;
+      --aurora-line:#28354d;--aurora-mint:#56f2c7;--aurora-cyan:#43d9ff;
+      --aurora-purple:#9b6cff;--aurora-pink:#ff5fb7;--aurora-text:#f7fbff;
+      --aurora-muted:#96a6be;--aurora-warning:#ffd166;--aurora-danger:#ff6b83;
+    }
+    html,body{background:#05060b!important}
+    body,.gradio-container{
+      background:
+        radial-gradient(900px 460px at -5% -5%,#00d4a91f 0%,transparent 62%),
+        radial-gradient(820px 430px at 105% 2%,#9b6cff20 0%,transparent 60%),
+        radial-gradient(650px 360px at 50% 105%,#ff5fb714 0%,transparent 70%),
+        linear-gradient(180deg,#070913 0%,#05060b 60%,#04050a 100%)!important;
+      color:var(--aurora-text)!important;
+    }
+    .gradio-container{max-width:1020px!important;padding:12px 14px 88px!important}
+
+    /* Hero */
+    .wiz-hero{
+      border:1px solid #ffffff12!important;
+      border-radius:30px!important;
+      background:linear-gradient(145deg,#111522e8,#0a0d16e8)!important;
+      box-shadow:0 28px 90px #0009,inset 0 1px #ffffff0d!important;
+      backdrop-filter:blur(22px)!important;
+      padding:25px!important;
+    }
+    .wiz-hero:before{content:"";position:absolute;inset:-2px;border-radius:31px;padding:1px;background:linear-gradient(125deg,#56f2c780,#43d9ff30,#9b6cff60,#ff5fb730);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+    .wiz-hero:after{width:300px!important;height:300px!important;right:-100px!important;top:-150px!important;background:radial-gradient(circle,#9b6cff2a,transparent 67%)!important}
+    .wiz-logo{position:relative!important;isolation:isolate;width:62px!important;height:62px!important;flex-basis:62px!important;border-radius:20px!important;background:#0c1019!important;border:1px solid #56f2c744!important;box-shadow:0 0 0 5px #56f2c70a,0 14px 45px #43d9ff20!important;overflow:hidden}
+    .wiz-logo:before{content:"";position:absolute;inset:-45%;z-index:-1;background:conic-gradient(from 0deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7,#56f2c7);animation:yfLogoSpin 7s linear infinite}
+    .wiz-logo:after{content:"";position:absolute;inset:2px;z-index:-1;border-radius:18px;background:#0a0d14}
+    .wiz-logo span{font-weight:1000;letter-spacing:-.06em;background:linear-gradient(120deg,#fff,#b9fff0 45%,#d9c8ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+    @keyframes yfLogoSpin{to{transform:rotate(360deg)}}
+    .wiz-name{font-size:29px!important;letter-spacing:-.04em!important;background:linear-gradient(90deg,#fff,#c9fff2 43%,#d5c7ff 80%);-webkit-background-clip:text;background-clip:text;color:transparent}
+    .wiz-sub{color:#7f91aa!important;letter-spacing:.13em!important;font-size:9px!important;font-weight:850!important}
+    .wiz-note{color:#a6b4c8!important}.wiz-note b{color:#72f7d4!important}
+
+    /* Wizard progress */
+    .wiz-progress-wrap{background:linear-gradient(180deg,#05060bf2 72%,transparent)!important;backdrop-filter:blur(16px)!important}
+    .wiz-line{background:linear-gradient(90deg,#223047,#33415b)!important}
+    .wiz-node span{background:#0b0f18!important;border-color:#31405a!important;color:#71829c!important;transition:.25s ease!important}
+    .wiz-node.active span{background:linear-gradient(135deg,#0f6c64,#336bd8 55%,#7652d1)!important;border-color:#72f7d4!important;box-shadow:0 0 0 5px #56f2c70d,0 0 25px #43d9ff32!important;transform:scale(1.08)}
+    .wiz-node.done span{background:linear-gradient(135deg,#087a61,#0aa487)!important;border-color:#56f2c7!important;box-shadow:0 0 18px #56f2c725!important}
+    .wiz-step-label{color:#72f7d4!important}
+
+    /* Glass cards / fields */
+    .wizard-card,.login-card-pro{
+      border:1px solid #ffffff12!important;
+      background:linear-gradient(180deg,#101520d9,#090d15e8)!important;
+      box-shadow:0 24px 70px #0008,inset 0 1px #ffffff0b!important;
+      backdrop-filter:blur(22px)!important;
+      border-radius:25px!important;
+    }
+    .wizard-badge{border-color:#56f2c73d!important;background:linear-gradient(90deg,#56f2c711,#43d9ff0d)!important;color:#8dffe1!important;letter-spacing:.08em!important}
+    .wizard-title{color:#f8fbff!important;letter-spacing:-.025em!important}
+    .wizard-copy,.hint,.clone-copy{color:#95a6bd!important}
+    .engine-panel{background:linear-gradient(180deg,#0b1019d9,#0a0d15dd)!important;border-color:#2b3950!important}
+    .clone-panel{background:linear-gradient(145deg,#25153b8c,#0a1018dc)!important;border-color:#9b6cff52!important}
+    .generate-summary,.download-note{background:#070b12d9!important;border-color:#26354c!important;color:#9eacc0!important}
+    .clean-audio-badge{background:#56f2c70a!important;border-color:#56f2c738!important;color:#8affe0!important}
+
+    /* Gradio form controls */
+    .gradio-container input,.gradio-container textarea,.gradio-container select{
+      border-radius:13px!important;
+    }
+    .gradio-container input:focus,.gradio-container textarea:focus,.gradio-container select:focus{
+      outline:none!important;box-shadow:0 0 0 2px #56f2c72c,0 0 22px #43d9ff16!important;border-color:#56f2c778!important;
+    }
+    input[type=range]{accent-color:#56f2c7!important}
+
+    /* Subtitle live size preview */
+    .sub-size-preview{margin:8px 0 13px;padding:12px;border-radius:16px;border:1px solid #2b3a50;background:linear-gradient(145deg,#080c13,#0e1420);box-shadow:inset 0 1px #ffffff08}
+    .sub-size-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
+    .sub-size-meta span{font-size:8px;font-weight:950;letter-spacing:.14em;color:#72839b}.sub-size-meta b{font-size:11px;color:#72f7d4}
+    .sub-size-stage{min-height:78px;border-radius:12px;display:grid;place-items:center;text-align:center;padding:12px;background:radial-gradient(circle at 50% 120%,#9b6cff22,transparent 58%),#05070c;border:1px solid #ffffff0b;overflow:hidden}
+    .sub-size-stage span{font-family:"Noto Sans Myanmar",sans-serif;font-weight:900;line-height:1.3;color:#ffe66d;text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000;transition:font-size .22s ease}
+    .sub-size-preview small{display:block;margin-top:7px;color:#76879e;font-size:9px;line-height:1.45}
+
+    /* Live process card */
+    .process-card{border-color:#43d9ff35!important;background:linear-gradient(135deg,#07121ae8,#121326e8)!important;box-shadow:0 18px 46px #0006,inset 0 1px #ffffff09!important}
+    .process-spinner{border-color:#56f2c725!important;border-top-color:#56f2c7!important;border-right-color:#9b6cff!important;box-shadow:0 0 20px #43d9ff20!important}
+    .process-top strong{color:#72f7d4!important}.process-track{height:9px!important;background:#03060b!important;border-color:#243249!important}.process-track i{background:linear-gradient(90deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7)!important;background-size:220% 100%!important;animation:yfProgressFlow 2s linear infinite!important;box-shadow:0 0 18px #43d9ff54!important}
+    @keyframes yfProgressFlow{to{background-position:220% 0}}
+    .eta-card.ready{border-color:#56f2c732!important;background:linear-gradient(105deg,#56f2c70d,#43d9ff0c,#9b6cff0d)!important}.eta-icon{background:#56f2c70e!important;border-color:#56f2c72b!important}
+
+    /* Button system — hover lift + glow + press feedback + shimmer */
+    .gradio-container button,#yf-download-btn{
+      position:relative!important;overflow:hidden!important;isolation:isolate!important;
+      transition:transform .18s ease,box-shadow .22s ease,border-color .22s ease,filter .22s ease!important;
+      -webkit-tap-highlight-color:transparent!important;
+    }
+    .gradio-container button:hover,#yf-download-btn:hover{transform:translateY(-2px) scale(1.006)!important;filter:brightness(1.08)!important}
+    .gradio-container button:active,#yf-download-btn:active{transform:translateY(1px) scale(.985)!important;transition-duration:.07s!important}
+    .wiz-next{background:linear-gradient(105deg,#0e9f82,#178fb6 48%,#6f50d7)!important;border:1px solid #78f9d745!important;box-shadow:0 10px 28px #43d9ff1b!important}
+    .wiz-next:hover{box-shadow:0 15px 38px #43d9ff2d,0 0 0 1px #56f2c72c inset!important}
+    .wiz-back{background:linear-gradient(180deg,#121824,#0b1019)!important;border-color:#34425a!important;color:#c7d1df!important}.wiz-back:hover{border-color:#71839d!important;box-shadow:0 10px 26px #0005!important}
+
+    #auto-recap-btn{
+      min-height:68px!important;border-radius:18px!important;font-size:16px!important;letter-spacing:.015em!important;
+      background:linear-gradient(105deg,#0eaa87 0%,#158eb2 35%,#6651d6 67%,#d34b9b 100%)!important;
+      background-size:220% 100%!important;
+      border:1px solid #ffffff24!important;
+      box-shadow:0 18px 46px #43d9ff24,0 0 0 1px #56f2c71f inset!important;
+      animation:yfButtonFlow 5s ease infinite!important;
+    }
+    #auto-recap-btn:before,#yf-download-btn:before{content:"";position:absolute;z-index:-1;top:-100%;left:-40%;width:35%;height:300%;transform:rotate(20deg);background:linear-gradient(90deg,transparent,#ffffff35,transparent);animation:yfShine 3.6s ease-in-out infinite}
+    #auto-recap-btn:hover{box-shadow:0 22px 58px #43d9ff38,0 0 30px #9b6cff24!important}
+    @keyframes yfButtonFlow{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+    @keyframes yfShine{0%,65%{left:-55%;opacity:0}72%{opacity:1}100%{left:125%;opacity:0}}
+
+    #yf-download-btn{background:linear-gradient(105deg,#079b78,#0b8ba8,#4e61d8)!important;border-color:#56f2c74a!important;box-shadow:0 15px 38px #56f2c71d!important}
+    #yf-download-btn:hover{box-shadow:0 20px 48px #56f2c72d!important}
+
+    .final-stage{border-color:#56f2c72e!important;background:linear-gradient(145deg,#0a1417d9,#0d1020e8)!important}.final-badge{background:#56f2c70c!important;border-color:#56f2c738!important;color:#8affe0!important}
+    .footer-note{color:#4d5c72!important;letter-spacing:.05em!important}
+
+    @media(max-width:720px){
+      .gradio-container{padding:6px 7px 82px!important}.wiz-hero{padding:18px 14px!important;border-radius:22px!important}.wiz-logo{width:50px!important;height:50px!important;flex-basis:50px!important;border-radius:16px!important}.wiz-logo:after{border-radius:14px!important}.wiz-name{font-size:22px!important}.wizard-card{padding:13px!important;border-radius:19px!important}.wizard-title{font-size:18px!important}
+      #auto-recap-btn{min-height:64px!important;bottom:10px!important;border-radius:16px!important;font-size:15px!important}
+      .sub-size-stage{min-height:70px}.process-card{padding:12px!important}.process-main>span{font-size:9.5px!important}
+    }
+    @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
+    """
+    theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
     connection_js = r"""
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
     """
 
-    with gr.Blocks(title="YF Recap V6.8.2 • Live ETA") as app:
+    with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
         app._yf_theme = theme
         app._yf_css = css
         app._yf_js = connection_js
@@ -3572,10 +3850,10 @@ def create_app():
         gr.HTML("""
         <section class='wiz-hero'>
           <div class='wiz-brand'>
-            <div class='wiz-logo'>YF</div>
-            <div><div class='wiz-name'>YF Recap</div><div class='wiz-sub'>MOBILE STEP-BY-STEP MOVIE RECAP STUDIO</div></div>
+            <div class='wiz-logo'><span>YF</span></div>
+            <div><div class='wiz-name'>YF Recap</div><div class='wiz-sub'>AURORA • STEP-BY-STEP AI RECAP STUDIO</div></div>
           </div>
-          <div class='wiz-note'>တစ်မျက်နှာတည်းမှာ settings အကုန်မပြတော့ပါဘူး။ <b>တစ်ဆင့်ပြီးမှ တစ်ဆင့်</b> သွားပြီး နောက်ဆုံး AUTO RECAP တစ်ချက်ပဲနှိပ်ပါ။</div>
+          <div class='wiz-note'>Clean wizard flow • <b>တစ်ဆင့်ပြီးမှ တစ်ဆင့်</b> • Mobile touch controls • Live render status</div>
         </section>
         """)
 
@@ -3667,7 +3945,8 @@ def create_app():
                 with gr.Row(elem_classes=["mobile-stack"]):
                     text_color = gr.ColorPicker(label="Subtitle Text", value="#FFFF00")
                     stroke_color = gr.ColorPicker(label="Outline", value="#000000")
-                subtitle_size = gr.Slider(2.0, 5.0, value=3.3, step=.1, label="Subtitle Size")
+                subtitle_size = gr.Slider(1.0, 10.0, value=5.5, step=.5, label="Subtitle Size • 1 Small — 10 Large")
+                subtitle_size_preview = gr.HTML(_subtitle_size_preview_html(5.5))
                 subtitle_font_style = gr.Dropdown(choices=list(FONT_STYLE_FILES.keys()), value="Noto Sans Myanmar (Default)", label="Subtitle Font Style")
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
                 font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
@@ -3719,7 +3998,7 @@ def create_app():
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
 
-            gr.HTML("<div class='footer-note'>YF RECAP V6.8.2 • LIVE LOADING + ETA • BIGGER SUBTITLES • FULL BACKEND • STEP WIZARD • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.8.3 • AURORA UI • TRUE SUBTITLE SIZE CONTROL • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
         wizard_outputs = [wizard_progress, step1_panel, step2_panel, step3_panel, step4_panel, step5_panel, step6_panel, wizard_step]
 
@@ -3741,6 +4020,7 @@ def create_app():
         voice_engine.change(update_voice_engine_panels_v6, [voice_engine], [edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel], queue=False, show_progress="hidden")
         clone_reference.change(inspect_clone_reference, [clone_reference], [clone_reference_status], show_progress="hidden")
         layout_editor.change(sync_layout_editor, outputs=[blur_y_percent, blur_height_percent, sub_pos_percent], queue=False, show_progress="hidden")
+        subtitle_size.change(_subtitle_size_preview_html, [subtitle_size], [subtitle_size_preview], queue=False, show_progress="hidden")
         subtitle_font_style.change(subtitle_font_status, [subtitle_font_style], [font_style_status], queue=False, show_progress="hidden")
         subtitle_font_upload.change(
             install_uploaded_subtitle_fonts,
