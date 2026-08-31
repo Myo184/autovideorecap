@@ -1752,29 +1752,8 @@ def process_magic_recap_video(
 # ================================================================
 # 9) VIP UNLOCK VIA MONGODB API
 # ================================================================
-def _ensure_browser_device_id(existing=""):
-    """
-    One-device licensing token.
-    Gradio BrowserState persists this value in the browser's local storage.
-    The Admin server stores only an HMAC hash of it.
-    """
-    value = str(existing or "").strip()
-    if re.fullmatch(r"YFDEV-[A-F0-9]{32}", value):
-        return value
-    return "YFDEV-" + uuid.uuid4().hex.upper()
-
-
-def unlock_vip(vip_code, device_id=""):
+def unlock_vip(vip_code):
     code_value = (vip_code or "").strip().upper()
-    device_id_value = str(device_id or "").strip()
-    if not device_id_value:
-        return (
-            {"authenticated": False},
-            gr.update(visible=True),
-            gr.update(visible=False),
-            "<div class='login-error'>📱 Device ID စတင်နေဆဲပါ။ Page ကို Refresh လုပ်ပြီး ထပ်စမ်းပါ။</div>",
-            ""
-        )
     if not code_value:
         return (
             {"authenticated": False},
@@ -1796,7 +1775,7 @@ def unlock_vip(vip_code, device_id=""):
     try:
         # Use positional input for maximum compatibility with Gradio API schemas.
         client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
-        result = client.predict(code_value, device_id_value, api_name="/verify")
+        result = client.predict(code_value, api_name="/verify")
 
         # gr.JSON normally returns a dict, but keep compatibility with older Gradio versions.
         if isinstance(result, (list, tuple)) and len(result) == 1:
@@ -1829,8 +1808,6 @@ def unlock_vip(vip_code, device_id=""):
             "role": data.get("role", "vip"),
             "daily_limit": data.get("daily_limit"),
             "expiry": data.get("expiry", ""),
-            "device_id": device_id_value,
-            "device_locked": bool(data.get("device_locked", True)),
         }
 
         quota = (
@@ -1842,7 +1819,7 @@ def unlock_vip(vip_code, device_id=""):
         member_html = f"""
         <div class="member-strip">
             <div>
-                <div class="member-small">ACCESS GRANTED ({access_state['expiry']} အထိ) · 📱 ONE DEVICE VERIFIED</div>
+                <div class="member-small">ACCESS GRANTED ({access_state['expiry']} အထိ)</div>
                 <div class="member-name">👑 {access_state['label']} ({str(access_state['role']).upper()})</div>
             </div>
             <div class="quota-badge">{quota}</div>
@@ -2049,22 +2026,7 @@ def create_app_legacy():
 
     /* Live process card */
     .process-card{border-color:#43d9ff35!important;background:linear-gradient(135deg,#07121ae8,#121326e8)!important;box-shadow:0 18px 46px #0006,inset 0 1px #ffffff09!important}
-    .process-spinner{display:none!important}
-    .process-mascot{position:relative;width:48px;height:52px;flex:0 0 48px;display:flex;align-items:center;justify-content:center;margin-top:-2px}
-    .process-mascot span{position:relative;z-index:2;font-size:32px;line-height:1;filter:drop-shadow(0 7px 8px #0008);transform-origin:50% 100%}
-    .process-mascot i{position:absolute;z-index:1;width:31px;height:8px;bottom:1px;border-radius:50%;background:#0009;filter:blur(3px);opacity:.65}
-    .process-mascot b{position:absolute;right:-2px;top:-2px;color:#72f7d4;font-size:11px;letter-spacing:1px;animation:yfDots 1.1s ease-in-out infinite}
-    .running-mascot span{animation:yfMascotBob 1.15s ease-in-out infinite}
-    .running-mascot i{animation:yfShadowPulse 1.15s ease-in-out infinite}
-    .done-mascot span{animation:yfMascotCelebrate .55s ease-in-out 3}
-    .error-mascot span{animation:yfMascotShake .38s ease-in-out 2}
-    .idle-mascot span{animation:yfMascotSleep 2.2s ease-in-out infinite}
-    @keyframes yfMascotBob{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-8px) rotate(3deg)}}
-    @keyframes yfShadowPulse{0%,100%{transform:scaleX(1);opacity:.62}50%{transform:scaleX(.72);opacity:.35}}
-    @keyframes yfDots{0%,100%{opacity:.25;transform:translateY(2px)}50%{opacity:1;transform:translateY(-2px)}}
-    @keyframes yfMascotCelebrate{0%,100%{transform:scale(1) rotate(0)}50%{transform:scale(1.18) rotate(8deg)}}
-    @keyframes yfMascotShake{0%,100%{transform:translateX(0)}25%{transform:translateX(-4px) rotate(-5deg)}75%{transform:translateX(4px) rotate(5deg)}}
-    @keyframes yfMascotSleep{0%,100%{transform:translateY(0);opacity:.8}50%{transform:translateY(-3px);opacity:1}}
+    .process-spinner{border-color:#56f2c725!important;border-top-color:#56f2c7!important;border-right-color:#9b6cff!important;box-shadow:0 0 20px #43d9ff20!important}
     .process-top strong{color:#72f7d4!important}.process-track{height:9px!important;background:#03060b!important;border-color:#243249!important}.process-track i{background:linear-gradient(90deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7)!important;background-size:220% 100%!important;animation:yfProgressFlow 2s linear infinite!important;box-shadow:0 0 18px #43d9ff54!important}
     @keyframes yfProgressFlow{to{background-position:220% 0}}
     .eta-card.ready{border-color:#56f2c732!important;background:linear-gradient(105deg,#56f2c70d,#43d9ff0c,#9b6cff0d)!important}.eta-icon{background:#56f2c70e!important;border-color:#56f2c72b!important}
@@ -3408,98 +3370,71 @@ def _auto_recap_eta_window(video_value, recap_length, voice_engine, render_mode,
     return float(low), float(high)
 
 
-LOTTIE_PROCESS_URL = "https://lottie.host/074083ab-c5cc-4727-b011-99ca7b131bff/bRq5PDRmA3.json"
-
-
-def _processing_lottie_card(stage="", state="running", progress=0, elapsed=0, remaining="calculating…"):
-    stage = str(stage or "Processing...")
-    if state == "done":
-        title = "🥳 Complete"
-    elif state == "error":
-        title = "😵 Error"
-    else:
-        title = stage
-
-    if state == "done":
-        animation = ""
-    else:
-        animation = f"""
-        <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
-        <lottie-player
-            src="{LOTTIE_PROCESS_URL}"
-            background="transparent"
-            speed="1"
-            loop
-            autoplay
-            style="width:90px;height:90px;">
-        </lottie-player>
-        """
-
-    return f"""
-    <div class="process-card lottie-process {state}">
-      <div class="lottie-box">{animation}</div>
-      <div class="process-main">
-        <div class="process-top">
-          <b>{title}</b>
-          <strong>{int(progress)}%</strong>
-        </div>
-        <span>⏱ Elapsed { _fmt_eta_seconds(elapsed) } • ⏳ Remaining {remaining}</span>
-        <div class="process-track"><i style="width:{max(0,min(100,int(progress)))}%"></i></div>
-        <small>YF Recap AI is processing. Please keep this page open.</small>
-      </div>
-    </div>
-    """
-
-
 def _processing_status_html(session_id):
     st = _get_process_status(session_id)
     state = st.get("state", "idle")
-
     if state == "idle":
-        return _processing_lottie_card(
-            "Waiting...",
-            "idle",
-            0,
-            0,
-            "start processing"
-        )
+        return """
+        <div class='process-card idle'>
+          <div class='process-icon'>◷</div>
+          <div class='process-main'><b>Waiting to start</b><span>AUTO RECAP နှိပ်လိုက်ရင် live processing status ကို ဒီနေရာမှာပြမယ်။</span></div>
+        </div>"""
 
     started = float(st.get("started") or time.time())
-    elapsed = max(0, time.time() - started)
-    progress = st.get("progress", 0) or 0
-    stage = st.get("stage", "Processing")
-
-    if state == "error":
-        return _processing_lottie_card(
-            str(st.get("error") or "Processing failed"),
-            "error",
-            progress,
-            elapsed,
-            "-"
-        )
-
-    if state == "done":
-        return _processing_lottie_card(
-            "Complete",
-            "done",
-            100,
-            elapsed,
-            "Finished"
-        )
-
+    elapsed = max(0.0, time.time() - started)
+    progress_pct = max(0, min(100, int(st.get("progress", 0) or 0)))
+    stage = str(st.get("stage") or "Processing…")
     eta_low = st.get("eta_low")
     eta_high = st.get("eta_high")
-    remaining = "calculating..."
-    if eta_low is not None and eta_high is not None:
-        remaining = f"{_fmt_eta_seconds(max(0,float(eta_low)-elapsed))} - {_fmt_eta_seconds(max(0,float(eta_high)-elapsed))}"
 
-    return _processing_lottie_card(
-        stage,
-        "running",
-        progress,
-        elapsed,
-        remaining
-    )
+    if state == "done":
+        return f"""
+        <div class='process-card done'>
+          <div class='process-icon done-icon'>✓</div>
+          <div class='process-main'><div class='process-top'><b>Complete</b><strong>100%</strong></div>
+          <span>Final video အဆင်သင့်ဖြစ်ပါပြီ • Total {_fmt_eta_seconds(elapsed)}</span>
+          <div class='process-track'><i style='width:100%'></i></div></div>
+        </div>"""
+
+    if state == "error":
+        message = str(st.get("error") or "Processing failed")
+        return f"""
+        <div class='process-card error'>
+          <div class='process-icon error-icon'>!</div>
+          <div class='process-main'><div class='process-top'><b>Processing stopped</b><strong>ERROR</strong></div>
+          <span>{message}</span></div>
+        </div>"""
+
+    # During a long stage, keep the bar visibly moving toward (but never past)
+    # 95% using the original ETA as a secondary estimate. Actual backend
+    # progress remains the lower bound and wins whenever it advances.
+    projected = progress_pct
+    if eta_high and float(eta_high) > 0:
+        projected = max(projected, min(95, int((elapsed / float(eta_high)) * 95)))
+    progress_pct = projected
+
+    if eta_low is not None and eta_high is not None:
+        remain_low = max(0.0, float(eta_low) - elapsed)
+        remain_high = max(0.0, float(eta_high) - elapsed)
+        if remain_high <= 1:
+            remaining = "finishing…"
+        else:
+            remaining = f"~ {_fmt_eta_seconds(remain_low)} – {_fmt_eta_seconds(remain_high)}"
+    else:
+        remaining = "calculating…"
+
+    # Escape the handful of characters that can break our tiny status card.
+    stage = (stage.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return f"""
+    <div class='process-card running'>
+      <div class='process-spinner'></div>
+      <div class='process-main'>
+        <div class='process-top'><b>{stage}</b><strong>{progress_pct}%</strong></div>
+        <span>⏱ Elapsed {_fmt_eta_seconds(elapsed)} &nbsp;•&nbsp; Remaining {remaining}</span>
+        <div class='process-track'><i style='width:{progress_pct}%'></i></div>
+        <small>⚠️ ဒီ page / Colab cell ကို processing ပြီးတဲ့အထိ မပိတ်ပါနဲ့။</small>
+      </div>
+    </div>"""
 
 
 class _LiveProgress:
@@ -3903,16 +3838,11 @@ def create_app():
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
     """
 
-    with gr.Blocks(title="YF Recap V6.8.4 • Mascot Device-Lock Studio") as app:
+    with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
         app._yf_theme = theme
         app._yf_css = css
         app._yf_js = connection_js
         session_id_state = gr.State(lambda: str(uuid.uuid4()))
-        # Persisted separately for every browser. The Admin Space stores only a hash.
-        device_id_state = gr.BrowserState(
-            default_value="",
-            storage_key="yf_recap_device_id_v1",
-        )
         vip_access_state = gr.State({"authenticated": False})
         analysis_state = gr.State({})
         wizard_step = gr.State(1)
@@ -4068,12 +3998,12 @@ def create_app():
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
 
-            gr.HTML("<div class='footer-note'>YF RECAP V6.8.4 • MASCOT LIVE PROCESS • ONE-DEVICE VIP • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.8.3 • AURORA UI • TRUE SUBTITLE SIZE CONTROL • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
         wizard_outputs = [wizard_progress, step1_panel, step2_panel, step3_panel, step4_panel, step5_panel, step6_panel, wizard_step]
 
-        unlock_btn.click(unlock_vip, [vip_code_input, device_id_state], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
-        vip_code_input.submit(unlock_vip, [vip_code_input, device_id_state], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
+        unlock_btn.click(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
+        vip_code_input.submit(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
         logout_btn.click(logout_vip, [], [vip_access_state, login_panel, main_panel, login_status, member_status_html, vip_code_input])
 
         # Wizard navigation.
@@ -4144,16 +4074,6 @@ def create_app():
             _processing_status_html,
             inputs=[session_id_state],
             outputs=[processing_card],
-            queue=False,
-            show_progress="hidden",
-        )
-
-        # BrowserState uses local browser storage. Clearing browser/site data will
-        # create a new token; the old VIP binding then requires an Admin Device Reset.
-        app.load(
-            _ensure_browser_device_id,
-            inputs=[device_id_state],
-            outputs=[device_id_state],
             queue=False,
             show_progress="hidden",
         )
