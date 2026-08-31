@@ -392,52 +392,89 @@ def _subtitle_visual_len(value):
     return count
 
 
-def split_subtitle_display_chunks(text, min_chars=25, max_chars=35):
-    """
-    Split narration into short, readable subtitle cards based on VISIBLE
-    characters rather than raw Unicode codepoints.  A typical card is 25-35
-    visible characters and is intended to stay on ONE LINE.
+def _split_long_unspaced_subtitle_unit(unit, max_chars=35):
+    """Fallback splitter for a very long Burmese unit with no spaces.
 
-    Example:
-      သူ တံခါးကို ဖြည်းဖြည်းဖွင့်လိုက်တော့
-      မထင်မှတ်ထားတဲ့အရာကို တွေ့လိုက်ရတယ်
-    becomes two separate subtitle events.
+    Splits only at Myanmar syllable/grapheme-like boundaries, never through a
+    combining-mark sequence. Normal spaced phrases do not use this fallback.
     """
-    text = (text or "").replace(" ြ", "ြ").replace("ြ ", "ြ").strip()
+    unit = (unit or "").strip()
+    if not unit:
+        return []
+    try:
+        clusters = segment_myanmar_syllables(unit)
+    except Exception:
+        clusters = [unit]
+    out, current = [], ""
+    for cluster in clusters:
+        proposal = current + cluster
+        if current and _subtitle_visual_len(proposal) > max_chars:
+            out.append(current.strip())
+            current = cluster
+        else:
+            current = proposal
+    if current.strip():
+        out.append(current.strip())
+    return out or [unit]
+
+
+def split_subtitle_display_chunks(text, min_chars=25, max_chars=35):
+    """Create readable one-card subtitles without cutting normal words/phrases.
+
+    Rules:
+    - Aim for 25-35 visible characters per subtitle event.
+    - Keep whitespace-delimited words/phrases intact.
+    - Prefer breaks after Burmese/Latin sentence punctuation.
+    - Only split inside a unit when it is itself longer than max_chars and has
+      no usable spaces; that fallback uses Myanmar syllable boundaries.
+    """
+    text = (text or "").replace(" ြ", "ြ").replace("ြ ", "ြ")
+    text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
 
-    try:
-        tokens = segment_myanmar_syllables(text)
-    except Exception:
-        tokens = list(text)
-    if not tokens:
-        return [text]
+    # Keep trailing punctuation attached to each whitespace-delimited unit.
+    raw_units = [u for u in re.findall(r"\S+", text) if u]
+    units = []
+    for unit in raw_units:
+        if _subtitle_visual_len(unit) > max_chars:
+            units.extend(_split_long_unspaced_subtitle_unit(unit, max_chars=max_chars))
+        else:
+            units.append(unit)
 
-    chunks = []
-    current = ""
-    for token in tokens:
-        proposal = current + token
+    chunks, current = [], ""
+    sentence_end = ("။", "!", "?", "…")
+    soft_end = ("၊", ",", ";", ":")
+
+    for unit in units:
+        proposal = unit if not current else f"{current} {unit}"
         proposal_len = _subtitle_visual_len(proposal)
         current_len = _subtitle_visual_len(current)
 
-        # Break once the current phrase is already readable and adding the next
-        # syllable would exceed the 30-visible-character target.
-        if current.strip() and proposal_len > max_chars and current_len >= min_chars:
+        # If adding the next intact unit would overflow, close the current card.
+        if current and proposal_len > max_chars:
             chunks.append(current.strip())
-            current = token
+            current = unit
         else:
             current = proposal
+
+        cur_len = _subtitle_visual_len(current)
+        # Natural punctuation breaks are preferred once the card is readable.
+        if cur_len >= min_chars and current.endswith(sentence_end):
+            chunks.append(current.strip())
+            current = ""
+        elif cur_len >= min_chars and current.endswith(soft_end) and cur_len >= max_chars - 4:
+            chunks.append(current.strip())
+            current = ""
 
     if current.strip():
         chunks.append(current.strip())
 
-    # If the final fragment is too short, merge it only when the merged card
-    # remains reasonably compact. Otherwise leave it as its own short card.
+    # Avoid a tiny final card when it can safely join the previous one.
     if len(chunks) >= 2 and _subtitle_visual_len(chunks[-1]) < min_chars:
-        merged = chunks[-2] + chunks[-1]
-        if _subtitle_visual_len(merged) <= max_chars + 4:
-            chunks[-2] = merged.strip()
+        merged = f"{chunks[-2]} {chunks[-1]}".strip()
+        if _subtitle_visual_len(merged) <= max_chars + 3:
+            chunks[-2] = merged
             chunks.pop()
 
     return [c for c in chunks if c]
@@ -1210,7 +1247,7 @@ def build_ass_subtitles(
 ):
     selected_font_path = resolve_subtitle_font(font_style)
     selected_font_family = detect_font_family(selected_font_path) if selected_font_path else ASS_FONT_FAMILY
-    font_size = max(18, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.74))
+    font_size = max(20, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.82))
     outline = max(2, int(font_size * 0.07))
     # sub_pos_percent now means exact subtitle CENTER Y from the top of the final frame.
     subtitle_y_percent = max(3.0, min(97.0, float(sub_pos_percent)))
@@ -1235,7 +1272,7 @@ def build_ass_subtitles(
         if not txt:
             continue
         if pil_font is not None and draw is not None:
-            wrapped = wrap_text_myanmar_smart(txt, pil_font, int(target_w * 0.90), draw)
+            wrapped = wrap_text_myanmar_smart(txt, pil_font, int(target_w * 0.94), draw)
             txt = r"\N".join(wrapped)
         txt = escape_ass_text(txt).replace(r"\\N", r"\N")
         positioned_txt = rf"{{\an5\pos({subtitle_x},{subtitle_y})}}" + txt
@@ -1390,7 +1427,7 @@ def process_magic_recap_video(
 ):
     video_path = normalize_file_path(video_value)
     logo_path = normalize_file_path(logo_value)
-    bgm_path = normalize_file_path(bgm_value)
+    bgm_path = None  # BGM removed in V6.7
     clone_reference_path = normalize_file_path(clone_reference)
 
     if not video_path or not os.path.exists(video_path):
@@ -1559,7 +1596,7 @@ def process_magic_recap_video(
         if not subtitle_segments:
             raise RuntimeError("TTS Voice ဖန်တီး၍ မရပါ။")
 
-        # 4) Merge narration audio and optional BGM.
+        # 4) Merge narration audio only. BGM is disabled in V6.7.
         progress(0.55, desc="🔊 04/06 • Audio tracks ပေါင်းနေသည်...")
         concat_list = os.path.join(work_dir, "audio_concat.txt")
         with open(concat_list, "w", encoding="utf-8") as f:
@@ -1872,6 +1909,28 @@ def create_app_legacy():
     .output-card { border-color:rgba(52,211,153,.18) !important; }
     .footer-note { text-align:center; color:#65708e; font-size:11px; padding:18px 0 2px; }
     @media (max-width:760px) { .hero-pro{padding:22px 18px}.mini-grid{grid-template-columns:1fr}.member-strip{align-items:flex-start;flex-direction:column}.quota-badge{align-self:flex-start} }
+
+    /* V6.7 mobile-first refinement */
+    .audio-clean-card{border-color:#10b98142!important;background:linear-gradient(180deg,#071c1b99,#0a1325f0)!important}
+    .clean-audio-badge{margin-top:10px;padding:9px 11px;border-radius:12px;background:#10b98112;border:1px solid #34d39935;color:#a7f3d0;font-size:11px;font-weight:800;line-height:1.45}
+    .gradio-container label span{font-weight:800!important}
+    @media(max-width:860px){
+      .gradio-container{max-width:100%!important;padding:6px!important}
+      .glass-card{margin-bottom:8px!important}
+      .gradio-container video{width:100%!important;max-height:58vh!important;border-radius:14px!important}
+      .gradio-container input,.gradio-container textarea,.gradio-container select{font-size:16px!important}
+      .gradio-container button{min-height:52px!important;border-radius:14px!important}
+      #auto-recap-btn{min-height:62px!important;font-size:17px!important;bottom:8px!important}
+      #yf-download-btn{width:100%!important;min-height:58px!important}
+      .final-top{align-items:flex-start!important}.final-badge{font-size:9px!important}
+    }
+    @media(max-width:480px){
+      .yf-hero{padding:15px 12px!important}.yf-name{font-size:19px!important}.yf-tag{line-height:1.35!important}
+      .glass-card{padding:10px!important;border-radius:15px!important}
+      .step-head{font-size:13px!important}.hint{font-size:10px!important}
+      .gradio-container video{max-height:55vh!important}
+      #auto-recap-btn{font-size:16px!important}
+    }
     """
     theme = gr.themes.Soft(primary_hue="violet", secondary_hue="cyan", neutral_hue="slate")
 
@@ -2130,10 +2189,9 @@ def create_app_legacy():
                     blur_height_percent = gr.Number(value=12, visible=False)
                     blur_strength = gr.Slider(5, 151, value=51, step=2, label="Final Blur Strength")
 
-            with gr.Accordion("✨ Brand, BGM & Advanced", open=False):
-                with gr.Row():
-                    bgm_file = gr.Audio(label="Background Music", type="filepath")
-                    bgm_vol = gr.Slider(1, 50, value=15, step=1, label="BGM Volume (%)")
+            with gr.Accordion("✨ Brand & Advanced", open=False):
+                bgm_file = gr.State(None)
+                bgm_vol = gr.State(0)
                 with gr.Row():
                     logo_file = gr.File(label="Logo PNG", file_types=["image"])
                     filter_color = gr.Dropdown(
@@ -2588,75 +2646,31 @@ def mix_story_audio(voice_path, original_path, bgm_path, narration_volume, origi
 def mix_story_audio_full_duration(voice_path, source_video_path, bgm_path, narration_volume,
                                   original_volume, bgm_volume, auto_duck_bgm,
                                   total_duration, output_path):
-    # YF Recap: original movie audio is always muted/removed from the final output.
-    original_volume = 0
-    source_video_path = None
-    """Mix narration/BGM while forcing the output audio to source duration.
+    """Narration-only final audio, padded to the uploaded video's duration.
 
-    Narration is padded with silence instead of truncating the final movie when
-    the generated voice track is shorter than the uploaded video.
+    YF Recap V6.7 intentionally removes BOTH the original movie audio and BGM.
+    Only generated narration is present in the final MP4.  Silence is padded at
+    the end when narration is shorter than the source so duration stays locked.
     """
     total_duration = max(0.5, float(total_duration))
-    inputs = ["-i", voice_path]
-    orig_idx = None
-    bgm_idx = None
-    idx = 1
-    if source_video_path and os.path.exists(source_video_path) and float(original_volume) > 0 and video_has_audio(source_video_path):
-        orig_idx = idx
-        inputs += ["-i", source_video_path]
-        idx += 1
-    if bgm_path and os.path.exists(bgm_path) and float(bgm_volume) > 0:
-        bgm_idx = idx
-        inputs += ["-stream_loop", "-1", "-i", bgm_path]
-        idx += 1
-
     nv = max(0.0, min(2.0, float(narration_volume) / 100.0))
-    ov = max(0.0, min(1.0, float(original_volume) / 100.0))
-    bv = max(0.0, min(1.0, float(bgm_volume) / 100.0))
-
-    # Narration always becomes exactly source-length by padding silence then trimming.
-    if bgm_idx is not None and auto_duck_bgm:
-        filters = [
-            f"[0:a]volume={nv:.4f},apad=whole_dur={total_duration:.3f},atrim=duration={total_duration:.3f},asplit=2[voicemix][voicesc]"
-        ]
-        mix_labels = ["[voicemix]"]
-    else:
-        filters = [
-            f"[0:a]volume={nv:.4f},apad=whole_dur={total_duration:.3f},atrim=duration={total_duration:.3f}[voice]"
-        ]
-        mix_labels = ["[voice]"]
-
-    if orig_idx is not None:
-        filters.append(
-            f"[{orig_idx}:a]volume={ov:.4f},atrim=duration={total_duration:.3f},apad=whole_dur={total_duration:.3f}[orig]"
-        )
-        mix_labels.append("[orig]")
-
-    if bgm_idx is not None:
-        filters.append(
-            f"[{bgm_idx}:a]volume={bv:.4f},atrim=duration={total_duration:.3f}[bgmraw]"
-        )
-        if auto_duck_bgm:
-            filters.append(
-                "[bgmraw][voicesc]sidechaincompress=threshold=0.015:ratio=10:attack=12:release=350[bgm]"
-            )
-        else:
-            filters.append("[bgmraw]anull[bgm]")
-        mix_labels.append("[bgm]")
-
-    filters.append(
-        "".join(mix_labels)
-        + f"amix=inputs={len(mix_labels)}:duration=longest:dropout_transition=2,"
-          f"atrim=duration={total_duration:.3f},alimiter=limit=0.95[aout]"
+    filters = (
+        f"[0:a]volume={nv:.4f},"
+        f"apad=whole_dur={total_duration:.3f},"
+        f"atrim=duration={total_duration:.3f},"
+        "alimiter=limit=0.95[aout]"
     )
-
     r = subprocess.run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
-        "-filter_complex", ";".join(filters), "-map", "[aout]",
-        "-t", f"{total_duration:.3f}", "-c:a", "aac", "-b:a", "192k", output_path,
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", voice_path,
+        "-filter_complex", filters,
+        "-map", "[aout]",
+        "-t", f"{total_duration:.3f}",
+        "-c:a", "aac", "-b:a", "160k",
+        output_path,
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if r.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError("Full-duration audio mixer failed: " + (r.stderr or "Unknown error")[-800:])
+        raise RuntimeError("Narration-only audio build failed: " + (r.stderr or "Unknown error")[-800:])
     return output_path
 
 
@@ -2923,7 +2937,7 @@ def render_reviewed_script_v3(
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", merged_voice,
                     "-c:a", "libmp3lame", "-b:a", "192k", narration_mp3], check=False)
 
-    progress(0.45, desc="🎚️ Original Audio + BGM Mixer ပြင်နေသည်...")
+    progress(0.45, desc="🎙️ Narration-only audio ပြင်နေသည်...")
     source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
     if source_duration <= 0.5:
         source_duration = max(0.5, probe_duration(video_path, fallback=timeline))
@@ -3271,7 +3285,7 @@ def auto_recap_pipeline_v5(
     elapsed = time.time() - started
     status = (
         "### ✅ AUTO RECAP COMPLETE\n"
-        "Analyze + Viral Script + Narration + Render + Export အားလုံးပြီးပါပြီ။  \n"
+        "Analyze + Viral Script + Narration + Subtitle + Render အားလုံးပြီးပါပြီ။  \n"
         f"**Total time:** {_fmt_eta_seconds(elapsed)}"
     )
     # The first output feeds the video preview; the second feeds the dedicated
@@ -3298,7 +3312,7 @@ def create_app():
     }
     @media(max-width:430px){.gradio-container{padding-left:5px!important;padding-right:5px!important}.yf-brand{gap:10px}.yf-logo{width:46px;height:46px;flex-basis:46px}.yf-name{font-size:20px}.glass-card{padding:10px!important}.eta-icon{width:34px;height:34px;flex-basis:34px}.step-no{width:26px;height:26px;flex-basis:26px}}
 
-    /* YF Recap V6 — Neo UI */
+    /* YF Recap V6.7 — Mobile Studio UI */
     :root{--neo:#38bdf8;--neo2:#8b5cf6;--neo-bg:#060912;--neo-card:#0d1423}
     .neo-hero{background:linear-gradient(145deg,#0b1222 0%,#11172c 55%,#172044 100%)!important;border:1px solid #2c3b61!important;position:relative}
     .neo-hero:after{content:"";position:absolute;width:210px;height:210px;right:-70px;top:-90px;border-radius:999px;background:radial-gradient(circle,#38bdf833,transparent 68%);pointer-events:none}
@@ -3417,7 +3431,7 @@ def create_app():
                         text_color=gr.ColorPicker(label="Subtitle Text",value="#FFFF00")
                         stroke_color=gr.ColorPicker(label="Outline",value="#000000")
                     with gr.Row(elem_classes=["mobile-stack"]):
-                        subtitle_size=gr.Slider(1.6,4.0,value=2.5,step=.1,label="Font Size (Compact)")
+                        subtitle_size=gr.Slider(1.8,4.5,value=2.9,step=.1,label="Subtitle Size")
                         subtitle_font_style=gr.Dropdown(
                             choices=list(FONT_STYLE_FILES.keys()),
                             value="Noto Sans Myanmar (Default)",
@@ -3435,16 +3449,20 @@ def create_app():
                         )
                         font_upload_status=gr.HTML("<div class='hint'>Custom font မတင်ရသေးပါ။ TTF/OTF တင်လျှင် Final subtitle ကို အဲဒီ font နဲ့ render လုပ်ပါမယ်။</div>")
 
+            # BGM and original movie audio are intentionally removed. Hidden states
+            # preserve the backend call signature while guaranteeing narration-only output.
+            bgm_file=gr.State(None)
+            original_vol=gr.State(0)
+            bgm_vol=gr.State(0)
+            auto_duck=gr.State(False)
+
             with gr.Row(equal_height=False,elem_classes=["mobile-stack"]):
-                with gr.Column(scale=6,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Narration + BGM Mixer</div><div class='hint'>Original movie audio ကို Final Video မှာ လုံးဝဖယ်ထားပါတယ်။</div>")
-                    bgm_file=gr.Audio(label="Background Music",type="filepath")
-                    narration_vol=gr.Slider(0,150,value=100,step=1,label="Narration Volume %")
-                    original_vol=gr.Number(value=0,visible=False)
-                    bgm_vol=gr.Slider(0,50,value=12,step=1,label="BGM Volume %")
-                    auto_duck=gr.Checkbox(label="Auto Duck BGM while Narrator speaks",value=True)
-                with gr.Column(scale=6,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>6</span> Fast Render Settings</div>")
+                with gr.Column(scale=5,elem_classes=["glass-card","audio-clean-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Clean Narration</div><div class='hint'>Final Video မှာ AI narration အသံပဲပါမယ်။ Original movie audio နဲ့ BGM နှစ်ခုလုံး လုံးဝမပါပါ။</div>")
+                    narration_vol=gr.Slider(70,130,value=100,step=1,label="Narration Volume %")
+                    gr.HTML("<div class='clean-audio-badge'>✓ Narration only · No original audio · No BGM</div>")
+                with gr.Column(scale=7,elem_classes=["glass-card"]):
+                    gr.HTML("<div class='step-head'><span class='step-no'>6</span> Video Output</div><div class='hint'>Mobile/TikTok အတွက် 9:16 + Turbo 24 FPS ကိုအကြံပြုပါတယ်။</div>")
                     with gr.Row(elem_classes=["mobile-stack"]):
                         ratio_select=gr.Dropdown(choices=["9:16 (TikTok/Reels)","16:9 (Landscape)"],value="9:16 (TikTok/Reels)",label="Output Ratio")
                         render_mode=gr.Radio(choices=["⚡ Turbo 24 FPS (Recommended)","🎬 Balanced 30 FPS"],value="⚡ Turbo 24 FPS (Recommended)",label="Render Mode")
@@ -3480,7 +3498,7 @@ def create_app():
                 srt_file=gr.File(visible=False)
                 mp3_file=gr.File(visible=False)
                 script_file=gr.File(visible=False)
-            gr.HTML("<div class='footer-note'>YF RECAP V6.6 • ORIGINAL AUDIO REMOVED • EXACT PREVIEW→FINAL LAYOUT • DIRECT DOWNLOAD • GEMINI AUTO • EDGE FALLBACK • SOURCE-DURATION LOCK • CUSTOM FONT • ONE-CLICK • MOBILE FIRST</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.7 • NO BGM • NARRATION ONLY • SMART BURMESE SUBTITLES • MOBILE FIRST • DIRECT DOWNLOAD</div>")
 
         unlock_btn.click(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
         vip_code_input.submit(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
