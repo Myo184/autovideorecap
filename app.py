@@ -5,6 +5,7 @@
 # Recommended Runtime: T4 GPU (Runtime > Change runtime type > T4 GPU)
 
 import os, sys, subprocess, importlib.util, shutil
+import threading
 import base64
 import socket
 import platform
@@ -1247,7 +1248,7 @@ def build_ass_subtitles(
 ):
     selected_font_path = resolve_subtitle_font(font_style)
     selected_font_family = detect_font_family(selected_font_path) if selected_font_path else ASS_FONT_FAMILY
-    font_size = max(20, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.82))
+    font_size = max(22, int(target_h * (float(subtitle_size_percent) / 100.0) * 0.86))
     outline = max(2, int(font_size * 0.07))
     # sub_pos_percent now means exact subtitle CENTER Y from the top of the final frame.
     subtitle_y_percent = max(3.0, min(97.0, float(sub_pos_percent)))
@@ -3181,6 +3182,143 @@ def render_start_status(analysis_state, script_editor, voice_engine, render_mode
 
 
 
+# ----------------------------------------------------------------
+# LIVE PROCESS STATUS (V6.8.2)
+# ----------------------------------------------------------------
+# The long render runs in the Gradio queue. A small non-queued Timer polls
+# this per-session state so mobile users always see visible activity, stage,
+# percent, elapsed time and an estimated remaining time.
+PROCESS_STATUS = {}
+PROCESS_STATUS_LOCK = threading.Lock()
+
+
+def _set_process_status(session_id, **updates):
+    sid = str(session_id or "default")
+    with PROCESS_STATUS_LOCK:
+        current = dict(PROCESS_STATUS.get(sid, {}))
+        current.update(updates)
+        current["updated"] = time.time()
+        PROCESS_STATUS[sid] = current
+    return current
+
+
+def _get_process_status(session_id):
+    sid = str(session_id or "default")
+    with PROCESS_STATUS_LOCK:
+        return dict(PROCESS_STATUS.get(sid, {}))
+
+
+def _auto_recap_eta_window(video_value, recap_length, voice_engine, render_mode, voxcpm_steps):
+    """Return numeric low/high ETA seconds for the live countdown card."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return None, None
+    duration = probe_duration(video_path, fallback=300.0)
+    target = _target_seconds(recap_length, duration)
+    engine = str(voice_engine or "")
+    steps = max(4.0, float(voxcpm_steps or 10))
+    if "Edge TTS" in engine:
+        low = 45 + target * 0.55
+        high = 180 + target * 1.45
+    else:
+        factor = steps / 10.0
+        low = 70 + target * 0.85 * factor
+        high = 240 + target * 2.10 * factor
+    if not HAS_NVENC:
+        low += target * 0.35
+        high += target * 0.90
+    elif "Balanced" in str(render_mode or ""):
+        low += target * 0.12
+        high += target * 0.30
+    high = max(high, low * 1.25)
+    return float(low), float(high)
+
+
+def _processing_status_html(session_id):
+    st = _get_process_status(session_id)
+    state = st.get("state", "idle")
+    if state == "idle":
+        return """
+        <div class='process-card idle'>
+          <div class='process-icon'>◷</div>
+          <div class='process-main'><b>Waiting to start</b><span>AUTO RECAP နှိပ်လိုက်ရင် live processing status ကို ဒီနေရာမှာပြမယ်။</span></div>
+        </div>"""
+
+    started = float(st.get("started") or time.time())
+    elapsed = max(0.0, time.time() - started)
+    progress_pct = max(0, min(100, int(st.get("progress", 0) or 0)))
+    stage = str(st.get("stage") or "Processing…")
+    eta_low = st.get("eta_low")
+    eta_high = st.get("eta_high")
+
+    if state == "done":
+        return f"""
+        <div class='process-card done'>
+          <div class='process-icon done-icon'>✓</div>
+          <div class='process-main'><div class='process-top'><b>Complete</b><strong>100%</strong></div>
+          <span>Final video အဆင်သင့်ဖြစ်ပါပြီ • Total {_fmt_eta_seconds(elapsed)}</span>
+          <div class='process-track'><i style='width:100%'></i></div></div>
+        </div>"""
+
+    if state == "error":
+        message = str(st.get("error") or "Processing failed")
+        return f"""
+        <div class='process-card error'>
+          <div class='process-icon error-icon'>!</div>
+          <div class='process-main'><div class='process-top'><b>Processing stopped</b><strong>ERROR</strong></div>
+          <span>{message}</span></div>
+        </div>"""
+
+    # During a long stage, keep the bar visibly moving toward (but never past)
+    # 95% using the original ETA as a secondary estimate. Actual backend
+    # progress remains the lower bound and wins whenever it advances.
+    projected = progress_pct
+    if eta_high and float(eta_high) > 0:
+        projected = max(projected, min(95, int((elapsed / float(eta_high)) * 95)))
+    progress_pct = projected
+
+    if eta_low is not None and eta_high is not None:
+        remain_low = max(0.0, float(eta_low) - elapsed)
+        remain_high = max(0.0, float(eta_high) - elapsed)
+        if remain_high <= 1:
+            remaining = "finishing…"
+        else:
+            remaining = f"~ {_fmt_eta_seconds(remain_low)} – {_fmt_eta_seconds(remain_high)}"
+    else:
+        remaining = "calculating…"
+
+    # Escape the handful of characters that can break our tiny status card.
+    stage = (stage.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return f"""
+    <div class='process-card running'>
+      <div class='process-spinner'></div>
+      <div class='process-main'>
+        <div class='process-top'><b>{stage}</b><strong>{progress_pct}%</strong></div>
+        <span>⏱ Elapsed {_fmt_eta_seconds(elapsed)} &nbsp;•&nbsp; Remaining {remaining}</span>
+        <div class='process-track'><i style='width:{progress_pct}%'></i></div>
+        <small>⚠️ ဒီ page / Colab cell ကို processing ပြီးတဲ့အထိ မပိတ်ပါနဲ့။</small>
+      </div>
+    </div>"""
+
+
+class _LiveProgress:
+    """Forward Gradio progress and mirror it into the on-page live status card."""
+    def __init__(self, parent, session_id):
+        self.parent = parent
+        self.session_id = session_id
+
+    def __call__(self, value=0.0, desc=None, **kwargs):
+        try:
+            frac = max(0.0, min(1.0, float(value)))
+        except Exception:
+            frac = 0.0
+        updates = {"state": "running", "progress": int(frac * 100)}
+        if desc:
+            updates["stage"] = str(desc)
+        _set_process_status(self.session_id, **updates)
+        return self.parent(frac, desc=desc, **kwargs)
+
+
 class _ProgressSlice:
     """Map a child task's 0..1 progress into one part of overall Auto Recap."""
     def __init__(self, parent, start, end):
@@ -3238,60 +3376,87 @@ def auto_recap_pipeline_v5(
     session_id, vip_access_state,
     progress=gr.Progress(track_tqdm=False),
 ):
-    """One user action: Analyze → script → narration → render → exports."""
+    """One user action: Analyze → script → narration → render → exports, with live UI status."""
     if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        _set_process_status(session_id, state="error", error="VIP Login ပြန်ဝင်ပါ။")
         raise gr.Error("🔒 VIP Login ပြန်ဝင်ပါ။")
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
+        _set_process_status(session_id, state="error", error="Movie / clip ကိုအရင် Upload လုပ်ပါ။")
         raise gr.Error("🎬 Movie / clip ကိုအရင် Upload လုပ်ပါ။")
 
     if "Voice Clone" in str(voice_engine):
         ref = normalize_file_path(clone_reference)
         if not clone_consent:
+            _set_process_status(session_id, state="error", error="Voice Clone permission checkbox လိုအပ်ပါတယ်။")
             raise gr.Error("🎙️ Voice Clone permission checkbox ကို အမှန်ခြစ်ပါ။")
         if not ref or not os.path.exists(ref):
+            _set_process_status(session_id, state="error", error="Voice Clone Reference MP3/WAV လိုအပ်ပါတယ်။")
             raise gr.Error("🎙️ Voice Clone အတွက် Reference MP3/WAV ထည့်ပါ။")
 
     started = time.time()
-    progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
+    previous = _get_process_status(session_id)
+    eta_low = previous.get("eta_low")
+    eta_high = previous.get("eta_high")
+    if eta_low is None or eta_high is None:
+        eta_low, eta_high = _auto_recap_eta_window(video_value, recap_length, voice_engine, render_mode, voxcpm_steps)
 
-    # Stage 1: speech / scene analysis (hidden from the user UI).
-    analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
-        video_value, vip_access_state,
-        progress=_ProgressSlice(progress, 0.01, 0.18),
+    _set_process_status(
+        session_id, state="running", started=started, progress=1,
+        stage="🎬 AUTO RECAP စတင်နေသည်…", eta_low=eta_low, eta_high=eta_high, error=""
     )
+    live_progress = _LiveProgress(progress, session_id)
 
-    # Stage 2: viral storytelling script (hidden from the user UI).
-    script_text, _script_summary = generate_recap_script_v3(
-        analysis, user_api_key, tone_style, recap_length,
-        progress=_ProgressSlice(progress, 0.18, 0.34),
-    )
+    try:
+        live_progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
 
-    # Stage 3: voice + scene render + exports.
-    result = render_reviewed_script_v3(
-        analysis, script_text,
-        ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
-        bgm_value, narration_volume, original_volume, bgm_volume, auto_duck_bgm,
-        mirror_flip, filter_color,
-        voice_engine, edge_voice_name, voice_preset, custom_voice_description,
-        clone_reference, clone_transcript, clone_consent,
-        voxcpm_cfg, voxcpm_steps, voxcpm_seed,
-        text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
-        sub_pos_percent, subtitle_size_percent, subtitle_font_style, desired_speed, render_mode,
-        session_id, vip_access_state,
-        progress=_ProgressSlice(progress, 0.34, 1.0),
-    )
-    out_video, srt_path, mp3_path, script_path, _old_status = result
-    elapsed = time.time() - started
-    status = (
-        "### ✅ AUTO RECAP COMPLETE\n"
-        "Analyze + Viral Script + Narration + Subtitle + Render အားလုံးပြီးပါပြီ။  \n"
-        f"**Total time:** {_fmt_eta_seconds(elapsed)}"
-    )
-    # The first output feeds the video preview; the second feeds the dedicated
-    # DownloadButton. Both use the same stable published MP4 path.
-    return out_video, out_video, srt_path, mp3_path, script_path, status
+        # Stage 1: speech / scene analysis (hidden from the user UI).
+        analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
+            video_value, vip_access_state,
+            progress=_ProgressSlice(live_progress, 0.01, 0.18),
+        )
 
+        # Stage 2: viral storytelling script (hidden from the user UI).
+        live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
+        script_text, _script_summary = generate_recap_script_v3(
+            analysis, user_api_key, tone_style, recap_length,
+            progress=_ProgressSlice(live_progress, 0.18, 0.34),
+        )
+
+        # Stage 3: narration + scene render + exports. The child function's
+        # Gradio progress (including FFmpeg render ETA) is mirrored live.
+        live_progress(0.34, desc="🎙️ Narration + subtitles + video render ပြင်ဆင်နေသည်…")
+        result = render_reviewed_script_v3(
+            analysis, script_text,
+            ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
+            bgm_value, narration_volume, original_volume, bgm_volume, auto_duck_bgm,
+            mirror_flip, filter_color,
+            voice_engine, edge_voice_name, voice_preset, custom_voice_description,
+            clone_reference, clone_transcript, clone_consent,
+            voxcpm_cfg, voxcpm_steps, voxcpm_seed,
+            text_color, stroke_color, blur_y_percent, blur_height_percent, blur_strength,
+            sub_pos_percent, subtitle_size_percent, subtitle_font_style, desired_speed, render_mode,
+            session_id, vip_access_state,
+            progress=_ProgressSlice(live_progress, 0.34, 1.0),
+        )
+        out_video, srt_path, mp3_path, script_path, _old_status = result
+        elapsed = time.time() - started
+        _set_process_status(
+            session_id, state="done", progress=100,
+            stage="✅ Final video အဆင်သင့်ဖြစ်ပါပြီ", finished=time.time()
+        )
+        status = (
+            "### ✅ AUTO RECAP COMPLETE\n"
+            "Analyze + Viral Script + Narration + Subtitle + Render အားလုံးပြီးပါပြီ။  \n"
+            f"**Total time:** {_fmt_eta_seconds(elapsed)}"
+        )
+        return out_video, out_video, srt_path, mp3_path, script_path, status
+    except Exception as e:
+        _set_process_status(
+            session_id, state="error", progress=0,
+            stage="❌ Processing stopped", error=str(e)[:500]
+        )
+        raise
 
 def _wizard_progress_html(step):
     step = max(1, min(6, int(step)))
@@ -3341,6 +3506,33 @@ def _wizard_validate_voice(engine, clone_reference, clone_consent):
     return _wizard_payload(4)
 
 
+def _start_auto_recap_feedback(video_value, recap_length, voice_engine, render_mode, voxcpm_steps, session_id):
+    """Immediate mobile feedback + initialize the live ETA/countdown state."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        raise gr.Error("🎬 Movie / clip ကိုအရင် Upload လုပ်ပါ။")
+
+    eta_low, eta_high = _auto_recap_eta_window(
+        video_value, recap_length, voice_engine, render_mode, voxcpm_steps
+    )
+    now = time.time()
+    _set_process_status(
+        session_id,
+        state="running", started=now, progress=1,
+        stage="🚀 Request လက်ခံပြီး processing စတင်နေသည်…",
+        eta_low=eta_low, eta_high=eta_high, error=""
+    )
+
+    eta_html = estimate_auto_recap_eta(
+        video_value, recap_length, voice_engine, render_mode, voxcpm_steps
+    )
+    status = (
+        "### 🚀 AUTO RECAP STARTED\n"
+        "Button click ကိုလက်ခံပြီးပါပြီ။  \n"
+        "အောက်က **Live Processing** card မှာ loading, လက်ရှိအဆင့်, %, elapsed နဲ့ remaining time ကိုကြည့်နိုင်ပါတယ်။"
+    )
+    return eta_html, status, _processing_status_html(session_id)
+
 def create_app():
     css = r"""
     :root{--bg:#050812;--card:#0d1424;--card2:#111b31;--line:#263755;--cyan:#22d3ee;--blue:#2563eb;--violet:#7c3aed;--green:#34d399;--text:#f8fafc;--muted:#91a1bd;--gold:#facc15}
@@ -3356,7 +3548,7 @@ def create_app():
     .wiz-nav{margin-top:13px!important}.wiz-next,.wiz-back{min-height:50px!important;border-radius:13px!important;font-weight:900!important}.wiz-next{background:linear-gradient(90deg,#6d28d9,#2563eb,#0891b2)!important;color:#fff!important;border:0!important}.wiz-back{background:#111827!important;border:1px solid #334155!important;color:#cbd5e1!important}
     .login-shell-pro{max-width:600px;margin:24px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:24px!important}.login-head{text-align:center;font-size:23px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:11px;margin:6px 0 14px}.member-strip{padding:11px 14px;border:1px solid #34d39945;background:#34d3990d;border-radius:14px;margin-bottom:9px}.member-name{font-weight:900}.member-small{font-size:9px;color:#7dd3fc}.quota-badge{font-size:9px;color:#fde68a}
     .engine-panel{border:1px solid #334268!important;background:#0a1229aa!important;border-radius:16px!important;padding:12px!important;margin-top:8px!important}.clone-panel{border-color:#8b5cf65c!important;background:linear-gradient(180deg,#3a1d6a26,#0a1229d9)!important}.clone-title{font-weight:950;color:#ddd6fe;margin-bottom:4px}.clone-copy,.hint{font-size:10px;color:#91a1bd;line-height:1.5}.voice-mode-title{font-weight:950;color:#e0f2fe}.font-ok,.font-warn{font-size:10px;line-height:1.45;padding:8px 10px;border-radius:10px;margin-top:6px}.font-ok{color:#a7f3d0;background:#34d39912;border:1px solid #34d39935}.font-warn{color:#fde68a;background:#f59e0b12;border:1px solid #f59e0b35}
-    .eta-card{display:flex;align-items:center;gap:11px;width:100%;padding:12px 13px;border-radius:15px;margin:10px 0}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:36px;height:36px;flex:0 0 36px;border-radius:11px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33}.eta-card b{display:block;font-size:12px}.eta-card span,.eta-card small{display:block;color:#9fb0cd;font-size:10px;margin-top:2px}.eta-card small{color:#facc15}
+    .process-card{display:flex;align-items:flex-start;gap:12px;width:100%;padding:14px;border-radius:16px;margin:10px 0;border:1px solid #22d3ee46;background:linear-gradient(110deg,#061426e8,#111738ed);box-shadow:inset 0 1px #ffffff08,0 12px 34px #0003}.process-card.idle{border-color:#47556966;background:#0a1020cc}.process-card.done{border-color:#34d39966;background:linear-gradient(110deg,#05251ce8,#092034ed)}.process-card.error{border-color:#fb718566;background:linear-gradient(110deg,#2b0b14e8,#1c1022ed)}.process-spinner{width:34px;height:34px;flex:0 0 34px;border-radius:50%;border:3px solid #22d3ee2f;border-top-color:#67e8f9;border-right-color:#818cf8;animation:yfspin .8s linear infinite;margin-top:1px}.process-icon{width:34px;height:34px;flex:0 0 34px;border-radius:11px;display:grid;place-items:center;border:1px solid #47556966;color:#94a3b8;font-weight:950}.done-icon{border-color:#34d39966;color:#6ee7b7;background:#10b98118}.error-icon{border-color:#fb718566;color:#fda4af;background:#fb718518}.process-main{min-width:0;flex:1}.process-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.process-top b{font-size:12px;line-height:1.35;color:#f8fafc;overflow-wrap:anywhere}.process-top strong{font-size:11px;color:#67e8f9;white-space:nowrap}.process-main>span{display:block;color:#a9b9d3;font-size:10px;margin-top:4px;line-height:1.45}.process-main>small{display:block;color:#facc15;font-size:9px;margin-top:7px;line-height:1.4}.process-track{height:8px;width:100%;border-radius:999px;background:#020617cc;border:1px solid #33415588;overflow:hidden;margin-top:9px}.process-track i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#2563eb,#22d3ee);box-shadow:0 0 14px #22d3ee66;transition:width .55s ease}@keyframes yfspin{to{transform:rotate(360deg)}}.eta-card{display:flex;align-items:center;gap:11px;width:100%;padding:12px 13px;border-radius:15px;margin:10px 0}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:36px;height:36px;flex:0 0 36px;border-radius:11px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33}.eta-card b{display:block;font-size:12px}.eta-card span,.eta-card small{display:block;color:#9fb0cd;font-size:10px;margin-top:2px}.eta-card small{color:#facc15}
     .clean-audio-badge{padding:10px;border-radius:12px;background:#34d3990c;border:1px solid #34d39935;color:#a7f3d0;font-size:10px;font-weight:850}.generate-summary{padding:12px;border-radius:14px;background:#07111f;border:1px solid #243852;color:#9fb0cb;font-size:10px;line-height:1.7;margin-bottom:12px}.generate-summary b{color:#e0f2fe}
     #auto-recap-btn{min-height:64px!important;border:0!important;border-radius:16px!important;font-size:17px!important;font-weight:950!important;background:linear-gradient(100deg,#6d28d9,#2563eb 50%,#0891b2)!important;box-shadow:0 14px 40px #2563eb40!important;color:white!important}.final-stage{border-color:#22d3ee42!important;background:linear-gradient(155deg,#0b1327,#0e1932)!important}.final-badge{display:inline-flex;padding:6px 9px;border-radius:999px;background:#22c55e12;border:1px solid #22c55e40;color:#86efac;font-size:9px;font-weight:950}.final-copy{font-size:10px;color:#93a4c5;line-height:1.5;margin-bottom:10px}#yf-download-btn{min-height:58px!important;border-radius:15px!important;border:1px solid #67e8f944!important;background:linear-gradient(100deg,#059669,#0891b2,#2563eb)!important;color:white!important;font-weight:950!important;font-size:15px!important;margin-top:10px!important}.download-note{padding:9px 10px;border-radius:11px;background:#07111f99;border:1px solid #334155;color:#8fa3c5;font-size:9px;line-height:1.45;margin-top:8px}.footer-note{text-align:center;color:#52617d;font-size:9px;padding:16px 0}
     input,textarea,select{max-width:100%!important}.gradio-container video{max-height:56vh!important}
@@ -3368,7 +3560,7 @@ def create_app():
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
     """
 
-    with gr.Blocks(title="YF Recap V6.8 • Step Wizard") as app:
+    with gr.Blocks(title="YF Recap V6.8.2 • Live ETA") as app:
         app._yf_theme = theme
         app._yf_css = css
         app._yf_js = connection_js
@@ -3475,7 +3667,7 @@ def create_app():
                 with gr.Row(elem_classes=["mobile-stack"]):
                     text_color = gr.ColorPicker(label="Subtitle Text", value="#FFFF00")
                     stroke_color = gr.ColorPicker(label="Outline", value="#000000")
-                subtitle_size = gr.Slider(1.8, 4.5, value=2.9, step=.1, label="Subtitle Size")
+                subtitle_size = gr.Slider(2.0, 5.0, value=3.3, step=.1, label="Subtitle Size")
                 subtitle_font_style = gr.Dropdown(choices=list(FONT_STYLE_FILES.keys()), value="Noto Sans Myanmar (Default)", label="Subtitle Font Style")
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
                 font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
@@ -3509,6 +3701,7 @@ def create_app():
                 zoom_level = gr.Slider(1.0, 3.0, value=1.0, step=.1, label="Zoom")
                 mirror_flip = gr.Checkbox(label="Mirror Flip", value=False)
                 eta_card = gr.HTML("<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div><b>Ready</b><span>Video + settings အဆင်သင့်ဖြစ်ရင် AUTO RECAP တစ်ခုပဲနှိပ်ပါ။</span></div></div>")
+                processing_card = gr.HTML(_processing_status_html(None))
                 auto_recap_btn = gr.Button("✨  AUTO RECAP — GENERATE VIDEO", variant="primary", elem_id="auto-recap-btn")
                 render_status = gr.Markdown()
                 with gr.Row(elem_classes=["wiz-nav"]):
@@ -3526,7 +3719,7 @@ def create_app():
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
 
-            gr.HTML("<div class='footer-note'>YF RECAP V6.8 • FULL BACKEND • STEP WIZARD • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.8.2 • LIVE LOADING + ETA • BIGGER SUBTITLES • FULL BACKEND • STEP WIZARD • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
         wizard_outputs = [wizard_progress, step1_panel, step2_panel, step3_panel, step4_panel, step5_panel, step6_panel, wizard_step]
 
@@ -3557,7 +3750,18 @@ def create_app():
             show_progress="hidden",
         )
 
-        auto_evt = auto_recap_btn.click(
+        # IMPORTANT: update the UI first.  In V6.8 the long backend started
+        # immediately, but no component changed until it finished, so on mobile
+        # the button looked as if it did nothing.
+        start_evt = auto_recap_btn.click(
+            _start_auto_recap_feedback,
+            inputs=[video_input, recap_length, voice_engine, render_mode, voxcpm_steps, session_id_state],
+            outputs=[eta_card, render_status, processing_card],
+            queue=False,
+            show_progress="hidden",
+        )
+
+        auto_evt = start_evt.then(
             auto_recap_pipeline_v5,
             inputs=[video_input, user_api_key, tone_style, recap_length,
                     ratio_select, background_fill, enable_zoom, zoom_level, logo_file,
@@ -3571,8 +3775,8 @@ def create_app():
             concurrency_id="yf_auto_recap",
             show_progress="full",
         )
-        # Only after a successful render, move to the Result step.
-        auto_evt.then(lambda: _wizard_payload(6), outputs=wizard_outputs, queue=False, show_progress="hidden")
+        # Result page must open only when the long render actually succeeds.
+        auto_evt.success(lambda: _wizard_payload(6), outputs=wizard_outputs, queue=False, show_progress="hidden")
 
         for _eta_trigger in [video_input, recap_length, voice_engine, render_mode, voxcpm_steps]:
             _eta_trigger.change(
@@ -3582,6 +3786,17 @@ def create_app():
                 queue=False,
                 show_progress="hidden",
             )
+
+        # Poll the per-session live state every second. queue=False keeps this
+        # responsive even while the heavy AUTO RECAP event owns the render queue.
+        live_status_timer = gr.Timer(value=1.0, active=True)
+        live_status_timer.tick(
+            _processing_status_html,
+            inputs=[session_id_state],
+            outputs=[processing_card],
+            queue=False,
+            show_progress="hidden",
+        )
 
     return app
 
