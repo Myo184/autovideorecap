@@ -3408,92 +3408,98 @@ def _auto_recap_eta_window(video_value, recap_length, voice_engine, render_mode,
     return float(low), float(high)
 
 
-def _process_mascot(stage="", state="running"):
-    """Cute lightweight mascot selection without external image assets."""
-    if state == "idle":
-        return "😴"
+LOTTIE_PROCESS_URL = "https://lottie.host/074083ab-c5cc-4727-b011-99ca7b131bff/bRq5PDRmA3.json"
+
+
+def _processing_lottie_card(stage="", state="running", progress=0, elapsed=0, remaining="calculating…"):
+    stage = str(stage or "Processing...")
     if state == "done":
-        return "🥳"
-    if state == "error":
-        return "😵"
-    s = str(stage or "").lower()
-    if any(k in s for k in ["speech", "dialogue", "analyze", "scene", "ဖတ်ယူ", "analy"]):
-        return "🕵️"
-    if any(k in s for k in ["script", "gemini", "story", "recap", "ရေးနေ"]):
-        return "🤖"
-    if any(k in s for k in ["voice", "narration", "tts", "voxcpm", "audio", "အသံ"]):
-        return "🧑‍🎤"
-    if any(k in s for k in ["subtitle", "စာတန်း", "ass track"]):
-        return "🧚"
-    if any(k in s for k in ["render", "ffmpeg", "gpu", "cpu", "video"]):
-        return "🧑‍🎬"
-    if any(k in s for k in ["export", "download", "final", "finishing"]):
-        return "🚀"
-    return "🤖"
+        title = "🥳 Complete"
+    elif state == "error":
+        title = "😵 Error"
+    else:
+        title = stage
+
+    if state == "done":
+        animation = ""
+    else:
+        animation = f"""
+        <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
+        <lottie-player
+            src="{LOTTIE_PROCESS_URL}"
+            background="transparent"
+            speed="1"
+            loop
+            autoplay
+            style="width:90px;height:90px;">
+        </lottie-player>
+        """
+
+    return f"""
+    <div class="process-card lottie-process {state}">
+      <div class="lottie-box">{animation}</div>
+      <div class="process-main">
+        <div class="process-top">
+          <b>{title}</b>
+          <strong>{int(progress)}%</strong>
+        </div>
+        <span>⏱ Elapsed { _fmt_eta_seconds(elapsed) } • ⏳ Remaining {remaining}</span>
+        <div class="process-track"><i style="width:{max(0,min(100,int(progress)))}%"></i></div>
+        <small>YF Recap AI is processing. Please keep this page open.</small>
+      </div>
+    </div>
+    """
 
 
 def _processing_status_html(session_id):
     st = _get_process_status(session_id)
     state = st.get("state", "idle")
+
     if state == "idle":
-        return """
-        <div class='process-card idle'>
-          <div class='process-mascot idle-mascot'><span>😴</span><i></i></div>
-          <div class='process-main'><b>Waiting to start</b><span>AUTO RECAP နှိပ်လိုက်ရင် အရုပ်လေးက process အဆင့်လိုက် ပြောင်းပြီး Live Status ပြပါမယ်။</span></div>
-        </div>"""
+        return _processing_lottie_card(
+            "Waiting...",
+            "idle",
+            0,
+            0,
+            "start processing"
+        )
 
     started = float(st.get("started") or time.time())
-    elapsed = max(0.0, time.time() - started)
-    progress_pct = max(0, min(100, int(st.get("progress", 0) or 0)))
-    stage = str(st.get("stage") or "Processing…")
-    eta_low = st.get("eta_low")
-    eta_high = st.get("eta_high")
-
-    if state == "done":
-        return f"""
-        <div class='process-card done'>
-          <div class='process-mascot done-mascot'><span>🥳</span><i></i></div>
-          <div class='process-main'><div class='process-top'><b>Complete</b><strong>100%</strong></div>
-          <span>Final video အဆင်သင့်ဖြစ်ပါပြီ • Total {_fmt_eta_seconds(elapsed)}</span>
-          <div class='process-track'><i style='width:100%'></i></div></div>
-        </div>"""
+    elapsed = max(0, time.time() - started)
+    progress = st.get("progress", 0) or 0
+    stage = st.get("stage", "Processing")
 
     if state == "error":
-        message = str(st.get("error") or "Processing failed")
-        return f"""
-        <div class='process-card error'>
-          <div class='process-mascot error-mascot'><span>😵</span><i></i></div>
-          <div class='process-main'><div class='process-top'><b>Processing stopped</b><strong>ERROR</strong></div>
-          <span>{message}</span></div>
-        </div>"""
+        return _processing_lottie_card(
+            str(st.get("error") or "Processing failed"),
+            "error",
+            progress,
+            elapsed,
+            "-"
+        )
 
-    projected = progress_pct
-    if eta_high and float(eta_high) > 0:
-        projected = max(projected, min(95, int((elapsed / float(eta_high)) * 95)))
-    progress_pct = projected
+    if state == "done":
+        return _processing_lottie_card(
+            "Complete",
+            "done",
+            100,
+            elapsed,
+            "Finished"
+        )
 
+    eta_low = st.get("eta_low")
+    eta_high = st.get("eta_high")
+    remaining = "calculating..."
     if eta_low is not None and eta_high is not None:
-        remain_low = max(0.0, float(eta_low) - elapsed)
-        remain_high = max(0.0, float(eta_high) - elapsed)
-        if remain_high <= 1:
-            remaining = "finishing…"
-        else:
-            remaining = f"~ {_fmt_eta_seconds(remain_low)} – {_fmt_eta_seconds(remain_high)}"
-    else:
-        remaining = "calculating…"
+        remaining = f"{_fmt_eta_seconds(max(0,float(eta_low)-elapsed))} - {_fmt_eta_seconds(max(0,float(eta_high)-elapsed))}"
 
-    stage_safe = stage.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    mascot = _process_mascot(stage, "running")
-    return f"""
-    <div class='process-card running'>
-      <div class='process-mascot running-mascot'><span>{mascot}</span><i></i><b>•••</b></div>
-      <div class='process-main'>
-        <div class='process-top'><b>{stage_safe}</b><strong>{progress_pct}%</strong></div>
-        <span>⏱ Elapsed {_fmt_eta_seconds(elapsed)} &nbsp;•&nbsp; Remaining {remaining}</span>
-        <div class='process-track'><i style='width:{progress_pct}%'></i></div>
-        <small>⚠️ ဒီ page / Colab cell ကို processing ပြီးတဲ့အထိ မပိတ်ပါနဲ့။</small>
-      </div>
-    </div>"""
+    return _processing_lottie_card(
+        stage,
+        "running",
+        progress,
+        elapsed,
+        remaining
+    )
 
 
 class _LiveProgress:
