@@ -2542,6 +2542,9 @@ def build_original_story_audio(video_path, source_segments, voice_durations, out
 
 def mix_story_audio(voice_path, original_path, bgm_path, narration_volume, original_volume,
                     bgm_volume, auto_duck_bgm, output_path):
+    # YF Recap: original movie audio is intentionally removed.
+    original_volume = 0
+    original_path = None
     inputs = ["-i", voice_path]
     orig_idx = None; bgm_idx = None; idx = 1
     if original_path and os.path.exists(original_path) and float(original_volume) > 0:
@@ -2585,7 +2588,10 @@ def mix_story_audio(voice_path, original_path, bgm_path, narration_volume, origi
 def mix_story_audio_full_duration(voice_path, source_video_path, bgm_path, narration_volume,
                                   original_volume, bgm_volume, auto_duck_bgm,
                                   total_duration, output_path):
-    """Mix narration/original/BGM while forcing the output audio to source duration.
+    # YF Recap: original movie audio is always muted/removed from the final output.
+    original_volume = 0
+    source_video_path = None
+    """Mix narration/BGM while forcing the output audio to source duration.
 
     Narration is padded with silence instead of truncating the final movie when
     the generated voice track is shorter than the uploaded video.
@@ -3431,10 +3437,10 @@ def create_app():
 
             with gr.Row(equal_height=False,elem_classes=["mobile-stack"]):
                 with gr.Column(scale=6,elem_classes=["glass-card"]):
-                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Original Audio + BGM Mixer</div>")
+                    gr.HTML("<div class='step-head'><span class='step-no'>5</span> Narration + BGM Mixer</div><div class='hint'>Original movie audio ကို Final Video မှာ လုံးဝဖယ်ထားပါတယ်။</div>")
                     bgm_file=gr.Audio(label="Background Music",type="filepath")
                     narration_vol=gr.Slider(0,150,value=100,step=1,label="Narration Volume %")
-                    original_vol=gr.Slider(0,60,value=10,step=1,label="Original Movie Audio %")
+                    original_vol=gr.Number(value=0,visible=False)
                     bgm_vol=gr.Slider(0,50,value=12,step=1,label="BGM Volume %")
                     auto_duck=gr.Checkbox(label="Auto Duck BGM while Narrator speaks",value=True)
                 with gr.Column(scale=6,elem_classes=["glass-card"]):
@@ -3474,7 +3480,7 @@ def create_app():
                 srt_file=gr.File(visible=False)
                 mp3_file=gr.File(visible=False)
                 script_file=gr.File(visible=False)
-            gr.HTML("<div class='footer-note'>YF RECAP V6.5 • EXACT PREVIEW→FINAL LAYOUT • DIRECT DOWNLOAD • GEMINI AUTO • EDGE FALLBACK • SOURCE-DURATION LOCK • CUSTOM FONT • ONE-CLICK • MOBILE FIRST</div>")
+            gr.HTML("<div class='footer-note'>YF RECAP V6.6 • ORIGINAL AUDIO REMOVED • EXACT PREVIEW→FINAL LAYOUT • DIRECT DOWNLOAD • GEMINI AUTO • EDGE FALLBACK • SOURCE-DURATION LOCK • CUSTOM FONT • ONE-CLICK • MOBILE FIRST</div>")
 
         unlock_btn.click(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
         vip_code_input.submit(unlock_vip,[vip_code_input],[vip_access_state,login_panel,main_panel,login_status,member_status_html])
