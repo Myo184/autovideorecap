@@ -4093,8 +4093,11 @@ def create_app():
     # Optional Lottie artwork shown at the very top of the user page.
     # Keep David Digital Sculpting.json beside this Python file in Colab/Space.
     lottie_json_text = "{}"
-    lottie_candidates = [
-        Path(__file__).resolve().with_name("David Digital Sculpting.json"),
+    script_file = globals().get("__file__")
+    lottie_candidates = ([
+        Path(script_file).resolve().with_name("David Digital Sculpting.json")
+    ] if script_file else []) + [
+        Path("/content/David Digital Sculpting.json"),
         Path.cwd() / "David Digital Sculpting.json",
         Path.cwd() / "upload" / "David Digital Sculpting.json",
     ]
