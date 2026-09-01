@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.8.6 • SUBTITLE ABOVE BLUR • EMERALD GOLD UI"
+YF_BUILD = "V6.8.7 • PERSISTENT RENDER PAGE • EMERALD GOLD UI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -4064,6 +4064,23 @@ def _wizard_payload(step):
     )
 
 
+def _restore_wizard_after_reconnect(saved_step):
+    """Keep the user on the same wizard page after a tunnel/browser reconnect.
+
+    Long Colab renders can outlive a temporary Cloudflare/WebSocket reconnect.
+    BrowserState supplies the last visible step instead of rebuilding at Step 1.
+    Never restore the result page automatically: Step 6 is opened only by the
+    render event's success callback after the final files exist.
+    """
+    try:
+        step = int(saved_step or 1)
+    except Exception:
+        step = 1
+    if step >= 6:
+        step = 5
+    return _wizard_payload(step)
+
+
 def _wizard_after_upload(video_value):
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
@@ -4369,7 +4386,9 @@ def create_app():
         session_id_state = gr.State(lambda: str(uuid.uuid4()))
         vip_access_state = gr.State({"authenticated": False})
         analysis_state = gr.State({})
-        wizard_step = gr.State(1)
+        # BrowserState survives a temporary Cloudflare/Gradio reconnect. This
+        # prevents a long render from visually jumping back to Step 1.
+        wizard_step = gr.BrowserState(1, storage_key="yf_recap_wizard_step_v687")
 
         gr.HTML("""
         <section class='wiz-hero'>
@@ -4548,6 +4567,17 @@ def create_app():
             gr.HTML(f"<div class='footer-note'>YF RECAP {YF_BUILD} • AURORA UI • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
         wizard_outputs = [wizard_progress, step1_panel, step2_panel, step3_panel, step4_panel, step5_panel, step6_panel, wizard_step]
+
+        # Restore the last active wizard page when the browser reconnects. The
+        # VIP login state is intentionally still server-side and is not stored
+        # in the browser.
+        app.load(
+            _restore_wizard_after_reconnect,
+            inputs=[wizard_step],
+            outputs=wizard_outputs,
+            queue=False,
+            show_progress="hidden",
+        )
 
         unlock_btn.click(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
         vip_code_input.submit(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
