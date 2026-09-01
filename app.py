@@ -2066,6 +2066,7 @@ def create_app_legacy():
       .gradio-container{padding:6px 7px 82px!important}.wiz-hero{padding:18px 14px!important;border-radius:22px!important}.wiz-logo{width:50px!important;height:50px!important;flex-basis:50px!important;border-radius:16px!important}.wiz-logo:after{border-radius:14px!important}.wiz-name{font-size:22px!important}.wizard-card{padding:13px!important;border-radius:19px!important}.wizard-title{font-size:18px!important}
       #auto-recap-btn{min-height:64px!important;bottom:10px!important;border-radius:16px!important;font-size:15px!important}
       .sub-size-stage{min-height:70px}.process-card{padding:12px!important}.process-main>span{font-size:9.5px!important}
+
     }
     @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
     """
@@ -3830,6 +3831,16 @@ def create_app():
       .gradio-container{padding:6px 7px 82px!important}.wiz-hero{padding:18px 14px!important;border-radius:22px!important}.wiz-logo{width:50px!important;height:50px!important;flex-basis:50px!important;border-radius:16px!important}.wiz-logo:after{border-radius:14px!important}.wiz-name{font-size:22px!important}.wizard-card{padding:13px!important;border-radius:19px!important}.wizard-title{font-size:18px!important}
       #auto-recap-btn{min-height:64px!important;bottom:10px!important;border-radius:16px!important;font-size:15px!important}
       .sub-size-stage{min-height:70px}.process-card{padding:12px!important}.process-main>span{font-size:9.5px!important}
+
+      /* Voice Clone: prevent the radio choices and uploaded-audio player from
+         widening the whole page on narrow Android/iPhone screens. */
+      html,body,.gradio-container,.wizard-card,.engine-panel,.voice-clone-card{max-width:100%!important;min-width:0!important}
+      .voice-engine-radio,.voice-engine-radio fieldset,.voice-engine-radio [role="radiogroup"],.voice-engine-radio .wrap{width:100%!important;max-width:100%!important;min-width:0!important}
+      .voice-engine-radio fieldset,.voice-engine-radio [role="radiogroup"],.voice-engine-radio .wrap{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:8px!important}
+      .voice-engine-radio label,.voice-engine-radio label.wrap{width:100%!important;min-width:0!important;max-width:100%!important}
+      .voice-engine-radio label span{min-width:0!important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .voice-clone-card,.clone-audio-input,.clone-audio-input .wrap,.clone-audio-input .audio-container,.clone-audio-input audio{width:100%!important;max-width:100%!important;min-width:0!important}
+      .clone-audio-input .audio-container,.clone-audio-input .audio-waveform{overflow:hidden!important}
     }
     @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
     """
@@ -3910,7 +3921,12 @@ def create_app():
             # ---------------- STEP 3 ----------------
             with gr.Column(visible=False, elem_classes=["wizard-card"]) as step3_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 3 • NARRATION</div><div class='wizard-title'>🎙 Choose Voice</div><div class='wizard-copy'>Fast Burmese voice သို့ VoxCPM2 Voice Clone ရွေးပါ။ Voice Clone ရွေးမှသာ reference controls ပေါ်ပါမယ်။</div>")
-                voice_engine = gr.Radio(choices=["⚡ Edge TTS • Fast", "🎙️ VoxCPM2 Voice Clone"], value="⚡ Edge TTS • Fast", label="Narration Voice")
+                voice_engine = gr.Radio(
+                    choices=["⚡ Edge TTS • Fast", "🎙️ VoxCPM2 Voice Clone"],
+                    value="⚡ Edge TTS • Fast",
+                    label="Narration Voice",
+                    elem_classes=["voice-engine-radio"],
+                )
                 with gr.Column(visible=True, elem_classes=["engine-panel"]) as edge_voice_panel:
                     gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
                     edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice")
@@ -3918,9 +3934,9 @@ def create_app():
                 voice_preset = gr.State("")
                 custom_voice_description = gr.State("")
 
-                with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel"]) as voxcpm_clone_panel:
+                with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
                     gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                    clone_reference = gr.Audio(label="Reference Voice • MP3/WAV", sources=["upload", "microphone"], type="filepath")
+                    clone_reference = gr.Audio(label="Reference Voice • MP3/WAV", sources=["upload", "microphone"], type="filepath", elem_classes=["clone-audio-input"])
                     clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
