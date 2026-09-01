@@ -4090,11 +4090,34 @@ def _subtitle_size_preview_html(size_value):
     """
 
 def create_app():
+    # Optional Lottie artwork shown at the very top of the user page.
+    # Keep David Digital Sculpting.json beside this Python file in Colab/Space.
+    lottie_json_text = "{}"
+    lottie_candidates = [
+        Path(__file__).resolve().with_name("David Digital Sculpting.json"),
+        Path.cwd() / "David Digital Sculpting.json",
+        Path.cwd() / "upload" / "David Digital Sculpting.json",
+    ]
+    for lottie_path in lottie_candidates:
+        try:
+            if lottie_path.exists():
+                lottie_json_text = json.dumps(
+                    json.loads(lottie_path.read_text(encoding="utf-8")),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                break
+        except Exception as exc:
+            print(f"[LOTTIE LOAD WARNING] {type(exc).__name__}: {exc}")
+
     css = r"""
     :root{--bg:#050812;--card:#0d1424;--card2:#111b31;--line:#263755;--cyan:#22d3ee;--blue:#2563eb;--violet:#7c3aed;--green:#34d399;--text:#f8fafc;--muted:#91a1bd;--gold:#facc15}
     html,body{overflow-x:hidden!important;background:#050812!important}*{box-sizing:border-box}
     body,.gradio-container{background:radial-gradient(circle at 12% 0,#142655 0,transparent 30%),radial-gradient(circle at 95% 3%,#32145c 0,transparent 27%),linear-gradient(180deg,#080d19,#050812)!important}
     .gradio-container{max-width:980px!important;margin:0 auto!important;padding:10px 12px 80px!important;color:var(--text)!important}
+    .top-lottie-shell{position:relative;width:100%;height:190px;margin:2px auto 10px;overflow:hidden;border:1px solid #2b3c6055;border-radius:24px;background:radial-gradient(circle at 50% 100%,#2563eb20,transparent 55%),linear-gradient(180deg,#0a1020cc,#070b15aa);box-shadow:0 14px 45px #0005}
+    #yf-david-lottie{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+    #yf-david-lottie svg{width:auto!important;height:210px!important;max-width:100%!important;display:block;margin:auto}
     .wiz-hero{position:relative;overflow:hidden;border:1px solid #2b3c60;border-radius:26px;background:linear-gradient(145deg,#0c1428ee,#111a36f5);padding:24px;margin:4px 0 14px;box-shadow:0 22px 65px #0007}
     .wiz-hero:after{content:"";position:absolute;width:230px;height:230px;right:-90px;top:-110px;border-radius:50%;background:radial-gradient(circle,#22d3ee2d,transparent 68%)}
     .wiz-brand{display:flex;align-items:center;gap:13px;position:relative;z-index:2}.wiz-logo{width:58px;height:58px;flex:0 0 58px;display:grid;place-items:center;border-radius:18px;background:linear-gradient(135deg,#7c3aed,#0891b2);font-weight:950;font-size:22px;box-shadow:0 12px 35px #22d3ee2e}.wiz-name{font-size:27px;font-weight:950;letter-spacing:-.02em}.wiz-sub{color:#8fa2c2;font-size:11px;margin-top:2px}.wiz-note{position:relative;z-index:2;color:#b5c1d8;font-size:11px;line-height:1.55;margin-top:13px}.wiz-note b{color:#67e8f9}
@@ -4104,11 +4127,12 @@ def create_app():
     .wiz-nav{margin-top:13px!important}.wiz-next,.wiz-back{min-height:50px!important;border-radius:13px!important;font-weight:900!important}.wiz-next{background:linear-gradient(90deg,#6d28d9,#2563eb,#0891b2)!important;color:#fff!important;border:0!important}.wiz-back{background:#111827!important;border:1px solid #334155!important;color:#cbd5e1!important}
     .login-shell-pro{max-width:600px;margin:24px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:24px!important}.login-head{text-align:center;font-size:23px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:11px;margin:6px 0 14px}.member-strip{padding:11px 14px;border:1px solid #34d39945;background:#34d3990d;border-radius:14px;margin-bottom:9px}.member-name{font-weight:900}.member-small{font-size:9px;color:#7dd3fc}.quota-badge{font-size:9px;color:#fde68a}
     .engine-panel{border:1px solid #334268!important;background:#0a1229aa!important;border-radius:16px!important;padding:12px!important;margin-top:8px!important}.clone-panel{border-color:#8b5cf65c!important;background:linear-gradient(180deg,#3a1d6a26,#0a1229d9)!important}.clone-title{font-weight:950;color:#ddd6fe;margin-bottom:4px}.clone-copy,.hint{font-size:10px;color:#91a1bd;line-height:1.5}.voice-mode-title{font-weight:950;color:#e0f2fe}.font-ok,.font-warn{font-size:10px;line-height:1.45;padding:8px 10px;border-radius:10px;margin-top:6px}.font-ok{color:#a7f3d0;background:#34d39912;border:1px solid #34d39935}.font-warn{color:#fde68a;background:#f59e0b12;border:1px solid #f59e0b35}
+    #subtitle-font-picker{position:relative;z-index:35}#subtitle-font-picker [role="listbox"]{padding:7px!important;border:1px solid #465779!important;border-radius:14px!important;background:#080d18f7!important;box-shadow:0 20px 55px #000c!important;max-height:300px!important}#subtitle-font-picker [role="option"]{min-height:38px!important;padding:9px 11px!important;margin:2px 0!important;border-radius:9px!important;color:#e5edf9!important;font-size:12px!important;border:1px solid transparent!important}#subtitle-font-picker [role="option"]:hover,#subtitle-font-picker [role="option"][aria-selected="true"]{background:linear-gradient(90deg,#7c3aed35,#0891b22a)!important;border-color:#67e8f944!important;color:#fff!important}
     .process-card{display:flex;align-items:flex-start;gap:12px;width:100%;padding:14px;border-radius:16px;margin:10px 0;border:1px solid #22d3ee46;background:linear-gradient(110deg,#061426e8,#111738ed);box-shadow:inset 0 1px #ffffff08,0 12px 34px #0003}.process-card.idle{border-color:#47556966;background:#0a1020cc}.process-card.done{border-color:#34d39966;background:linear-gradient(110deg,#05251ce8,#092034ed)}.process-card.error{border-color:#fb718566;background:linear-gradient(110deg,#2b0b14e8,#1c1022ed)}.process-spinner{width:34px;height:34px;flex:0 0 34px;border-radius:50%;border:3px solid #22d3ee2f;border-top-color:#67e8f9;border-right-color:#818cf8;animation:yfspin .8s linear infinite;margin-top:1px}.process-icon{width:34px;height:34px;flex:0 0 34px;border-radius:11px;display:grid;place-items:center;border:1px solid #47556966;color:#94a3b8;font-weight:950}.done-icon{border-color:#34d39966;color:#6ee7b7;background:#10b98118}.error-icon{border-color:#fb718566;color:#fda4af;background:#fb718518}.process-main{min-width:0;flex:1}.process-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.process-top b{font-size:12px;line-height:1.35;color:#f8fafc;overflow-wrap:anywhere}.process-top strong{font-size:11px;color:#67e8f9;white-space:nowrap}.process-main>span{display:block;color:#a9b9d3;font-size:10px;margin-top:4px;line-height:1.45}.process-main>small{display:block;color:#facc15;font-size:9px;margin-top:7px;line-height:1.4}.process-track{height:8px;width:100%;border-radius:999px;background:#020617cc;border:1px solid #33415588;overflow:hidden;margin-top:9px}.process-track i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#2563eb,#22d3ee);box-shadow:0 0 14px #22d3ee66;transition:width .55s ease}@keyframes yfspin{to{transform:rotate(360deg)}}.eta-card{display:flex;align-items:center;gap:11px;width:100%;padding:12px 13px;border-radius:15px;margin:10px 0}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:36px;height:36px;flex:0 0 36px;border-radius:11px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33}.eta-card b{display:block;font-size:12px}.eta-card span,.eta-card small{display:block;color:#9fb0cd;font-size:10px;margin-top:2px}.eta-card small{color:#facc15}
     .clean-audio-badge{padding:10px;border-radius:12px;background:#34d3990c;border:1px solid #34d39935;color:#a7f3d0;font-size:10px;font-weight:850}.generate-summary{padding:12px;border-radius:14px;background:#07111f;border:1px solid #243852;color:#9fb0cb;font-size:10px;line-height:1.7;margin-bottom:12px}.generate-summary b{color:#e0f2fe}
     #auto-recap-btn{min-height:64px!important;border:0!important;border-radius:16px!important;font-size:17px!important;font-weight:950!important;background:linear-gradient(100deg,#6d28d9,#2563eb 50%,#0891b2)!important;box-shadow:0 14px 40px #2563eb40!important;color:white!important}.final-stage{border-color:#22d3ee42!important;background:linear-gradient(155deg,#0b1327,#0e1932)!important}.final-badge{display:inline-flex;padding:6px 9px;border-radius:999px;background:#22c55e12;border:1px solid #22c55e40;color:#86efac;font-size:9px;font-weight:950}.final-copy{font-size:10px;color:#93a4c5;line-height:1.5;margin-bottom:10px}#yf-download-btn{min-height:58px!important;border-radius:15px!important;border:1px solid #67e8f944!important;background:linear-gradient(100deg,#059669,#0891b2,#2563eb)!important;color:white!important;font-weight:950!important;font-size:15px!important;margin-top:10px!important}.download-note{padding:9px 10px;border-radius:11px;background:#07111f99;border:1px solid #334155;color:#8fa3c5;font-size:9px;line-height:1.45;margin-top:8px}.footer-note{text-align:center;color:#52617d;font-size:9px;padding:16px 0}
     input,textarea,select{max-width:100%!important}.gradio-container video{max-height:56vh!important}
-    @media(max-width:720px){.gradio-container{padding:5px 6px 74px!important}.wiz-hero{padding:17px 13px;border-radius:19px;margin-top:2px}.wiz-logo{width:48px;height:48px;flex-basis:48px;border-radius:15px;font-size:18px}.wiz-name{font-size:21px}.wiz-sub{font-size:9px}.wiz-note{font-size:10px;margin-top:10px}.wiz-progress{padding-left:0;padding-right:0}.wiz-node small{font-size:7px}.wiz-node span{width:27px;height:27px;font-size:9px}.wiz-line{top:22px}.wizard-card{padding:12px!important;border-radius:17px!important}.wizard-title{font-size:17px}.wizard-copy{font-size:10px}.mobile-stack{display:flex!important;flex-direction:column!important;gap:9px!important}.mobile-stack>*{width:100%!important;min-width:0!important}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.wiz-nav{display:flex!important;flex-direction:row!important;gap:8px!important}.wiz-nav>*{min-width:0!important;flex:1!important}#auto-recap-btn{position:sticky!important;bottom:8px!important;z-index:85!important;box-shadow:0 10px 34px #000b,0 0 24px #2563eb55!important}.gradio-container video{max-height:47vh!important}#yf-download-btn{min-height:55px!important}#yf-conn{right:7px!important;bottom:72px!important}}
+    @media(max-width:720px){.gradio-container{padding:5px 6px 74px!important}.top-lottie-shell{height:145px;border-radius:19px;margin-bottom:8px}#yf-david-lottie svg{height:160px!important}.wiz-hero{padding:17px 13px;border-radius:19px;margin-top:2px}.wiz-logo{width:48px;height:48px;flex-basis:48px;border-radius:15px;font-size:18px}.wiz-name{font-size:21px}.wiz-sub{font-size:9px}.wiz-note{font-size:10px;margin-top:10px}.wiz-progress{padding-left:0;padding-right:0}.wiz-node small{font-size:7px}.wiz-node span{width:27px;height:27px;font-size:9px}.wiz-line{top:22px}.wizard-card{padding:12px!important;border-radius:17px!important}.wizard-title{font-size:17px}.wizard-copy{font-size:10px}.mobile-stack{display:flex!important;flex-direction:column!important;gap:9px!important}.mobile-stack>*{width:100%!important;min-width:0!important}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.wiz-nav{display:flex!important;flex-direction:row!important;gap:8px!important}.wiz-nav>*{min-width:0!important;flex:1!important}#auto-recap-btn{position:sticky!important;bottom:8px!important;z-index:85!important;box-shadow:0 10px 34px #000b,0 0 24px #2563eb55!important}.gradio-container video{max-height:47vh!important}#yf-download-btn{min-height:55px!important}#yf-conn{right:7px!important;bottom:72px!important}}
     @media(max-width:390px){.wiz-node small{display:none}.wiz-progress{padding-bottom:0}.wizard-card{padding:10px!important}.wiz-name{font-size:19px}}
     """
     # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
@@ -4313,7 +4337,30 @@ def create_app():
     theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
     connection_js = r"""
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
-    """
+    """ + """
+    (() => {
+      const animationData = %s;
+      const mount = () => {
+        const box = document.getElementById('yf-david-lottie');
+        if (!box || !animationData || !animationData.layers) {
+          if (box) box.style.display = 'none';
+          return;
+        }
+        const start = () => {
+          if (box.dataset.ready || !window.lottie) return;
+          box.dataset.ready = '1';
+          window.lottie.loadAnimation({container:box,renderer:'svg',loop:true,autoplay:true,animationData});
+        };
+        if (window.lottie) return start();
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js';
+        script.onload = start;
+        script.onerror = () => { box.style.display = 'none'; };
+        document.head.appendChild(script);
+      };
+      setTimeout(mount, 250);
+    })();
+    """ % lottie_json_text
 
     with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
         app._yf_theme = theme
@@ -4325,6 +4372,9 @@ def create_app():
         wizard_step = gr.State(1)
 
         gr.HTML("""
+        <section class='top-lottie-shell' aria-label='David digital sculpting animation'>
+          <div id='yf-david-lottie'></div>
+        </section>
         <section class='wiz-hero'>
           <div class='wiz-brand'>
             <div class='wiz-logo'><span>YF</span></div>
@@ -4442,7 +4492,7 @@ def create_app():
                     choices=list(FONT_STYLE_FILES.keys()),
                     value="Noto Sans Myanmar (Default)",
                     label="Subtitle Font Style",
-                    filterable=True,
+                    filterable=False,
                     allow_custom_value=False,
                     elem_id="subtitle-font-picker",
                 )
