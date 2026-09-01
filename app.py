@@ -4185,8 +4185,33 @@ def create_app():
       .voice-engine-radio fieldset,.voice-engine-radio [role="radiogroup"],.voice-engine-radio .wrap{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:8px!important}
       .voice-engine-radio label,.voice-engine-radio label.wrap{width:100%!important;min-width:0!important;max-width:100%!important}
       .voice-engine-radio label span{min-width:0!important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .voice-clone-card,.clone-audio-input,.clone-audio-input .wrap,.clone-audio-input .audio-container,.clone-audio-input audio{width:100%!important;max-width:100%!important;min-width:0!important}
-      .clone-audio-input .audio-container,.clone-audio-input .audio-waveform{overflow:hidden!important}
+      /* Gradio creates the waveform player only after an audio file is
+         selected.  Constrain both the original upload block and that dynamic
+         player so neither can push the mobile page sideways. */
+      #clone-reference-upload,#clone-reference-upload *,
+      .voice-clone-card,.voice-clone-card *{box-sizing:border-box!important}
+      #clone-reference-upload,.clone-audio-input,
+      #clone-reference-upload .wrap,#clone-reference-upload .block,
+      #clone-reference-upload [data-testid="audio"],
+      #clone-reference-upload .audio-container,
+      #clone-reference-upload .audio-waveform,
+      #clone-reference-upload .waveform,
+      #clone-reference-upload .audio-player,
+      #clone-reference-upload audio,
+      .clone-audio-input .wrap,.clone-audio-input .audio-container,
+      .clone-audio-input .audio-waveform,.clone-audio-input audio{
+        width:100%!important;max-width:100%!important;min-width:0!important;
+      }
+      #clone-reference-upload,.clone-audio-input{overflow:hidden!important}
+      #clone-reference-upload [data-testid="audio"],
+      #clone-reference-upload .audio-container,.clone-audio-input .audio-container,
+      #clone-reference-upload .audio-waveform,.clone-audio-input .audio-waveform{
+        overflow:hidden!important;flex:1 1 0!important;
+      }
+      #clone-reference-upload canvas,#clone-reference-upload svg{
+        max-width:100%!important;min-width:0!important;
+      }
+      #clone-reference-upload audio{height:42px!important;display:block!important}
     }
     @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
     """
@@ -4282,7 +4307,7 @@ def create_app():
 
                 with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
                     gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                    clone_reference = gr.Audio(label="Reference Voice • MP3/WAV", sources=["upload", "microphone"], type="filepath", elem_classes=["clone-audio-input"])
+                    clone_reference = gr.Audio(label="Reference Voice • MP3/WAV", sources=["upload", "microphone"], type="filepath", elem_id="clone-reference-upload", elem_classes=["clone-audio-input"])
                     clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
