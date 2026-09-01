@@ -13,6 +13,8 @@ import platform
 import urllib.request
 import zipfile
 
+YF_BUILD = "V6.8.5 • FIXED UPLOAD BUTTON"
+print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
 # 0) AUTO INSTALL DEPENDENCIES
@@ -1300,13 +1302,20 @@ def inspect_clone_reference(reference_value):
 
     duration = probe_duration(path, fallback=0.0)
     name = os.path.basename(path)
+    display_name = name if len(name) <= 32 else name[:14] + "…" + name[-12:]
     if duration <= 0:
-        return f"<div class='ref-status warn'>⚠️ <b>{name}</b> ကိုတွေ့ပေမယ့် duration မဖတ်နိုင်ပါ။</div>"
+        return f"<div class='ref-status warn'>⚠️ <b>{display_name}</b> ကိုတွေ့ပေမယ့် duration မဖတ်နိုင်ပါ။</div>"
     if duration < 3.0:
-        return f"<div class='ref-status warn'>⚠️ <b>{name}</b> • {duration:.1f}s — reference တိုလွန်းပါတယ်။ 5–15 sec ကြည်လင်တဲ့အသံကို အကြံပြုပါတယ်။</div>"
+        return f"<div class='ref-status warn'>⚠️ <b>{display_name}</b> • {duration:.1f}s — reference တိုလွန်းပါတယ်။ 5–15 sec ကြည်လင်တဲ့အသံကို အကြံပြုပါတယ်။</div>"
     if duration > 15.0:
-        return f"<div class='ref-status ok'>✅ <b>{name}</b> • {duration:.1f}s — detected. Voice Clone မှာ ပထမ 15 sec ကို အသုံးပြုပါမယ်။</div>"
-    return f"<div class='ref-status ok'>✅ <b>{name}</b> • {duration:.1f}s — VoxCPM2 cloning အတွက် reference ready ဖြစ်ပါတယ်။</div>"
+        return f"<div class='ref-status ok'>✅ <b>{display_name}</b> • {duration:.1f}s — detected. Voice Clone မှာ ပထမ 15 sec ကို အသုံးပြုပါမယ်။</div>"
+    return f"<div class='ref-status ok'>✅ <b>{display_name}</b> • {duration:.1f}s — VoxCPM2 cloning အတွက် reference ready ဖြစ်ပါတယ်။</div>"
+
+
+def accept_clone_upload(reference_value):
+    """Store UploadButton's file path without showing Gradio's changing file card."""
+    path = normalize_file_path(reference_value)
+    return path or "", inspect_clone_reference(path)
 
 
 def generate_voice_preview(
@@ -4234,11 +4243,25 @@ def create_app():
          is chosen.  Gradio turns the tall drop area into one short file row
          after upload, which used to make the whole mobile page jump upward. */
       .clone-upload-stable-slot{
-        height:222px!important;min-height:222px!important;max-height:222px!important;
+        height:122px!important;min-height:122px!important;max-height:122px!important;
         overflow:hidden!important;
       }
       .clone-upload-stable-slot #clone-reference-upload{
-        height:222px!important;min-height:222px!important;max-height:222px!important;
+        height:122px!important;min-height:122px!important;max-height:122px!important;
+      }
+      .clone-upload-stable-slot #clone-reference-upload .wrap,
+      .clone-upload-stable-slot #clone-reference-upload .wrap > *{
+        height:72px!important;min-height:0!important;max-height:72px!important;
+        overflow:hidden!important;
+      }
+      /* UploadButton never swaps itself for Gradio's large file preview.
+         It therefore has the exact same mobile size before and after upload. */
+      #clone-reference-upload button{
+        width:100%!important;min-height:56px!important;height:56px!important;
+        border-radius:12px!important;font-weight:900!important;
+      }
+      .clone-reference-status-slot{
+        min-height:54px!important;max-height:54px!important;overflow:hidden!important;
       }
 
       /* Dropdown pop-up should stay tap-friendly and above the card on phones. */
@@ -4339,19 +4362,17 @@ def create_app():
 
                 with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
                     gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                    # A File input is deliberate: Gradio's Audio component creates a
-                    # large WaveSurfer editor after upload, which expands/jumps on
-                    # narrow phones.  VoxCPM only needs the uploaded file path.
-                    with gr.Column(elem_classes=["clone-upload-stable-slot"]):
-                        clone_reference = gr.File(
-                            label="Reference Voice • Upload MP3/WAV",
-                            file_types=["audio"],
-                            file_count="single",
-                            type="filepath",
-                            elem_id="clone-reference-upload",
-                            elem_classes=["clone-audio-input"],
-                        )
-                    clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
+                    # UploadButton stays visually identical after selecting a
+                    # file.  Unlike gr.File it does not replace the drop area
+                    # with a filename preview, so mobile layout never jumps.
+                    clone_reference = gr.State("")
+                    clone_upload_button = gr.UploadButton(
+                        "📤  UPLOAD REFERENCE MP3 / WAV",
+                        file_types=["audio"], file_count="single", type="filepath",
+                        variant="primary", elem_id="clone-reference-upload",
+                    )
+                    with gr.Column(elem_classes=["clone-reference-status-slot"]):
+                        clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
 
@@ -4437,7 +4458,7 @@ def create_app():
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
 
-            gr.HTML("<div class='footer-note'>YF RECAP V6.8.3 • AURORA UI • TRUE SUBTITLE SIZE CONTROL • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
+            gr.HTML(f"<div class='footer-note'>YF RECAP {YF_BUILD} • AURORA UI • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
         wizard_outputs = [wizard_progress, step1_panel, step2_panel, step3_panel, step4_panel, step5_panel, step6_panel, wizard_step]
 
@@ -4457,7 +4478,13 @@ def create_app():
         step6_back.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
 
         voice_engine.change(update_voice_engine_panels_v6, [voice_engine], [edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel], queue=False, show_progress="hidden")
-        clone_reference.change(inspect_clone_reference, [clone_reference], [clone_reference_status], show_progress="hidden")
+        clone_upload_button.upload(
+            accept_clone_upload,
+            inputs=[clone_upload_button],
+            outputs=[clone_reference, clone_reference_status],
+            queue=False,
+            show_progress="hidden",
+        )
         layout_editor.change(sync_layout_editor, outputs=[blur_y_percent, blur_height_percent, sub_pos_percent], queue=False, show_progress="hidden")
         subtitle_size.change(_subtitle_size_preview_html, [subtitle_size], [subtitle_size_preview], queue=False, show_progress="hidden")
         subtitle_font_style.change(subtitle_font_status, [subtitle_font_style], [font_style_status], queue=False, show_progress="hidden")
@@ -4850,13 +4877,22 @@ def launch_yf_recap_dual_links():
     )
 
     last_state = None
+    local_server_misses = 0
     try:
         while True:
             if not _wait_for_port("127.0.0.1", PUBLIC_PORT, timeout=2):
+                # A long FFmpeg/VoxCPM generation can briefly delay a health
+                # check.  Do not close a render that is still running because
+                # of one missed port probe.
+                local_server_misses += 1
+                if local_server_misses < 6:
+                    time.sleep(5)
+                    continue
                 raise RuntimeError(
-                    "YF Recap local server stopped responding. "
+                    "YF Recap local server stopped responding for too long. "
                     "The Colab runtime may have restarted or run out of RAM/VRAM."
                 )
+            local_server_misses = 0
 
             cf_alive = bool(
                 cloudflare_url
@@ -4884,11 +4920,32 @@ def launch_yf_recap_dual_links():
                 )
                 last_state = state
 
+            # Tunnel services can disconnect while a long video is rendering.
+            # Keep the local Gradio server alive and retry the tunnels instead
+            # of ending the Colab cell and killing the user's render.
+            if not cf_alive:
+                try:
+                    cloudflare_process, cloudflare_url, _cf_log_thread = start_cloudflare_tunnel(local_origin)
+                    cloudflare_error = ""
+                    cf_alive = True
+                except Exception as exc:
+                    cloudflare_error = f"Reconnect pending: {exc}"
+
+            if not gr_alive:
+                try:
+                    gradio_url, gradio_tunnel, gradio_error = _start_gradio_share_tunnel(demo)
+                    gr_alive = bool(gradio_url and gradio_tunnel is not None)
+                except Exception as exc:
+                    gradio_error = f"Reconnect pending: {exc}"
+
             if not cf_alive and not gr_alive:
-                raise RuntimeError(
-                    "Public tunnels နှစ်ခုလုံး disconnected ဖြစ်သွားပါပြီ။ "
-                    "ဒီ Colab cell ကိုပြန် Run လုပ်ပြီး links အသစ်ထုတ်ပါ။"
+                _display_dual_links(
+                    "", "",
+                    cloudflare_error=cloudflare_error or "Reconnecting…",
+                    gradio_error=gradio_error or "Reconnecting…",
                 )
+                time.sleep(8)
+                continue
 
             time.sleep(12)
 
