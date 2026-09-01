@@ -650,13 +650,27 @@ def split_subtitle_display_chunks(text, min_chars=25, max_chars=35):
     return [c for c in chunks if c]
 
 
+def read_video_middle_frame(cap):
+    """Read the frame at roughly 50% of a video, with a first-frame fallback."""
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count > 1:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_count // 2))
+    ret, frame = cap.read()
+    if ret and frame is not None:
+        return True, frame
+
+    # Some browser-uploaded/codecs do not support accurate seeking.
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return cap.read()
+
+
 def update_preview_image(video_value, blur_y_percent, blur_height_percent, blur_strength):
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         return None
     try:
         cap = cv2.VideoCapture(video_path)
-        ret, frame = cap.read()
+        ret, frame = read_video_middle_frame(cap)
         cap.release()
         if not ret or frame is None: return None
 
@@ -682,14 +696,14 @@ def update_preview_image(video_value, blur_y_percent, blur_height_percent, blur_
 
 
 def video_first_frame_data_uri(video_value):
-    """Return a lightweight JPEG data URI for the browser-side drag blur editor."""
+    """Return a midpoint-frame JPEG data URI for the browser-side drag blur editor."""
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         return ""
     cap = None
     try:
         cap = cv2.VideoCapture(video_path)
-        ret, frame = cap.read()
+        ret, frame = read_video_middle_frame(cap)
         if not ret or frame is None:
             return ""
         h, w = frame.shape[:2]
@@ -1628,23 +1642,6 @@ def process_magic_recap_video(
         if not clone_reference_path or not os.path.exists(clone_reference_path):
             raise gr.Error("🎙️ VoxCPM Voice Clone အတွက် Reference Audio upload လုပ်ပါ။")
 
-    role = vip_access_state.get("role", "vip")
-    member_label = vip_access_state.get("label", "VIP Member")
-    daily_limit = vip_access_state.get("daily_limit")
-    user_identifier = f"{role}:{session_id}"
-    now = time.time()
-
-    if daily_limit is not None:
-        daily_limit = int(daily_limit)
-        data = USER_LIMIT_TRACKER.get(user_identifier)
-        if not data or (now - data["first_time"]) >= 86400:
-            USER_LIMIT_TRACKER[user_identifier] = {"count": 0, "first_time": now}
-            data = USER_LIMIT_TRACKER[user_identifier]
-        if data["count"] >= daily_limit:
-            remain = max(0, 86400 - (now - data["first_time"]))
-            h, m = int(remain // 3600), int((remain % 3600) // 60)
-            raise gr.Error(f"❌ {member_label} daily quota ပြည့်ပါပြီ ({daily_limit} vids/day)။ {h}နာရီ {m}မိနစ်နောက် ပြန်စမ်းပါ။")
-
     work_dir = tempfile.mkdtemp(prefix=f"magic_fast_{session_id[:8]}_")
     output_video_path = os.path.join(work_dir, "final_recap_fast.mp4")
     cap = None
@@ -1909,8 +1906,7 @@ def process_magic_recap_video(
         if not os.path.exists(output_video_path) or os.path.getsize(output_video_path) < 1024:
             raise RuntimeError("Final video file မထွက်လာပါ။")
 
-        if daily_limit is not None:
-            USER_LIMIT_TRACKER[user_identifier]["count"] += 1
+        consume_video_quota(vip_access_state)
 
         progress(1.0, desc="✅ Recap Video အောင်မြင်စွာ ထုတ်ပြီးပါပြီ။")
         return output_video_path
@@ -1928,6 +1924,65 @@ def process_magic_recap_video(
 # ================================================================
 # 9) VIP UNLOCK VIA MONGODB API
 # ================================================================
+def _vip_api_dict(result):
+    if isinstance(result, (list, tuple)) and len(result) == 1:
+        result = result[0]
+    if isinstance(result, str):
+        return json.loads(result)
+    if isinstance(result, dict):
+        return result
+    return dict(result)
+
+
+def _member_quota_html(data):
+    limit = data.get("daily_limit")
+    used = int(data.get("used_today", 0) or 0)
+    remaining = data.get("remaining_today")
+    if limit is None:
+        quota = f"Unlimited Videos · ဒီနေ့ထုတ်ပြီး {used}"
+    else:
+        limit = int(limit)
+        remaining = max(0, int(remaining if remaining is not None else limit - used))
+        quota = f"ဒီနေ့ထုတ်ပြီး {used}/{limit} · ကျန် {remaining} Videos"
+    return f"""
+    <div class="member-strip">
+        <div>
+            <div class="member-small">ACCESS GRANTED ({data.get('expiry', '')} အထိ)</div>
+            <div class="member-name">👑 {data.get('label', 'VIP Member')} ({str(data.get('role', 'vip')).upper()})</div>
+        </div>
+        <div class="quota-badge">{quota}</div>
+    </div>
+    """
+
+
+def refresh_member_quota(vip_access_state):
+    if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        return ""
+    try:
+        client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
+        data = _vip_api_dict(client.predict(vip_access_state.get("code", ""), api_name="/verify"))
+        return _member_quota_html(data) if data.get("valid") else f"<div class='login-error'>{data.get('msg', 'VIP status error')}</div>"
+    except Exception as exc:
+        print(f"[VIP QUOTA REFRESH ERROR] {type(exc).__name__}: {exc}")
+        return _member_quota_html(vip_access_state)
+
+
+def consume_video_quota(vip_access_state):
+    """Register one successful render on the admin server and reject over-limit delivery."""
+    code = str((vip_access_state or {}).get("code", "")).strip().upper()
+    if not code:
+        raise gr.Error("🔒 VIP Code မရှိပါ။ Login ပြန်ဝင်ပါ။")
+    try:
+        client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
+        data = _vip_api_dict(client.predict(code, api_name="/consume_video"))
+    except Exception as exc:
+        print(f"[VIP CONSUME ERROR] {type(exc).__name__}: {exc}")
+        raise gr.Error("❌ Daily video quota server ကို ချိတ်ဆက်၍မရပါ။ Video ကို count မစစ်ဘဲ ထုတ်မပေးနိုင်ပါ။")
+    if not data.get("valid") or not data.get("allowed"):
+        raise gr.Error(data.get("msg") or "❌ ဒီနေ့ video limit ပြည့်ပါပြီ။")
+    return data
+
+
 def unlock_vip(vip_code):
     code_value = (vip_code or "").strip().upper()
     if not code_value:
@@ -1954,18 +2009,7 @@ def unlock_vip(vip_code):
         result = client.predict(code_value, api_name="/verify")
 
         # gr.JSON normally returns a dict, but keep compatibility with older Gradio versions.
-        if isinstance(result, (list, tuple)) and len(result) == 1:
-            result = result[0]
-
-        if isinstance(result, str):
-            data = json.loads(result)
-        elif isinstance(result, dict):
-            data = result
-        else:
-            try:
-                data = dict(result)
-            except Exception:
-                raise RuntimeError(f"Unexpected verify response type: {type(result).__name__}")
+        data = _vip_api_dict(result)
 
         if not data.get("valid"):
             msg = data.get("msg") or "❌ VIP Code စစ်ဆေးမှု မအောင်မြင်ပါ။"
@@ -1983,24 +2027,12 @@ def unlock_vip(vip_code):
             "label": data.get("label", "VIP Member"),
             "role": data.get("role", "vip"),
             "daily_limit": data.get("daily_limit"),
+            "used_today": data.get("used_today", 0),
+            "remaining_today": data.get("remaining_today"),
             "expiry": data.get("expiry", ""),
         }
 
-        quota = (
-            "Unlimited Videos"
-            if access_state["daily_limit"] is None
-            else f"{access_state['daily_limit']} Videos / 24 Hours"
-        )
-
-        member_html = f"""
-        <div class="member-strip">
-            <div>
-                <div class="member-small">ACCESS GRANTED ({access_state['expiry']} အထိ)</div>
-                <div class="member-name">👑 {access_state['label']} ({str(access_state['role']).upper()})</div>
-            </div>
-            <div class="quota-badge">{quota}</div>
-        </div>
-        """
+        member_html = _member_quota_html(access_state)
 
         return (
             access_state,
@@ -2570,7 +2602,7 @@ def create_app_legacy():
             show_progress="hidden",
         )
 
-        submit_btn.click(
+        submit_evt = submit_btn.click(
             fn=process_magic_recap_video,
             inputs=[
                 video_input, user_api_key, ratio_select, background_fill, enable_zoom, zoom_level,
@@ -2583,6 +2615,13 @@ def create_app_legacy():
                 session_id_state, vip_access_state
             ],
             outputs=output_video
+        )
+        submit_evt.success(
+            refresh_member_quota,
+            inputs=[vip_access_state],
+            outputs=[member_status_html],
+            queue=False,
+            show_progress="hidden",
         )
 
     return app
@@ -3940,6 +3979,7 @@ def auto_recap_pipeline_v5(
             progress=_ProgressSlice(live_progress, 0.34, 1.0),
         )
         out_video, srt_path, mp3_path, script_path, _old_status = result
+        consume_video_quota(vip_access_state)
         elapsed = time.time() - started
         _set_process_status(
             session_id, state="done", progress=100,
@@ -4530,6 +4570,13 @@ def create_app():
         )
         # Result page must open only when the long render actually succeeds.
         auto_evt.success(lambda: _wizard_payload(6), outputs=wizard_outputs, queue=False, show_progress="hidden")
+        auto_evt.success(
+            refresh_member_quota,
+            inputs=[vip_access_state],
+            outputs=[member_status_html],
+            queue=False,
+            show_progress="hidden",
+        )
 
         for _eta_trigger in [video_input, recap_length, voice_engine, render_mode, voxcpm_steps]:
             _eta_trigger.change(
