@@ -2466,7 +2466,127 @@ def group_transcript_scenes(raw_segments, max_scene_seconds=28.0, silence_gap=2.
     return out
 
 
-def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_tqdm=False)):
+def _sample_video_frames_for_story(video_path, duration, max_frames=18):
+    """Return small, timestamped RGB frames for Gemini visual story analysis.
+
+    Sampling frames (instead of uploading the whole movie) keeps the request
+    fast and makes this work for silent clips as well as dialogue-heavy videos.
+    """
+    duration = max(0.5, float(duration or 0.0))
+    count = max(3, min(int(max_frames), max(3, int(np.ceil(duration / 7.0)))))
+    # Keep the first/last visual beat, but avoid exact black frames at 0 seconds.
+    start = min(0.35, duration * 0.15)
+    end = max(start, duration - min(0.35, duration * 0.15))
+    moments = np.linspace(start, end, num=count).tolist()
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    try:
+        for moment in moments:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(moment) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            scale = min(1.0, 640.0 / max(1, w))
+            if scale < 1.0:
+                frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append({"time": float(moment), "image": Image.fromarray(rgb)})
+    finally:
+        cap.release()
+    return frames
+
+
+def _visual_scenes_from_gemini(video_path, duration, user_api_key):
+    """Ask Gemini to describe chronological visual events, including hard subtitles.
+
+    The supplied API key is deliberately required.  Whisper can still handle an
+    audio-only recap without it, but a silent video needs a vision-capable model.
+    """
+    api_key = (user_api_key or "").strip()
+    if not api_key:
+        return []
+    frames = _sample_video_frames_for_story(video_path, duration)
+    if not frames:
+        return []
+
+    prompt = f"""
+You are analyzing chronological frames from one movie/video clip ({duration:.2f} seconds total).
+Each image is labelled with its timestamp. Describe only what can actually be seen.
+
+Create short chronological visual-story scenes. Read any visible on-screen subtitle/text only when legible, but do not invent dialogue, names, motives, or events that are not visible. Combine adjacent frames when they show one continuing event.
+
+Return VALID JSON ONLY in this exact shape:
+{{"scenes":[{{"start":0.0,"end":5.0,"text":"Objective visual event description"}}]}}
+
+Rules:
+- Keep start/end inside 0–{duration:.2f}, in chronological order.
+- Cover the important visual events across the full clip, including silent action.
+- `text` must be factual visual context suitable for a later Burmese recap writer.
+"""
+    contents = [prompt]
+    for item in frames:
+        contents.extend([f"Frame timestamp: {item['time']:.2f} seconds", item["image"]])
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response, selected_model = gemini_generate_auto(
+            client, contents,
+            system_instruction="Analyze video frames faithfully. Never invent unseen story facts.",
+            purpose="Visual movie analysis",
+        )
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+    except Exception as exc:
+        print(f"⚠️ Visual analysis unavailable; continuing with speech only: {exc}")
+        return []
+
+    scenes, last_end = [], 0.0
+    for item in parsed.get("scenes", []):
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            start = max(0.0, float(item.get("start", last_end)))
+            end = float(item.get("end", start + 4.0))
+        except (TypeError, ValueError):
+            continue
+        start = max(last_end, min(start, duration))
+        end = min(duration, max(start + 0.35, end))
+        if end <= start:
+            continue
+        scenes.append({"scene": len(scenes) + 1, "start": start, "end": end, "text": text})
+        last_end = end
+    return scenes
+
+
+def _combine_audio_and_visual_scenes(audio_scenes, visual_scenes):
+    """Use visual context for every scene and attach overlapping dialogue when present."""
+    if not visual_scenes:
+        return audio_scenes
+    combined = []
+    for visual in visual_scenes:
+        spoken = []
+        for audio in audio_scenes:
+            if float(audio["end"]) > float(visual["start"]) and float(audio["start"]) < float(visual["end"]):
+                spoken.append((audio.get("text") or "").strip())
+        visual_text = (visual.get("text") or "").strip()
+        dialogue = " ".join(x for x in spoken if x)
+        text = f"Visual: {visual_text}"
+        if dialogue:
+            text += f"\nDialogue heard: {dialogue}"
+        combined.append({
+            "scene": len(combined) + 1,
+            "start": float(visual["start"]),
+            "end": float(visual["end"]),
+            "text": text,
+        })
+    return combined
+
+
+def analyze_movie_v3(video_value, vip_access_state, user_api_key="", progress=gr.Progress(track_tqdm=False)):
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         raise gr.Error("🎬 Movie/Video upload လုပ်ပါ။")
@@ -2474,13 +2594,20 @@ def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_t
         raise gr.Error("🔒 VIP Code ဖြင့် Login ဝင်ပါ။")
 
     progress(0.08, desc="🎙️ Speech & dialogue ကို Analyze လုပ်နေသည်...")
-    segments_raw, info = whisper_model.transcribe(
-        video_path, beam_size=1, vad_filter=True, condition_on_previous_text=False
-    )
-    raw_segments = [
-        {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
-        for s in segments_raw if (s.text or "").strip()
-    ]
+    try:
+        segments_raw, info = whisper_model.transcribe(
+            video_path, beam_size=1, vad_filter=True, condition_on_previous_text=False
+        )
+        raw_segments = [
+            {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+            for s in segments_raw if (s.text or "").strip()
+        ]
+    except Exception as exc:
+        # A completely silent MP4 can have no audio stream at all.  That must
+        # not block the visual/Gemini route.
+        print(f"ℹ️ Speech track unavailable; switching to visual analysis: {exc}")
+        info = None
+        raw_segments = []
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -2490,11 +2617,16 @@ def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_t
     cap.release()
     duration = (frame_count / fps) if fps > 0 else (raw_segments[-1]["end"] if raw_segments else 0.0)
 
-    if not raw_segments:
-        raise gr.Error("🎙️ Video ထဲက speech/dialogue ကို ဖတ်မရပါ။ Audio ပါ/မပါ စစ်ပါ။")
+    audio_scenes = group_transcript_scenes(raw_segments)
+    progress(0.55, desc="👁️ Video scenes ကိုဖတ်နေသည်...")
+    visual_scenes = _visual_scenes_from_gemini(video_path, duration, user_api_key)
+    scenes = _combine_audio_and_visual_scenes(audio_scenes, visual_scenes)
+    if not scenes:
+        raise gr.Error(
+            "🎙️ Speech/dialogue မဖတ်မိပါ။ Silent video ကို visual အနေနဲ့ရေးရန် Gemini API Key ထည့်ပြီး ပြန်စမ်းပါ။"
+        )
 
     progress(0.72, desc="🧠 Narrative scenes ခွဲနေသည်...")
-    scenes = group_transcript_scenes(raw_segments)
     lang = getattr(info, "language", None) or "en"
 
     state = {
@@ -2505,6 +2637,8 @@ def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_t
         "height": height,
         "language": lang,
         "raw_segments": raw_segments,
+        "audio_scenes": audio_scenes,
+        "visual_scenes": visual_scenes,
         "scenes": scenes,
         "analyzed_at": time.time(),
     }
@@ -2520,7 +2654,7 @@ def analyze_movie_v3(video_value, vip_access_state, progress=gr.Progress(track_t
     summary = (
         f"### ✅ Movie Analysis Ready\n"
         f"**Duration:** {_fmt_clock(duration)}  ·  **Detected Language:** `{lang}`  ·  "
-        f"**Narrative Scenes:** {len(scenes)}  ·  **Speech Chunks:** {len(raw_segments)}\n\n"
+        f"**Narrative Scenes:** {len(scenes)}  ·  **Speech Chunks:** {len(raw_segments)}  ·  **Visual Scenes:** {len(visual_scenes)}\n\n"
         "အောက်က **Generate Viral Recap Script** ကိုနှိပ်ပြီး script ဖန်တီးပါ။"
     )
     return state, summary, rows
@@ -2552,7 +2686,9 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
 
     scenes = analysis_state["scenes"]
     source_duration = float(analysis_state.get("duration", 0.0))
-    target_sec = _target_seconds(recap_length, source_duration)
+    # This renderer deliberately preserves the uploaded video's duration, so a
+    # requested 3/5/10-minute setting cannot create a longer visual timeline.
+    target_sec = min(_target_seconds(recap_length, source_duration), max(1.0, source_duration))
     progress(0.08, desc="✍️ Viral recap structure စီနေသည်...")
 
     # Keep prompt payload bounded while retaining chronology.
@@ -2812,6 +2948,59 @@ def mix_story_audio_full_duration(voice_path, source_video_path, bgm_path, narra
     return output_path
 
 
+def fit_narration_clip_to_slot(audio_path, slot_duration, output_path):
+    """Tempo-adjust one narration clip so it exactly fills its source scene.
+
+    This is the key sync rule: a line whose script timestamp is 12–18 seconds
+    always occupies that six-second video window, rather than being concatenated
+    immediately after the preceding TTS line.
+    """
+    target = max(0.35, float(slot_duration))
+    source = max(0.05, probe_duration(audio_path, fallback=target))
+    # atempo > 1 speeds speech up; < 1 slows it down. `_atempo_filters` safely
+    # splits extreme values into FFmpeg-supported 0.5–2.0 stages.
+    tempo = source / target
+    filters = (
+        f"[0:a]aresample=48000,{_atempo_filters(tempo)},"
+        f"apad=whole_dur={target:.3f},atrim=duration={target:.3f}[aout]"
+    )
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", audio_path,
+        "-filter_complex", filters, "-map", "[aout]",
+        "-c:a", "pcm_s16le", output_path,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError("Narration timing fit failed: " + (r.stderr or "Unknown error")[-700:])
+    return output_path
+
+
+def build_timeline_narration_track(voice_files, source_segments, total_duration, output_path):
+    """Place each fitted narration clip at its actual source-video timestamp."""
+    if not voice_files or not source_segments or len(voice_files) != len(source_segments):
+        raise RuntimeError("Narration timeline has no matching voice/scene clips.")
+    inputs, filters, labels = [], [], []
+    for idx, (audio_path, segment) in enumerate(zip(voice_files, source_segments)):
+        delay_ms = max(0, int(round(float(segment.get("start", 0.0)) * 1000.0)))
+        inputs.extend(["-i", audio_path])
+        label = f"v{idx}"
+        filters.append(f"[{idx}:a]aresample=48000,adelay={delay_ms}:all=1[{label}]")
+        labels.append(f"[{label}]")
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+          f"apad=whole_dur={float(total_duration):.3f},"
+          f"atrim=duration={float(total_duration):.3f},alimiter=limit=0.95[aout]"
+    )
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
+        "-filter_complex", ";".join(filters), "-map", "[aout]",
+        "-c:a", "aac", "-b:a", "192k", output_path,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError("Narration timeline build failed: " + (r.stderr or "Unknown error")[-700:])
+    return output_path
+
+
 def build_full_source_video_filter_graph(target_w, target_h, render_fps, total_duration,
                                          background_fill, enable_zoom, zoom_level,
                                          mirror_flip, filter_color, blur_y_percent,
@@ -2971,7 +3160,9 @@ def render_reviewed_script_v3(
 
     work_dir = tempfile.mkdtemp(prefix=f"yf_v3_{str(session_id)[:8]}_")
     voice_files, subtitle_segments, voice_durations, successful_source_segments = [], [], [], []
-    timeline = 0.0
+    source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
+    if source_duration <= 0.5:
+        source_duration = max(0.5, probe_duration(video_path, fallback=1.0))
     total = len(script_segments)
 
     total_started_at = time.time()
@@ -3028,24 +3219,30 @@ def render_reviewed_script_v3(
             )
         if not os.path.exists(audio) or os.path.getsize(audio) == 0:
             continue
-        dur = max(0.15, probe_duration(audio, fallback=src_dur))
-        voice_files.append(audio)
+        # Fit every generated line to the script's original video time slot.
+        # The timeline stays tied to the video; it no longer starts every line
+        # immediately after the prior one and then leaves silence at the end.
+        slot_start = max(0.0, min(float(seg["start"]), source_duration - 0.35))
+        slot_end = min(source_duration, max(slot_start + 0.35, float(seg["end"])))
+        slot_duration = max(0.35, slot_end - slot_start)
+        fitted_audio = os.path.join(work_dir, f"voice_fit_{idx:03d}.wav")
+        fit_narration_clip_to_slot(audio, slot_duration, fitted_audio)
+        dur = slot_duration
+        voice_files.append(fitted_audio)
         voice_durations.append(dur)
-        successful_source_segments.append({"start": float(seg["start"]), "end": float(seg["end"]), "text": text})
+        successful_source_segments.append({"start": slot_start, "end": slot_end, "text": text})
         display_chunks = split_subtitle_display_chunks(text, min_chars=25, max_chars=35)
         if not display_chunks:
             display_chunks = [text]
         total_chars = max(1, sum(len(c) for c in display_chunks))
-        chunk_cursor = timeline
+        chunk_cursor = slot_start
         for chunk in display_chunks:
             chunk_share = len(chunk) / total_chars
             chunk_dur = max(0.65, dur * chunk_share)
             subtitle_segments.append({"start": chunk_cursor, "end": chunk_cursor + chunk_dur, "text": chunk})
             chunk_cursor += chunk_dur
-        # keep subtitle timeline synced to the narration audio duration exactly
-        timeline += dur
         if subtitle_segments:
-            subtitle_segments[-1]["end"] = timeline
+            subtitle_segments[-1]["end"] = slot_end
         completed = idx + 1
         voice_elapsed = max(0.01, time.time() - voice_started_at)
         voice_eta = (voice_elapsed / completed) * max(0, total - completed)
@@ -3059,26 +3256,16 @@ def render_reviewed_script_v3(
     # Ensure source list matches exactly the voice clips that succeeded.
     source_segments = successful_source_segments
 
-    concat_list = os.path.join(work_dir, "voice_concat.txt")
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for p in voice_files:
-            f.write("file '" + p.replace("'", "'\\''") + "'\n")
     merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
-    r = subprocess.run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-        "-i", concat_list, "-c:a", "aac", "-b:a", "192k", merged_voice
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    if r.returncode != 0 or not os.path.exists(merged_voice):
-        raise RuntimeError("Narration merge failed: " + (r.stderr or "Unknown")[-600:])
+    build_timeline_narration_track(
+        voice_files, successful_source_segments, source_duration, merged_voice
+    )
 
     narration_mp3 = os.path.join(work_dir, "YF_Recap_Narration.mp3")
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", merged_voice,
                     "-c:a", "libmp3lame", "-b:a", "192k", narration_mp3], check=False)
 
     progress(0.45, desc="🎙️ Narration-only audio ပြင်နေသည်...")
-    source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
-    if source_duration <= 0.5:
-        source_duration = max(0.5, probe_duration(video_path, fallback=timeline))
     final_audio = mix_story_audio_full_duration(
         merged_voice, video_path, bgm_path, narration_volume, original_volume,
         bgm_volume, auto_duck_bgm, source_duration,
@@ -3549,7 +3736,7 @@ def auto_recap_pipeline_v5(
 
         # Stage 1: speech / scene analysis (hidden from the user UI).
         analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
-            video_value, vip_access_state,
+            video_value, vip_access_state, user_api_key=user_api_key,
             progress=_ProgressSlice(live_progress, 0.01, 0.18),
         )
 
