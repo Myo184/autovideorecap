@@ -10,6 +10,7 @@ import base64
 import socket
 import platform
 import urllib.request
+import zipfile
 
 
 # ----------------------------------------------------------------
@@ -53,9 +54,21 @@ run_pip("install", "-q", "-U",
         "gTTS",
         "google-genai",
         "opencv-python-headless",
-        "numpy",
-        "soundfile",
         "voxcpm")
+
+# VoxCPM2 uses librosa to read the uploaded reference voice.  Colab's
+# preinstalled SciPy can be compiled against a different NumPy build; simply
+# upgrading NumPy then leaves a mixed installation and raises:
+# "numpy.ufunc has no attribute __module__".  Reinstall this matched audio
+# stack together *before* importing torch/librosa/voxcpm.
+print("🎙️ Installing compatible VoxCPM2 audio stack...")
+run_pip(
+    "install", "-q", "--no-cache-dir", "--upgrade", "--force-reinstall",
+    "numpy==2.2.6",
+    "scipy==1.15.3",
+    "librosa==0.11.0",
+    "soundfile==0.13.1",
+)
 
 clean_reinstall_pillow()
 
@@ -190,6 +203,109 @@ FONT_SEARCH_DIRS = [
 RUNTIME_FONT_DIR = "/content/yf_recap_fonts" if os.path.isdir("/content") else os.path.join(tempfile.gettempdir(), "yf_recap_fonts")
 os.makedirs(RUNTIME_FONT_DIR, exist_ok=True)
 RUNTIME_FONT_PATHS = {}
+
+# Premium bundle support: every TTF/OTF inside the user's ZIP is registered as
+# an individual subtitle choice.  The dropdown remains searchable, so a large
+# collection stays easy to use on mobile as well as desktop.
+PREMIUM_FONT_DIR = os.path.join(RUNTIME_FONT_DIR, "premium_bundle")
+
+
+def _premium_font_style_name(font_path, group_hint=""):
+    stem = os.path.splitext(os.path.basename(font_path))[0]
+    group = str(group_hint or "").strip()
+    return f"Premium • {group} • {stem}" if group else f"Premium • {stem}"
+
+
+def _safe_extract_premium_fonts(zip_path):
+    """Extract only TTF/OTF files from a trusted user font archive.
+
+    Font files are flattened using their numbered bundle folder plus filename,
+    which avoids duplicate names such as Burma027-Regular.ttf overwriting one
+    another.
+    """
+    # This helper runs during module startup, before normalize_file_path() is
+    # declared lower in the file, so resolve Gradio's common file values here.
+    if isinstance(zip_path, dict):
+        src = zip_path.get("path") or zip_path.get("name") or zip_path.get("orig_name")
+    else:
+        src = str(zip_path or "")
+    if not src or not os.path.isfile(src):
+        raise ValueError("Premium Font ZIP file မတွေ့ပါ။")
+    if not zipfile.is_zipfile(src):
+        raise ValueError("Upload လုပ်ထားတဲ့ file က valid ZIP မဟုတ်ပါ။")
+
+    os.makedirs(PREMIUM_FONT_DIR, exist_ok=True)
+    registered = []
+    with zipfile.ZipFile(src) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            archive_name = info.filename.replace("\\", "/")
+            ext = os.path.splitext(archive_name)[1].lower()
+            if ext not in (".ttf", ".otf"):
+                continue
+            # A font bundle should be small; this guard also avoids archive abuse.
+            if info.file_size <= 0 or info.file_size > 25 * 1024 * 1024:
+                continue
+            folders = [p for p in archive_name.split("/")[:-1] if p]
+            group = next((p for p in reversed(folders) if p.isdigit()), "")
+            safe_name = (group + "__" if group else "") + os.path.basename(archive_name)
+            dst = os.path.join(PREMIUM_FONT_DIR, safe_name)
+            with archive.open(info, "r") as read_f, open(dst, "wb") as write_f:
+                shutil.copyfileobj(read_f, write_f)
+            style = _premium_font_style_name(dst, group)
+            RUNTIME_FONT_PATHS[style] = dst
+            FONT_STYLE_FILES[style] = []
+            registered.append(style)
+    return registered
+
+
+def install_premium_font_bundle(zip_value):
+    """UI handler: install a ZIP and refresh the subtitle dropdown choices."""
+    try:
+        registered = _safe_extract_premium_fonts(zip_value)
+    except Exception as exc:
+        return (
+            f"<div class='font-warn'>⚠️ Premium font ZIP မထည့်နိုင်ပါ: {exc}</div>",
+            gr.update(choices=list(FONT_STYLE_FILES.keys())),
+            gr.update(),
+        )
+    if not registered:
+        return (
+            "<div class='font-warn'>⚠️ ZIP ထဲမှာ TTF/OTF font မတွေ့ပါ။</div>",
+            gr.update(choices=list(FONT_STYLE_FILES.keys())),
+            gr.update(),
+        )
+    preferred = registered[0]
+    return (
+        f"<div class='font-ok'>✅ Premium fonts <b>{len(registered)}</b> ခု ထည့်ပြီးပါပြီ။ Subtitle Font Style မှာ search လုပ်ပြီးရွေးပါ။</div>",
+        gr.update(choices=list(FONT_STYLE_FILES.keys()), value=preferred),
+        subtitle_font_status(preferred),
+    )
+
+
+def _autoload_premium_font_bundle():
+    """Load a ZIP already placed beside the Colab app, when available."""
+    candidates = [
+        "/content/PREMIUM FONT.zip",
+        "/content/PREMIUM_FONT.zip",
+        os.path.join(os.getcwd(), "PREMIUM FONT.zip"),
+        os.path.join(os.getcwd(), "PREMIUM_FONT.zip"),
+        "/mnt/data/PREMIUM FONT.zip",
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            try:
+                loaded = _safe_extract_premium_fonts(candidate)
+                if loaded:
+                    print(f"🔤 Premium subtitle fonts loaded: {len(loaded)}")
+                    return len(loaded)
+            except Exception as exc:
+                print(f"⚠️ Premium font ZIP could not be loaded: {exc}")
+    return 0
+
+
+PREMIUM_FONT_COUNT = _autoload_premium_font_bundle()
 
 def _font_style_from_filename(filename):
     base = os.path.basename(filename or "").lower()
@@ -4154,7 +4270,9 @@ def create_app():
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
                 font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
                 with gr.Accordion("📁 Custom Myanmar Font", open=False):
-                    gr.HTML("<div class='hint'>Unicode Myanmar TTF/OTF font ကို upload လုပ်နိုင်ပါတယ်။ Upload ပြီးတာနဲ့ dropdown auto-select ဖြစ်ပါမယ်။</div>")
+                    gr.HTML(f"<div class='hint'>Unicode Myanmar TTF/OTF font ကို upload လုပ်နိုင်ပါတယ်။ Premium Font ZIP တင်ရင် ZIP ထဲက font အားလုံးကို dropdown မှာ search/ရွေးလို့ရပါတယ်။ လက်ရှိ auto-loaded premium fonts: <b>{PREMIUM_FONT_COUNT}</b></div>")
+                    premium_font_zip_upload = gr.File(label="Premium Font ZIP • Add All Fonts", file_types=[".zip"], type="filepath")
+                    premium_font_status = gr.HTML("<div class='hint'>Premium Font ZIP မတင်ရသေးပါ။</div>")
                     subtitle_font_upload = gr.File(label="Upload Font (.ttf / .otf)", file_count="multiple", file_types=[".ttf", ".otf"], type="filepath")
                     font_upload_status = gr.HTML("<div class='hint'>Custom font မတင်ရသေးပါ။</div>")
                 with gr.Row(elem_classes=["wiz-nav"]):
@@ -4229,6 +4347,13 @@ def create_app():
             install_uploaded_subtitle_fonts,
             inputs=[subtitle_font_upload, subtitle_font_style],
             outputs=[font_upload_status, font_style_status, subtitle_font_style],
+            queue=False,
+            show_progress="hidden",
+        )
+        premium_font_zip_upload.change(
+            install_premium_font_bundle,
+            inputs=[premium_font_zip_upload],
+            outputs=[premium_font_status, subtitle_font_style, font_style_status],
             queue=False,
             show_progress="hidden",
         )
