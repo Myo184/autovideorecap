@@ -4322,7 +4322,17 @@ def create_app():
 
                 with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
                     gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                    clone_reference = gr.Audio(label="Reference Voice • MP3/WAV", sources=["upload", "microphone"], type="filepath", elem_id="clone-reference-upload", elem_classes=["clone-audio-input"])
+                    # A File input is deliberate: Gradio's Audio component creates a
+                    # large WaveSurfer editor after upload, which expands/jumps on
+                    # narrow phones.  VoxCPM only needs the uploaded file path.
+                    clone_reference = gr.File(
+                        label="Reference Voice • Upload MP3/WAV",
+                        file_types=["audio"],
+                        file_count="single",
+                        type="filepath",
+                        elem_id="clone-reference-upload",
+                        elem_classes=["clone-audio-input"],
+                    )
                     clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
