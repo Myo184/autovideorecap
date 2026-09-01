@@ -1524,6 +1524,56 @@ def run_ffmpeg_with_progress(cmd, total_duration, progress, start=0.70, end=0.98
     if rc != 0:
         raise RuntimeError("FFmpeg render failed:\n" + "\n".join(recent[-20:]))
 
+
+def normalize_blur_zones(blur_layout_value, fallback_height=12.0):
+    """Accept legacy center-Y values or the new JSON list of up to three blur rectangles."""
+    default = [{"x": 0.0, "y": 72.0, "w": 100.0, "h": float(fallback_height or 12.0)}]
+    raw = blur_layout_value
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            raw = parsed.get("zones", parsed) if isinstance(parsed, dict) else parsed
+        except Exception:
+            raw = None
+    if isinstance(raw, list):
+        zones = []
+        for item in raw[:3]:
+            if not isinstance(item, dict) or item.get("enabled", True) is False:
+                continue
+            try:
+                x = max(0.0, min(97.0, float(item.get("x", 0))))
+                y = max(0.0, min(97.0, float(item.get("y", 72))))
+                w = max(3.0, min(100.0 - x, float(item.get("w", 100))))
+                h = max(3.0, min(100.0 - y, float(item.get("h", fallback_height))))
+                zones.append({"x": x, "y": y, "w": w, "h": h})
+            except Exception:
+                continue
+        return zones
+    try:
+        center = float(blur_layout_value)
+        height = max(3.0, min(45.0, float(fallback_height)))
+        return [{"x": 0.0, "y": max(0.0, min(100.0 - height, center - height / 2)), "w": 100.0, "h": height}]
+    except Exception:
+        return default
+
+
+def append_blur_zones(parts, input_label, zones, target_w, target_h, blur_strength, prefix="blur"):
+    """Append chained crop/boxblur/overlay filters and return the final label."""
+    current = input_label
+    radius = max(2, min(32, int(float(blur_strength) / 6)))
+    for index, zone in enumerate(zones[:3], 1):
+        x = max(0, min(target_w - 2, int(target_w * zone["x"] / 100.0)))
+        y = max(0, min(target_h - 2, int(target_h * zone["y"] / 100.0)))
+        w = max(2, min(target_w - x, int(target_w * zone["w"] / 100.0)))
+        h = max(2, min(target_h - y, int(target_h * zone["h"] / 100.0)))
+        zone_radius = max(1, min(radius, min(w, h) // 4))
+        main, src, band, out = (f"{prefix}main{index}", f"{prefix}src{index}", f"{prefix}band{index}", f"{prefix}out{index}")
+        parts.append(f"[{current}]split=2[{main}][{src}]")
+        parts.append(f"[{src}]crop={w}:{h}:{x}:{y},boxblur={zone_radius}:1[{band}]")
+        parts.append(f"[{main}][{band}]overlay={x}:{y}[{out}]")
+        current = out
+    return current
+
 def build_video_filter_graph(
     target_w, target_h, render_fps, total_duration,
     background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
@@ -1560,17 +1610,8 @@ def build_video_filter_graph(
         parts.append(f"[0:v]{fg_chain}[fg]")
         parts.append("[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=0[base]")
 
-    blur_h = max(8, int(target_h * (float(blur_height_percent) / 100.0)))
-    center_y = int(target_h * (float(blur_y_percent) / 100.0))
-    blur_y = max(0, min(center_y - blur_h // 2, target_h - blur_h))
-    radius = max(2, min(32, int(float(blur_strength) / 6)))
-    parts.append("[base]split=2[main][bandsrc]")
-    parts.append(
-        f"[bandsrc]crop={target_w}:{blur_h}:0:{blur_y},boxblur={radius}:1[band]"
-    )
-    parts.append(f"[main][band]overlay=0:{blur_y}[blurred]")
-
-    current = "blurred"
+    zones = normalize_blur_zones(blur_y_percent, blur_height_percent)
+    current = append_blur_zones(parts, "base", zones, target_w, target_h, blur_strength, "mainblur")
     if logo_input_index is not None:
         logo_w = max(72, int(target_w * 0.16))
         parts.append(f"[{logo_input_index}:v]scale={logo_w}:-1[logo]")
@@ -3251,14 +3292,8 @@ def build_full_source_video_filter_graph(target_w, target_h, render_fps, total_d
         parts.append(f"[0:v]{fg_chain}[fg]")
         parts.append("[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[base]")
 
-    blur_h = max(8, int(target_h * (float(blur_height_percent) / 100.0)))
-    center_y = int(target_h * (float(blur_y_percent) / 100.0))
-    blur_y = max(0, min(center_y - blur_h // 2, target_h - blur_h))
-    radius = max(2, min(32, int(float(blur_strength) / 6)))
-    parts.append("[base]split=2[main][bandsrc]")
-    parts.append(f"[bandsrc]crop={target_w}:{blur_h}:0:{blur_y},boxblur={radius}:1[band]")
-    parts.append(f"[main][band]overlay=0:{blur_y}[blurred]")
-    current = "blurred"
+    zones = normalize_blur_zones(blur_y_percent, blur_height_percent)
+    current = append_blur_zones(parts, "base", zones, target_w, target_h, blur_strength, "fullblur")
 
     if logo_input_index is not None:
         logo_w = max(72, int(target_w * 0.16))
@@ -3322,14 +3357,8 @@ def build_story_video_filter_graph(source_segments, voice_durations, target_w, t
         parts.append(f"[storysrc]{fg_chain}[fg]")
         parts.append("[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[base]")
 
-    blur_h = max(8, int(target_h * (float(blur_height_percent) / 100.0)))
-    center_y = int(target_h * (float(blur_y_percent) / 100.0))
-    blur_y = max(0, min(center_y - blur_h // 2, target_h - blur_h))
-    radius = max(2, min(32, int(float(blur_strength) / 6)))
-    parts.append("[base]split=2[main][bandsrc]")
-    parts.append(f"[bandsrc]crop={target_w}:{blur_h}:0:{blur_y},boxblur={radius}:1[band]")
-    parts.append(f"[main][band]overlay=0:{blur_y}[blurred]")
-    current = "blurred"
+    zones = normalize_blur_zones(blur_y_percent, blur_height_percent)
+    current = append_blur_zones(parts, "base", zones, target_w, target_h, blur_strength, "storyblur")
     if logo_input_index is not None:
         logo_w = max(72, int(target_w * 0.16))
         parts.append(f"[{logo_input_index}:v]scale={logo_w}:-1[logo]")
@@ -3574,8 +3603,12 @@ def publish_final_video_for_download(source_path, session_id):
 # ---- Combined manual layout editor: Blur band + Subtitle vertical position ----
 def sync_layout_editor(evt: gr.EventData):
     try:
-        center = float(evt.center)
-        height = float(evt.height)
+        zones = getattr(evt, "zones", None)
+        if not isinstance(zones, list):
+            zones = [{"x": 0, "y": float(evt.center) - float(evt.height) / 2, "w": 100, "h": float(evt.height)}]
+        clean_zones = normalize_blur_zones(zones, 12.0)
+        layout_json = json.dumps(clean_zones, separators=(",", ":"))
+        first_height = clean_zones[0]["h"] if clean_zones else 12.0
         # Exact subtitle center Y, measured from the TOP of the preview/final frame.
         raw_y = getattr(evt, "subtitleY", None)
         if raw_y is None:
@@ -3584,44 +3617,46 @@ def sync_layout_editor(evt: gr.EventData):
             raw_y = 100.0 - old_bottom - 3.0
         subtitle_y = float(raw_y)
     except Exception:
-        return 78.0, 12.0, 82.0
-    height = max(3.0, min(45.0, height))
-    center = max(height/2, min(100-height/2, center))
+        return '[{"x":0,"y":72,"w":100,"h":12}]', 12.0, 82.0
     subtitle_y = max(4.0, min(96.0, subtitle_y))
-    return round(center, 2), round(height, 2), round(subtitle_y, 2)
+    return layout_json, round(first_height, 2), round(subtitle_y, 2)
 
 
 LAYOUT_EDITOR_TEMPLATE = r"""
 <div class="yf-layout-editor">
-  <div class="yf-layout-head"><div><b>✋ Drag Layout Editor</b><small>Purple = Blur • Yellow = EXACT final subtitle center</small></div><button type="button" class="yf-reset">Reset</button></div>
+  <div class="yf-layout-head"><div><b>✋ Multi Blur Layout Editor</b><small>Blur ကိုရွှေ့ပါ • ဘေး/အပေါ်/အောက် handle ဆွဲပြီး အနံ/အမြင့်ပြောင်းပါ</small></div><button type="button" class="yf-reset">Reset</button></div>
   <div class="yf-stage">
     <img class="yf-img" src="${value}" draggable="false">
     <div class="yf-empty">🎬 Video upload ပြီး Blur + Subtitle ကို mouse နဲ့တိုက်ရိုက်ညှိပါ</div>
-    <div class="yf-blur"><i class="yf-top"></i><span>⋮⋮ DRAG BLUR ⋮⋮</span><i class="yf-bottom"></i></div>
+    <div class="yf-blur active" data-zone="0"><i class="yf-edge yf-top"></i><i class="yf-edge yf-right"></i><i class="yf-edge yf-bottom"></i><i class="yf-edge yf-left"></i><span>BLUR 1</span></div>
+    <div class="yf-blur disabled" data-zone="1"><i class="yf-edge yf-top"></i><i class="yf-edge yf-right"></i><i class="yf-edge yf-bottom"></i><i class="yf-edge yf-left"></i><span>BLUR 2</span></div>
+    <div class="yf-blur disabled" data-zone="2"><i class="yf-edge yf-top"></i><i class="yf-edge yf-right"></i><i class="yf-edge yf-bottom"></i><i class="yf-edge yf-left"></i><span>BLUR 3</span></div>
     <div class="yf-sub"><span>SUBTITLE • DRAG UP / DOWN</span></div>
   </div>
-  <div class="yf-read"><span>Blur <b class="yc">78%</b></span><span>Height <b class="yh">12%</b></span><span>Subtitle Y <b class="ys">82%</b></span><em>✓ Exact final position synced</em></div>
+  <div class="yf-zone-tabs"><small>Blur area:</small><button type="button" class="on" data-pick="0">1</button><button type="button" data-pick="1">＋2</button><button type="button" data-pick="2">＋3</button><button type="button" class="yf-remove">Remove</button></div>
+  <div class="yf-read"><span>Selected <b class="yz">1</b></span><span>Width <b class="yw">100%</b></span><span>Height <b class="yh">12%</b></span><span>Subtitle Y <b class="ys">82%</b></span><em>✓ Final render synced</em></div>
 </div>
 """
 
 LAYOUT_EDITOR_CSS = r"""
-.yf-layout-editor{width:100%;color:#eef2ff;user-select:none}.yf-layout-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.yf-layout-head b{font-size:14px}.yf-layout-head small{display:block;color:#8896b7;margin-top:3px}.yf-reset{border:1px solid #554c88;background:#17152d;color:#ddd6fe;border-radius:10px;padding:7px 11px;cursor:pointer}.yf-stage{position:relative;overflow:hidden;min-height:280px;border-radius:18px;border:1px solid #34345e;background:#050713;touch-action:none}.yf-img{display:block;width:100%;height:auto;min-height:280px;max-height:620px;object-fit:contain;pointer-events:none}.yf-empty{position:absolute;inset:0;display:grid;place-items:center;color:#71809f;background:#090d1df0;padding:20px;text-align:center}.yf-stage.ready .yf-empty{display:none}.yf-blur{position:absolute;left:0;top:72%;height:12%;width:100%;min-height:25px;border-top:2px solid #a78bfa;border-bottom:2px solid #22d3ee;background:#7c3aed18;backdrop-filter:blur(9px);cursor:grab}.yf-blur span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#080b19d9;border:1px solid #a78bfa66;padding:6px 11px;border-radius:999px;font-size:10px;font-weight:900}.yf-blur i{position:absolute;left:50%;width:80px;height:12px;transform:translateX(-50%);cursor:ns-resize}.yf-blur i:after{content:"";position:absolute;left:18px;right:18px;top:4px;height:4px;background:white;border-radius:999px}.yf-top{top:-7px}.yf-bottom{bottom:-7px}.yf-sub{position:absolute;left:6%;right:6%;top:82%;transform:translateY(-50%);height:34px;border:2px dashed #facc15;background:#facc1517;border-radius:10px;display:grid;place-items:center;cursor:ns-resize;box-shadow:0 0 24px #facc1518}.yf-sub span{background:#0b0d18de;color:#fde68a;padding:5px 9px;border-radius:8px;font-size:10px;font-weight:900}.yf-read{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;font-size:11px}.yf-read span,.yf-read em{padding:6px 9px;border-radius:9px;background:#0f142a;border:1px solid #25304b;font-style:normal}.yf-read em{color:#86efac}.yf-read b{color:white}@media(max-width:720px){.yf-stage,.yf-img{min-height:220px}}
+.yf-layout-editor{width:100%;color:#eef2ff;user-select:none}.yf-layout-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.yf-layout-head b{font-size:14px}.yf-layout-head small{display:block;color:#8896b7;margin-top:3px}.yf-reset{border:1px solid #554c88;background:#17152d;color:#ddd6fe;border-radius:10px;padding:7px 11px;cursor:pointer}.yf-stage{position:relative;overflow:hidden;min-height:280px;border-radius:18px;border:1px solid #34345e;background:#050713;touch-action:none}.yf-img{display:block;width:100%;height:auto;min-height:280px;max-height:620px;object-fit:contain;pointer-events:none}.yf-empty{position:absolute;inset:0;display:grid;place-items:center;color:#71809f;background:#090d1df0;padding:20px;text-align:center}.yf-stage.ready .yf-empty{display:none}.yf-blur{position:absolute;min-width:28px;min-height:25px;border:2px solid #a78bfa;background:#7c3aed22;backdrop-filter:blur(9px);cursor:grab;box-shadow:0 0 20px #7c3aed28}.yf-blur.active{border-color:#facc15;z-index:5}.yf-blur.disabled{display:none}.yf-blur span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);white-space:nowrap;background:#080b19dc;border:1px solid #a78bfa66;padding:5px 9px;border-radius:999px;font-size:9px;font-weight:900;pointer-events:none}.yf-edge{position:absolute;display:block}.yf-top,.yf-bottom{left:18%;right:18%;height:14px;cursor:ns-resize}.yf-top{top:-8px}.yf-bottom{bottom:-8px}.yf-left,.yf-right{top:18%;bottom:18%;width:14px;cursor:ew-resize}.yf-left{left:-8px}.yf-right{right:-8px}.yf-edge:after{content:"";position:absolute;background:#fff;border-radius:999px}.yf-top:after,.yf-bottom:after{left:20%;right:20%;top:5px;height:4px}.yf-left:after,.yf-right:after{top:20%;bottom:20%;left:5px;width:4px}.yf-sub{position:absolute;left:6%;right:6%;top:82%;transform:translateY(-50%);height:34px;border:2px dashed #facc15;background:#facc1517;border-radius:10px;display:grid;place-items:center;cursor:ns-resize;box-shadow:0 0 24px #facc1518}.yf-sub span{background:#0b0d18de;color:#fde68a;padding:5px 9px;border-radius:8px;font-size:10px;font-weight:900}.yf-zone-tabs{display:flex;align-items:center;gap:7px;margin-top:10px}.yf-zone-tabs small{color:#8fa0bd;margin-right:2px}.yf-zone-tabs button{width:34px;height:32px;border-radius:9px;border:1px solid #34415f;background:#0d1425;color:#9fb0cc;font-weight:900;cursor:pointer}.yf-zone-tabs button.on{border-color:#facc15;color:#fde68a;background:#facc1515}.yf-zone-tabs .yf-remove{width:auto;padding:0 10px;margin-left:auto;color:#fda4af;border-color:#fb718544}.yf-read{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;font-size:11px}.yf-read span,.yf-read em{padding:6px 9px;border-radius:9px;background:#0f142a;border:1px solid #25304b;font-style:normal}.yf-read em{color:#86efac}.yf-read b{color:white}@media(max-width:720px){.yf-stage,.yf-img{min-height:220px}}
 """
 
 LAYOUT_EDITOR_JS = r"""
-const stage=element.querySelector('.yf-stage'), img=element.querySelector('.yf-img'), blur=element.querySelector('.yf-blur'), topH=element.querySelector('.yf-top'), botH=element.querySelector('.yf-bottom'), sub=element.querySelector('.yf-sub'), reset=element.querySelector('.yf-reset');
-const yc=element.querySelector('.yc'),yh=element.querySelector('.yh'),ys=element.querySelector('.ys');
-let center=78,height=12,subY=82,mode=null,startY=0,sc=center,sh=height,sy=subY;
+const stage=element.querySelector('.yf-stage'),img=element.querySelector('.yf-img'),bands=[...element.querySelectorAll('.yf-blur')],tabs=[...element.querySelectorAll('[data-pick]')],sub=element.querySelector('.yf-sub'),reset=element.querySelector('.yf-reset'),remove=element.querySelector('.yf-remove');
+const yz=element.querySelector('.yz'),yw=element.querySelector('.yw'),yh=element.querySelector('.yh'),ys=element.querySelector('.ys');
+let zones=[{x:0,y:72,w:100,h:12,on:true},{x:12,y:50,w:76,h:11,on:false},{x:20,y:30,w:60,h:10,on:false}],active=0,subY=82,drag=null;
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 function ready(){const ok=!!img.getAttribute('src')&&img.naturalWidth>0;stage.classList.toggle('ready',ok);return ok}
-function norm(){height=clamp(height,3,45);center=clamp(center,height/2,100-height/2);subY=clamp(subY,4,96)}
-function draw(){norm();blur.style.top=`${center-height/2}%`;blur.style.height=`${height}%`;sub.style.top=`${subY}%`;yc.textContent=`${center.toFixed(1)}%`;yh.textContent=`${height.toFixed(1)}%`;ys.textContent=`${subY.toFixed(1)}%`}
-function emit(){norm();trigger('change',{center:+center.toFixed(2),height:+height.toFixed(2),subtitleY:+subY.toFixed(2)})}
-function pct(e){const r=stage.getBoundingClientRect();return((e.clientY-r.top)/Math.max(1,r.height))*100}
-function begin(e,m){if(!ready())return;e.preventDefault();e.stopPropagation();mode=m;startY=pct(e);sc=center;sh=height;sy=subY;stage.setPointerCapture?.(e.pointerId)}
-blur.addEventListener('pointerdown',e=>{if(e.target===topH||e.target===botH)return;begin(e,'move')});topH.addEventListener('pointerdown',e=>begin(e,'top'));botH.addEventListener('pointerdown',e=>begin(e,'bottom'));sub.addEventListener('pointerdown',e=>begin(e,'sub'));
-stage.addEventListener('pointermove',e=>{if(!mode)return;e.preventDefault();const d=pct(e)-startY;if(mode==='move')center=sc+d;else if(mode==='top'){const b=sc+sh/2,t=clamp(sc-sh/2+d,0,b-3);height=b-t;center=(b+t)/2}else if(mode==='bottom'){const t=sc-sh/2,b=clamp(sc+sh/2+d,t+3,100);height=b-t;center=(b+t)/2}else if(mode==='sub')subY=sy+d;draw()});
-function end(e){if(!mode)return;mode=null;try{stage.releasePointerCapture?.(e.pointerId)}catch(_){ }draw();emit()}stage.addEventListener('pointerup',end);stage.addEventListener('pointercancel',end);reset.addEventListener('click',e=>{e.preventDefault();center=78;height=12;subY=82;draw();emit()});img.addEventListener('load',()=>{ready();draw();emit()});img.addEventListener('error',()=>stage.classList.remove('ready'));ready();draw();
+function norm(z){z.w=clamp(z.w,3,100);z.h=clamp(z.h,3,45);z.x=clamp(z.x,0,100-z.w);z.y=clamp(z.y,0,100-z.h)}
+function draw(){zones.forEach((z,i)=>{norm(z);const b=bands[i];b.classList.toggle('disabled',!z.on);b.classList.toggle('active',i===active&&z.on);b.style.left=z.x+'%';b.style.top=z.y+'%';b.style.width=z.w+'%';b.style.height=z.h+'%'});tabs.forEach((t,i)=>{t.classList.toggle('on',i===active);t.textContent=(zones[i].on?'':'＋')+(i+1)});const z=zones[active];yz.textContent=active+1;yw.textContent=z.w.toFixed(1)+'%';yh.textContent=z.h.toFixed(1)+'%';ys.textContent=subY.toFixed(1)+'%';sub.style.top=subY+'%';remove.style.visibility=active===0?'hidden':'visible'}
+function emit(){const payload=zones.filter(z=>z.on).map(({x,y,w,h})=>({x:+x.toFixed(2),y:+y.toFixed(2),w:+w.toFixed(2),h:+h.toFixed(2)}));trigger('change',{zones:payload,subtitleY:+subY.toFixed(2)})}
+function point(e){const r=stage.getBoundingClientRect();return{x:(e.clientX-r.left)*100/Math.max(1,r.width),y:(e.clientY-r.top)*100/Math.max(1,r.height)}}
+function begin(e,i,mode){if(!ready())return;e.preventDefault();e.stopPropagation();active=i;const p=point(e),z=zones[i];drag={mode,sx:p.x,sy:p.y,z:{...z},subY};stage.setPointerCapture?.(e.pointerId);draw()}
+bands.forEach((b,i)=>{b.addEventListener('pointerdown',e=>begin(e,i,e.target.classList.contains('yf-top')?'top':e.target.classList.contains('yf-bottom')?'bottom':e.target.classList.contains('yf-left')?'left':e.target.classList.contains('yf-right')?'right':'move'))});sub.addEventListener('pointerdown',e=>begin(e,active,'sub'));
+stage.addEventListener('pointermove',e=>{if(!drag)return;e.preventDefault();const p=point(e),dx=p.x-drag.sx,dy=p.y-drag.sy,z=zones[active],s=drag.z;if(drag.mode==='move'){z.x=s.x+dx;z.y=s.y+dy}else if(drag.mode==='left'){z.x=s.x+dx;z.w=s.w-dx}else if(drag.mode==='right')z.w=s.w+dx;else if(drag.mode==='top'){z.y=s.y+dy;z.h=s.h-dy}else if(drag.mode==='bottom')z.h=s.h+dy;else if(drag.mode==='sub')subY=clamp(drag.subY+dy,4,96);norm(z);draw()});
+function end(e){if(!drag)return;drag=null;try{stage.releasePointerCapture?.(e.pointerId)}catch(_){ }draw();emit()}stage.addEventListener('pointerup',end);stage.addEventListener('pointercancel',end);
+tabs.forEach((t,i)=>t.addEventListener('click',e=>{e.preventDefault();active=i;zones[i].on=true;draw();emit()}));remove.addEventListener('click',e=>{e.preventDefault();if(active>0){zones[active].on=false;active=0;draw();emit()}});reset.addEventListener('click',e=>{e.preventDefault();zones=[{x:0,y:72,w:100,h:12,on:true},{x:12,y:50,w:76,h:11,on:false},{x:20,y:30,w:60,h:10,on:false}];active=0;subY=82;draw();emit()});img.addEventListener('load',()=>{ready();draw();emit()});img.addEventListener('error',()=>stage.classList.remove('ready'));ready();draw();
 """
 
 
@@ -4090,37 +4125,11 @@ def _subtitle_size_preview_html(size_value):
     """
 
 def create_app():
-    # Optional Lottie artwork shown at the very top of the user page.
-    # Keep David Digital Sculpting.json beside this Python file in Colab/Space.
-    lottie_json_text = "{}"
-    script_file = globals().get("__file__")
-    lottie_candidates = ([
-        Path(script_file).resolve().with_name("David Digital Sculpting.json")
-    ] if script_file else []) + [
-        Path("/content/David Digital Sculpting.json"),
-        Path.cwd() / "David Digital Sculpting.json",
-        Path.cwd() / "upload" / "David Digital Sculpting.json",
-    ]
-    for lottie_path in lottie_candidates:
-        try:
-            if lottie_path.exists():
-                lottie_json_text = json.dumps(
-                    json.loads(lottie_path.read_text(encoding="utf-8")),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                break
-        except Exception as exc:
-            print(f"[LOTTIE LOAD WARNING] {type(exc).__name__}: {exc}")
-
     css = r"""
     :root{--bg:#050812;--card:#0d1424;--card2:#111b31;--line:#263755;--cyan:#22d3ee;--blue:#2563eb;--violet:#7c3aed;--green:#34d399;--text:#f8fafc;--muted:#91a1bd;--gold:#facc15}
     html,body{overflow-x:hidden!important;background:#050812!important}*{box-sizing:border-box}
     body,.gradio-container{background:radial-gradient(circle at 12% 0,#142655 0,transparent 30%),radial-gradient(circle at 95% 3%,#32145c 0,transparent 27%),linear-gradient(180deg,#080d19,#050812)!important}
     .gradio-container{max-width:980px!important;margin:0 auto!important;padding:10px 12px 80px!important;color:var(--text)!important}
-    .top-lottie-shell{position:relative;width:100%;height:190px;margin:2px auto 10px;overflow:hidden;border:1px solid #2b3c6055;border-radius:24px;background:radial-gradient(circle at 50% 100%,#2563eb20,transparent 55%),linear-gradient(180deg,#0a1020cc,#070b15aa);box-shadow:0 14px 45px #0005}
-    #yf-david-lottie{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
-    #yf-david-lottie svg{width:auto!important;height:210px!important;max-width:100%!important;display:block;margin:auto}
     .wiz-hero{position:relative;overflow:hidden;border:1px solid #2b3c60;border-radius:26px;background:linear-gradient(145deg,#0c1428ee,#111a36f5);padding:24px;margin:4px 0 14px;box-shadow:0 22px 65px #0007}
     .wiz-hero:after{content:"";position:absolute;width:230px;height:230px;right:-90px;top:-110px;border-radius:50%;background:radial-gradient(circle,#22d3ee2d,transparent 68%)}
     .wiz-brand{display:flex;align-items:center;gap:13px;position:relative;z-index:2}.wiz-logo{width:58px;height:58px;flex:0 0 58px;display:grid;place-items:center;border-radius:18px;background:linear-gradient(135deg,#7c3aed,#0891b2);font-weight:950;font-size:22px;box-shadow:0 12px 35px #22d3ee2e}.wiz-name{font-size:27px;font-weight:950;letter-spacing:-.02em}.wiz-sub{color:#8fa2c2;font-size:11px;margin-top:2px}.wiz-note{position:relative;z-index:2;color:#b5c1d8;font-size:11px;line-height:1.55;margin-top:13px}.wiz-note b{color:#67e8f9}
@@ -4135,7 +4144,7 @@ def create_app():
     .clean-audio-badge{padding:10px;border-radius:12px;background:#34d3990c;border:1px solid #34d39935;color:#a7f3d0;font-size:10px;font-weight:850}.generate-summary{padding:12px;border-radius:14px;background:#07111f;border:1px solid #243852;color:#9fb0cb;font-size:10px;line-height:1.7;margin-bottom:12px}.generate-summary b{color:#e0f2fe}
     #auto-recap-btn{min-height:64px!important;border:0!important;border-radius:16px!important;font-size:17px!important;font-weight:950!important;background:linear-gradient(100deg,#6d28d9,#2563eb 50%,#0891b2)!important;box-shadow:0 14px 40px #2563eb40!important;color:white!important}.final-stage{border-color:#22d3ee42!important;background:linear-gradient(155deg,#0b1327,#0e1932)!important}.final-badge{display:inline-flex;padding:6px 9px;border-radius:999px;background:#22c55e12;border:1px solid #22c55e40;color:#86efac;font-size:9px;font-weight:950}.final-copy{font-size:10px;color:#93a4c5;line-height:1.5;margin-bottom:10px}#yf-download-btn{min-height:58px!important;border-radius:15px!important;border:1px solid #67e8f944!important;background:linear-gradient(100deg,#059669,#0891b2,#2563eb)!important;color:white!important;font-weight:950!important;font-size:15px!important;margin-top:10px!important}.download-note{padding:9px 10px;border-radius:11px;background:#07111f99;border:1px solid #334155;color:#8fa3c5;font-size:9px;line-height:1.45;margin-top:8px}.footer-note{text-align:center;color:#52617d;font-size:9px;padding:16px 0}
     input,textarea,select{max-width:100%!important}.gradio-container video{max-height:56vh!important}
-    @media(max-width:720px){.gradio-container{padding:5px 6px 74px!important}.top-lottie-shell{height:145px;border-radius:19px;margin-bottom:8px}#yf-david-lottie svg{height:160px!important}.wiz-hero{padding:17px 13px;border-radius:19px;margin-top:2px}.wiz-logo{width:48px;height:48px;flex-basis:48px;border-radius:15px;font-size:18px}.wiz-name{font-size:21px}.wiz-sub{font-size:9px}.wiz-note{font-size:10px;margin-top:10px}.wiz-progress{padding-left:0;padding-right:0}.wiz-node small{font-size:7px}.wiz-node span{width:27px;height:27px;font-size:9px}.wiz-line{top:22px}.wizard-card{padding:12px!important;border-radius:17px!important}.wizard-title{font-size:17px}.wizard-copy{font-size:10px}.mobile-stack{display:flex!important;flex-direction:column!important;gap:9px!important}.mobile-stack>*{width:100%!important;min-width:0!important}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.wiz-nav{display:flex!important;flex-direction:row!important;gap:8px!important}.wiz-nav>*{min-width:0!important;flex:1!important}#auto-recap-btn{position:sticky!important;bottom:8px!important;z-index:85!important;box-shadow:0 10px 34px #000b,0 0 24px #2563eb55!important}.gradio-container video{max-height:47vh!important}#yf-download-btn{min-height:55px!important}#yf-conn{right:7px!important;bottom:72px!important}}
+    @media(max-width:720px){.gradio-container{padding:5px 6px 74px!important}.wiz-hero{padding:17px 13px;border-radius:19px;margin-top:2px}.wiz-logo{width:48px;height:48px;flex-basis:48px;border-radius:15px;font-size:18px}.wiz-name{font-size:21px}.wiz-sub{font-size:9px}.wiz-note{font-size:10px;margin-top:10px}.wiz-progress{padding-left:0;padding-right:0}.wiz-node small{font-size:7px}.wiz-node span{width:27px;height:27px;font-size:9px}.wiz-line{top:22px}.wizard-card{padding:12px!important;border-radius:17px!important}.wizard-title{font-size:17px}.wizard-copy{font-size:10px}.mobile-stack{display:flex!important;flex-direction:column!important;gap:9px!important}.mobile-stack>*{width:100%!important;min-width:0!important}button{min-height:48px!important}input,textarea,select{font-size:16px!important}.wiz-nav{display:flex!important;flex-direction:row!important;gap:8px!important}.wiz-nav>*{min-width:0!important;flex:1!important}#auto-recap-btn{position:sticky!important;bottom:8px!important;z-index:85!important;box-shadow:0 10px 34px #000b,0 0 24px #2563eb55!important}.gradio-container video{max-height:47vh!important}#yf-download-btn{min-height:55px!important}#yf-conn{right:7px!important;bottom:72px!important}}
     @media(max-width:390px){.wiz-node small{display:none}.wiz-progress{padding-bottom:0}.wizard-card{padding:10px!important}.wiz-name{font-size:19px}}
     """
     # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
@@ -4340,30 +4349,7 @@ def create_app():
     theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
     connection_js = r"""
     (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
-    """ + """
-    (() => {
-      const animationData = %s;
-      const mount = () => {
-        const box = document.getElementById('yf-david-lottie');
-        if (!box || !animationData || !animationData.layers) {
-          if (box) box.style.display = 'none';
-          return;
-        }
-        const start = () => {
-          if (box.dataset.ready || !window.lottie) return;
-          box.dataset.ready = '1';
-          window.lottie.loadAnimation({container:box,renderer:'svg',loop:true,autoplay:true,animationData});
-        };
-        if (window.lottie) return start();
-        const script = document.createElement('script');
-        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js';
-        script.onload = start;
-        script.onerror = () => { box.style.display = 'none'; };
-        document.head.appendChild(script);
-      };
-      setTimeout(mount, 250);
-    })();
-    """ % lottie_json_text
+    """
 
     with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
         app._yf_theme = theme
@@ -4375,9 +4361,6 @@ def create_app():
         wizard_step = gr.State(1)
 
         gr.HTML("""
-        <section class='top-lottie-shell' aria-label='David digital sculpting animation'>
-          <div id='yf-david-lottie'></div>
-        </section>
         <section class='wiz-hero'>
           <div class='wiz-brand'>
             <div class='wiz-logo'><span>YF</span></div>
@@ -4483,7 +4466,7 @@ def create_app():
             with gr.Column(visible=False, elem_classes=["wizard-card"]) as step4_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 4 • LOOK</div><div class='wizard-title'>✨ Subtitle + Blur</div><div class='wizard-copy'>Yellow subtitle guide နဲ့ blur band ကို preview ပေါ်မှာ finger/mouse နဲ့ drag လုပ်ပါ။ Final render မှာ exact position sync ဖြစ်ပါတယ်။</div>")
                 layout_editor = gr.HTML(value=video_first_frame_data_uri, inputs=[video_input], html_template=LAYOUT_EDITOR_TEMPLATE, css_template=LAYOUT_EDITOR_CSS, js_on_load=LAYOUT_EDITOR_JS, apply_default_css=False, container=False)
-                blur_y_percent = gr.Number(value=78, visible=False)
+                blur_y_percent = gr.Textbox(value='[{"x":0,"y":72,"w":100,"h":12}]', visible=False)
                 blur_height_percent = gr.Number(value=12, visible=False)
                 sub_pos_percent = gr.Number(value=82, visible=False)
                 with gr.Row(elem_classes=["mobile-stack"]):
