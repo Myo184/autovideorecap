@@ -332,6 +332,8 @@ def _autoload_premium_font_bundle():
     candidates = [
         "/content/PREMIUM FONT.zip",
         "/content/PREMIUM_FONT.zip",
+        # Works when app.py and the supplied ZIP are downloaded together.
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "PREMIUM FONT.zip") if "__file__" in globals() else "",
         os.path.join(os.getcwd(), "PREMIUM FONT.zip"),
         os.path.join(os.getcwd(), "PREMIUM_FONT.zip"),
         "/mnt/data/PREMIUM FONT.zip",
@@ -4211,7 +4213,20 @@ def create_app():
       #clone-reference-upload canvas,#clone-reference-upload svg{
         max-width:100%!important;min-width:0!important;
       }
-      #clone-reference-upload audio{height:42px!important;display:block!important}
+      /* Compact the tall WaveSurfer view Gradio shows after uploading. */
+      #clone-reference-upload [class*="waveform"],
+      #clone-reference-upload [class*="Waveform"]{
+        height:92px!important;min-height:92px!important;max-height:92px!important;
+      }
+      #clone-reference-upload [class*="waveform"]>*,
+      #clone-reference-upload [class*="Waveform"]>*{
+        max-height:92px!important;
+      }
+      #clone-reference-upload audio{height:38px!important;display:block!important}
+
+      /* Dropdown pop-up should stay tap-friendly and above the card on phones. */
+      #subtitle-font-picker,#subtitle-font-picker *{min-width:0!important;box-sizing:border-box!important}
+      #subtitle-font-picker [role="listbox"]{max-width:calc(100vw - 26px)!important;z-index:1000!important}
     }
     @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
     """
@@ -4334,7 +4349,14 @@ def create_app():
                     stroke_color = gr.ColorPicker(label="Outline", value="#000000")
                 subtitle_size = gr.Slider(1.0, 10.0, value=5.5, step=.5, label="Subtitle Size • 1 Small — 10 Large")
                 subtitle_size_preview = gr.HTML(_subtitle_size_preview_html(5.5))
-                subtitle_font_style = gr.Dropdown(choices=list(FONT_STYLE_FILES.keys()), value="Noto Sans Myanmar (Default)", label="Subtitle Font Style")
+                subtitle_font_style = gr.Dropdown(
+                    choices=list(FONT_STYLE_FILES.keys()),
+                    value="Noto Sans Myanmar (Default)",
+                    label="Subtitle Font Style",
+                    filterable=True,
+                    allow_custom_value=False,
+                    elem_id="subtitle-font-picker",
+                )
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
                 font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
                 with gr.Accordion("📁 Custom Myanmar Font", open=False):
