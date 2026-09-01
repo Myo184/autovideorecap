@@ -82,10 +82,14 @@ def install_missing_core_packages():
 
 
 def ensure_voxcpm_audio_stack():
-    """Repair the NumPy/SciPy/librosa stack once, then reuse it on later runs."""
+    """Install only the VoxCPM audio helpers without replacing NumPy/SciPy.
+
+    Colab itself may already have NumPy's compiled C extension loaded.  A
+    force-reinstall of NumPy/SciPy inside that live kernel can leave Python
+    files from one version next to a C extension from another, causing the
+    ``numpy.ufunc.__module__`` crash.  Keep Colab's working NumPy/SciPy intact.
+    """
     expected = {
-        "numpy": "2.2.6",
-        "scipy": "1.15.3",
         "librosa": "0.11.0",
         "soundfile": "0.13.1",
     }
@@ -93,14 +97,16 @@ def ensure_voxcpm_audio_stack():
     if not mismatch:
         print("✅ VoxCPM2 audio stack already compatible — reuse mode")
         return
-    print("🎙️ Installing compatible VoxCPM2 audio stack (first run only)...")
+
+    print("🎙️ Installing VoxCPM2 audio helpers:", ", ".join(mismatch))
+    # Do not use --force-reinstall and do not pin NumPy/SciPy here.  pip keeps
+    # Colab's already-compatible compiled scientific stack in place.
     run_pip(
-        "install", "-q", "--no-cache-dir", "--upgrade", "--force-reinstall",
-        "numpy==2.2.6",
-        "scipy==1.15.3",
+        "install", "-q", "--no-cache-dir", "--upgrade-strategy", "only-if-needed",
         "librosa==0.11.0",
         "soundfile==0.13.1",
     )
+    print("✅ VoxCPM2 audio helpers ready.")
 
 
 def ensure_pillow():
@@ -4224,6 +4230,17 @@ def create_app():
       }
       #clone-reference-upload audio{height:38px!important;display:block!important}
 
+      /* Keep the Voice Clone card at the same height before and after a file
+         is chosen.  Gradio turns the tall drop area into one short file row
+         after upload, which used to make the whole mobile page jump upward. */
+      .clone-upload-stable-slot{
+        height:222px!important;min-height:222px!important;max-height:222px!important;
+        overflow:hidden!important;
+      }
+      .clone-upload-stable-slot #clone-reference-upload{
+        height:222px!important;min-height:222px!important;max-height:222px!important;
+      }
+
       /* Dropdown pop-up should stay tap-friendly and above the card on phones. */
       #subtitle-font-picker,#subtitle-font-picker *{min-width:0!important;box-sizing:border-box!important}
       #subtitle-font-picker [role="listbox"]{max-width:calc(100vw - 26px)!important;z-index:1000!important}
@@ -4325,14 +4342,15 @@ def create_app():
                     # A File input is deliberate: Gradio's Audio component creates a
                     # large WaveSurfer editor after upload, which expands/jumps on
                     # narrow phones.  VoxCPM only needs the uploaded file path.
-                    clone_reference = gr.File(
-                        label="Reference Voice • Upload MP3/WAV",
-                        file_types=["audio"],
-                        file_count="single",
-                        type="filepath",
-                        elem_id="clone-reference-upload",
-                        elem_classes=["clone-audio-input"],
-                    )
+                    with gr.Column(elem_classes=["clone-upload-stable-slot"]):
+                        clone_reference = gr.File(
+                            label="Reference Voice • Upload MP3/WAV",
+                            file_types=["audio"],
+                            file_count="single",
+                            type="filepath",
+                            elem_id="clone-reference-upload",
+                            elem_classes=["clone-audio-input"],
+                        )
                     clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
