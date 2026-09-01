@@ -5,6 +5,7 @@
 # Recommended Runtime: T4 GPU (Runtime > Change runtime type > T4 GPU)
 
 import os, sys, subprocess, importlib.util, shutil
+from importlib import metadata as importlib_metadata
 import threading
 import base64
 import socket
@@ -45,32 +46,74 @@ def clean_reinstall_pillow():
             del sys.modules[module_name]
     importlib.invalidate_caches()
 
+
+def _installed_distribution_version(name):
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _module_is_available(module_name):
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def install_missing_core_packages():
+    """Install only packages that are missing; do not slow every Colab restart."""
+    requirements = {
+        "gradio": "gradio",
+        "gradio_client": "gradio_client",
+        "faster_whisper": "faster-whisper",
+        "edge_tts": "edge-tts",
+        "gtts": "gTTS",
+        "google.genai": "google-genai",
+        "cv2": "opencv-python-headless",
+        "voxcpm": "voxcpm",
+    }
+    missing = [package for module, package in requirements.items() if not _module_is_available(module)]
+    if missing:
+        print("📦 Installing missing packages:", ", ".join(missing))
+        run_pip("install", "-q", *missing)
+    else:
+        print("✅ Core packages already installed — reuse mode")
+
+
+def ensure_voxcpm_audio_stack():
+    """Repair the NumPy/SciPy/librosa stack once, then reuse it on later runs."""
+    expected = {
+        "numpy": "2.2.6",
+        "scipy": "1.15.3",
+        "librosa": "0.11.0",
+        "soundfile": "0.13.1",
+    }
+    mismatch = [name for name, wanted in expected.items() if _installed_distribution_version(name) != wanted]
+    if not mismatch:
+        print("✅ VoxCPM2 audio stack already compatible — reuse mode")
+        return
+    print("🎙️ Installing compatible VoxCPM2 audio stack (first run only)...")
+    run_pip(
+        "install", "-q", "--no-cache-dir", "--upgrade", "--force-reinstall",
+        "numpy==2.2.6",
+        "scipy==1.15.3",
+        "librosa==0.11.0",
+        "soundfile==0.13.1",
+    )
+
+
+def ensure_pillow():
+    if not _module_is_available("PIL"):
+        print("📦 Installing Pillow...")
+        run_pip("install", "-q", "Pillow==11.3.0")
+    else:
+        print("✅ Pillow already installed — reuse mode")
+
 print("📦 Installing Python packages...")
-run_pip("install", "-q", "-U",
-        "gradio",
-        "gradio_client",
-        "faster-whisper",
-        "edge-tts",
-        "gTTS",
-        "google-genai",
-        "opencv-python-headless",
-        "voxcpm")
-
-# VoxCPM2 uses librosa to read the uploaded reference voice.  Colab's
-# preinstalled SciPy can be compiled against a different NumPy build; simply
-# upgrading NumPy then leaves a mixed installation and raises:
-# "numpy.ufunc has no attribute __module__".  Reinstall this matched audio
-# stack together *before* importing torch/librosa/voxcpm.
-print("🎙️ Installing compatible VoxCPM2 audio stack...")
-run_pip(
-    "install", "-q", "--no-cache-dir", "--upgrade", "--force-reinstall",
-    "numpy==2.2.6",
-    "scipy==1.15.3",
-    "librosa==0.11.0",
-    "soundfile==0.13.1",
-)
-
-clean_reinstall_pillow()
+install_missing_core_packages()
+ensure_voxcpm_audio_stack()
+ensure_pillow()
 
 print("🎞️ Installing FFmpeg & Myanmar fonts...")
 subprocess.run(["apt-get", "update", "-qq"], check=False)
