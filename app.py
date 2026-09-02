@@ -8,12 +8,13 @@ import os, sys, subprocess, importlib.util, shutil, math
 from importlib import metadata as importlib_metadata
 import threading
 import base64
+import hashlib
 import socket
 import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.9 • NEW VIDEO HOME • FIXED VOXCPM NOTICE • EARLY QUOTA GATE"
+YF_BUILD = "V6.11.0 • BACKGROUND GEMINI SCRIPT • NEW VIDEO HOME • EARLY QUOTA GATE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -4155,6 +4156,72 @@ def render_start_status(analysis_state, script_editor, voice_engine, render_mode
 # percent, elapsed time and an estimated remaining time.
 PROCESS_STATUS = {}
 PROCESS_STATUS_LOCK = threading.Lock()
+PRECOMPUTE_CACHE = {}
+PRECOMPUTE_CACHE_LOCK = threading.Lock()
+
+
+def _precompute_signature(video_value, user_api_key, tone_style, recap_length):
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return None
+    try:
+        stat = os.stat(video_path)
+        file_mark = f"{os.path.abspath(video_path)}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        file_mark = os.path.abspath(video_path)
+    key_mark = hashlib.sha256(str(user_api_key or "").strip().encode("utf-8")).hexdigest()[:16]
+    raw = "|".join([file_mark, key_mark, str(tone_style or ""), str(recap_length or "")])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _background_script_notice(user_api_key):
+    if not str(user_api_key or "").strip():
+        gr.Warning("Gemini API Key မထည့်ရသေးပါ။ Script ကို AUTO RECAP နှိပ်ချိန်မှ ပြင်ဆင်ပါမယ်။")
+        note = "⚠️ Gemini Key မရှိသေးလို့ background script မစတင်သေးပါ။"
+    else:
+        note = "🧠 Gemini က နောက်ကွယ်မှာ Video Analyze + Recap Script ရေးနေပါတယ်…"
+    return (*_wizard_payload(3), f"<div class='precompute-card working'>{note}</div>")
+
+
+def precompute_recap_in_background(
+    video_value, user_api_key, tone_style, recap_length,
+    vip_access_state, session_id,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Analyze and write the script while the user chooses later settings."""
+    api_key = str(user_api_key or "").strip()
+    if not api_key:
+        return "<div class='precompute-card waiting'>Gemini Key ထည့်ပြီးမှ background script စတင်နိုင်ပါတယ်။</div>"
+    try:
+        verify_video_quota_available(vip_access_state, show_available_notice=False)
+        signature = _precompute_signature(video_value, api_key, tone_style, recap_length)
+        if not signature:
+            raise ValueError("Video file မတွေ့ပါ။")
+        sid = str(session_id or "default")
+        with PRECOMPUTE_CACHE_LOCK:
+            cached = dict(PRECOMPUTE_CACHE.get(sid, {}))
+        if cached.get("signature") == signature and cached.get("script"):
+            return "<div class='precompute-card ready'>✅ Recap Script အဆင်သင့်ဖြစ်ပြီးသားပါ။</div>"
+
+        analysis, _summary, _rows = analyze_movie_v3(
+            video_value, vip_access_state, user_api_key=api_key,
+            progress=_ProgressSlice(progress, 0.02, 0.55),
+        )
+        script_text, _script_summary = generate_recap_script_v3(
+            analysis, api_key, tone_style, recap_length,
+            progress=_ProgressSlice(progress, 0.55, 1.0),
+        )
+        with PRECOMPUTE_CACHE_LOCK:
+            PRECOMPUTE_CACHE[sid] = {
+                "signature": signature,
+                "analysis": analysis,
+                "script": script_text,
+                "ready_at": time.time(),
+            }
+        return "<div class='precompute-card ready'>✅ Video Analyze + Recap Script အဆင်သင့်ဖြစ်ပါပြီ။ AUTO RECAP နှိပ်ရင် ထပ်မရေးတော့ပါ။</div>"
+    except Exception as exc:
+        print(f"[BACKGROUND SCRIPT ERROR] {type(exc).__name__}: {exc}")
+        return f"<div class='precompute-card error'>⚠️ Background script မပြီးပါ: {str(exc)[:240]}</div>"
 
 
 def _set_process_status(session_id, **updates):
@@ -4377,18 +4444,38 @@ def auto_recap_pipeline_v5(
     try:
         live_progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
 
-        # Stage 1: speech / scene analysis (hidden from the user UI).
-        analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
-            video_value, vip_access_state, user_api_key=user_api_key,
-            progress=_ProgressSlice(live_progress, 0.01, 0.18),
-        )
+        # Step 2 NEXT starts these two expensive stages in the background.
+        # Reuse them only when video, Gemini key, tone and target length all
+        # still match; otherwise generate safely with the current settings.
+        signature = _precompute_signature(video_value, user_api_key, tone_style, recap_length)
+        sid = str(session_id or "default")
+        with PRECOMPUTE_CACHE_LOCK:
+            cached = dict(PRECOMPUTE_CACHE.get(sid, {}))
+        if signature and cached.get("signature") == signature and cached.get("analysis") and cached.get("script"):
+            analysis = cached["analysis"]
+            script_text = cached["script"]
+            live_progress(0.34, desc="✅ Background မှ အဆင်သင့်ဖြစ်နေသော Analyze + Script ကိုသုံးနေသည်…")
+        else:
+            # Stage 1: speech / scene analysis (hidden from the user UI).
+            analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
+                video_value, vip_access_state, user_api_key=user_api_key,
+                progress=_ProgressSlice(live_progress, 0.01, 0.18),
+            )
 
-        # Stage 2: viral storytelling script (hidden from the user UI).
-        live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
-        script_text, _script_summary = generate_recap_script_v3(
-            analysis, user_api_key, tone_style, recap_length,
-            progress=_ProgressSlice(live_progress, 0.18, 0.34),
-        )
+            # Stage 2: viral storytelling script (hidden from the user UI).
+            live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
+            script_text, _script_summary = generate_recap_script_v3(
+                analysis, user_api_key, tone_style, recap_length,
+                progress=_ProgressSlice(live_progress, 0.18, 0.34),
+            )
+            if signature:
+                with PRECOMPUTE_CACHE_LOCK:
+                    PRECOMPUTE_CACHE[sid] = {
+                        "signature": signature,
+                        "analysis": analysis,
+                        "script": script_text,
+                        "ready_at": time.time(),
+                    }
 
         # Stage 3: narration + scene render + exports. The child function's
         # Gradio progress (including FFmpeg render ETA) is mirrored live.
@@ -4464,6 +4551,9 @@ def _start_new_recap(session_id):
         state="idle", progress=0, stage="Waiting to start",
         eta_low=None, eta_high=None, error="",
     )
+    sid = str(session_id or "default")
+    with PRECOMPUTE_CACHE_LOCK:
+        PRECOMPUTE_CACHE.pop(sid, None)
     ready_eta = (
         "<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div>"
         "<b>Ready</b><span>Video အသစ်တင်ပြီး AUTO RECAP ကိုနှိပ်ပါ။</span></div></div>"
@@ -4472,6 +4562,7 @@ def _start_new_recap(session_id):
         *_wizard_payload(1),
         None, {}, "", None, None, None, None, None, "",
         ready_eta, _processing_status_html(session_id),
+        "<div class='precompute-card waiting'>Gemini Key ထည့်ပြီး NEXT နှိပ်ပါက script ကို နောက်ကွယ်မှာ ကြိုရေးပေးပါမယ်။</div>",
     )
 
 
@@ -4573,7 +4664,7 @@ def create_app():
     .login-shell-pro{max-width:600px;margin:24px auto!important}.login-card-pro{border:1px solid #334166!important;background:#0d142cf5!important;border-radius:22px!important;padding:24px!important}.login-head{text-align:center;font-size:23px;font-weight:950}.login-copy{text-align:center;color:#8f9abb;font-size:11px;margin:6px 0 14px}.member-strip{padding:11px 14px;border:1px solid #34d39945;background:#34d3990d;border-radius:14px;margin-bottom:9px}.member-name{font-weight:900}.member-small{font-size:9px;color:#7dd3fc}.quota-badge{font-size:9px;color:#fde68a}
     .engine-panel{border:1px solid #334268!important;background:#0a1229aa!important;border-radius:16px!important;padding:12px!important;margin-top:8px!important}.clone-panel{border-color:#8b5cf65c!important;background:linear-gradient(180deg,#3a1d6a26,#0a1229d9)!important}.clone-title{font-weight:950;color:#ddd6fe;margin-bottom:4px}.clone-copy,.hint{font-size:10px;color:#91a1bd;line-height:1.5}.voice-mode-title{font-weight:950;color:#e0f2fe}.font-ok,.font-warn{font-size:10px;line-height:1.45;padding:8px 10px;border-radius:10px;margin-top:6px}.font-ok{color:#a7f3d0;background:#34d39912;border:1px solid #34d39935}.font-warn{color:#fde68a;background:#f59e0b12;border:1px solid #f59e0b35}
     #subtitle-font-picker{position:relative;z-index:35}#subtitle-font-picker [role="listbox"]{padding:7px!important;border:1px solid #465779!important;border-radius:14px!important;background:#080d18f7!important;box-shadow:0 20px 55px #000c!important;max-height:300px!important}#subtitle-font-picker [role="option"]{min-height:38px!important;padding:9px 11px!important;margin:2px 0!important;border-radius:9px!important;color:#e5edf9!important;font-size:12px!important;border:1px solid transparent!important}#subtitle-font-picker [role="option"]:hover,#subtitle-font-picker [role="option"][aria-selected="true"]{background:linear-gradient(90deg,#7c3aed35,#0891b22a)!important;border-color:#67e8f944!important;color:#fff!important}
-    .process-card{display:flex;align-items:flex-start;gap:12px;width:100%;padding:14px;border-radius:16px;margin:10px 0;border:1px solid #22d3ee46;background:linear-gradient(110deg,#061426e8,#111738ed);box-shadow:inset 0 1px #ffffff08,0 12px 34px #0003}.process-card.idle{border-color:#47556966;background:#0a1020cc}.process-card.done{border-color:#34d39966;background:linear-gradient(110deg,#05251ce8,#092034ed)}.process-card.error{border-color:#fb718566;background:linear-gradient(110deg,#2b0b14e8,#1c1022ed)}.process-spinner{width:34px;height:34px;flex:0 0 34px;border-radius:50%;border:3px solid #22d3ee2f;border-top-color:#67e8f9;border-right-color:#818cf8;animation:yfspin .8s linear infinite;margin-top:1px}.process-icon{width:34px;height:34px;flex:0 0 34px;border-radius:11px;display:grid;place-items:center;border:1px solid #47556966;color:#94a3b8;font-weight:950}.done-icon{border-color:#34d39966;color:#6ee7b7;background:#10b98118}.error-icon{border-color:#fb718566;color:#fda4af;background:#fb718518}.process-main{min-width:0;flex:1}.process-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.process-top b{font-size:12px;line-height:1.35;color:#f8fafc;overflow-wrap:anywhere}.process-top strong{font-size:11px;color:#67e8f9;white-space:nowrap}.process-main>span{display:block;color:#a9b9d3;font-size:10px;margin-top:4px;line-height:1.45}.process-main>small{display:block;color:#facc15;font-size:9px;margin-top:7px;line-height:1.4}.process-track{height:8px;width:100%;border-radius:999px;background:#020617cc;border:1px solid #33415588;overflow:hidden;margin-top:9px}.process-track i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#2563eb,#22d3ee);box-shadow:0 0 14px #22d3ee66;transition:width .55s ease}@keyframes yfspin{to{transform:rotate(360deg)}}.eta-card{display:flex;align-items:center;gap:11px;width:100%;padding:12px 13px;border-radius:15px;margin:10px 0}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:36px;height:36px;flex:0 0 36px;border-radius:11px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33}.eta-card b{display:block;font-size:12px}.eta-card span,.eta-card small{display:block;color:#9fb0cd;font-size:10px;margin-top:2px}.eta-card small{color:#facc15}
+    .process-card{display:flex;align-items:flex-start;gap:12px;width:100%;padding:14px;border-radius:16px;margin:10px 0;border:1px solid #22d3ee46;background:linear-gradient(110deg,#061426e8,#111738ed);box-shadow:inset 0 1px #ffffff08,0 12px 34px #0003}.process-card.idle{border-color:#47556966;background:#0a1020cc}.process-card.done{border-color:#34d39966;background:linear-gradient(110deg,#05251ce8,#092034ed)}.process-card.error{border-color:#fb718566;background:linear-gradient(110deg,#2b0b14e8,#1c1022ed)}.process-spinner{width:34px;height:34px;flex:0 0 34px;border-radius:50%;border:3px solid #22d3ee2f;border-top-color:#67e8f9;border-right-color:#818cf8;animation:yfspin .8s linear infinite;margin-top:1px}.process-icon{width:34px;height:34px;flex:0 0 34px;border-radius:11px;display:grid;place-items:center;border:1px solid #47556966;color:#94a3b8;font-weight:950}.done-icon{border-color:#34d39966;color:#6ee7b7;background:#10b98118}.error-icon{border-color:#fb718566;color:#fda4af;background:#fb718518}.process-main{min-width:0;flex:1}.process-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.process-top b{font-size:12px;line-height:1.35;color:#f8fafc;overflow-wrap:anywhere}.process-top strong{font-size:11px;color:#67e8f9;white-space:nowrap}.process-main>span{display:block;color:#a9b9d3;font-size:10px;margin-top:4px;line-height:1.45}.process-main>small{display:block;color:#facc15;font-size:9px;margin-top:7px;line-height:1.4}.process-track{height:8px;width:100%;border-radius:999px;background:#020617cc;border:1px solid #33415588;overflow:hidden;margin-top:9px}.process-track i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#2563eb,#22d3ee);box-shadow:0 0 14px #22d3ee66;transition:width .55s ease}@keyframes yfspin{to{transform:rotate(360deg)}}.eta-card{display:flex;align-items:center;gap:11px;width:100%;padding:12px 13px;border-radius:15px;margin:10px 0}.eta-card.ready{border:1px solid #22d3ee44;background:linear-gradient(90deg,#06b6d414,#7c3aed13)}.eta-card.waiting{border:1px solid #64748b45;background:#1118277d}.eta-icon{width:36px;height:36px;flex:0 0 36px;border-radius:11px;display:grid;place-items:center;background:#22d3ee17;border:1px solid #22d3ee33}.eta-card b{display:block;font-size:12px}.eta-card span,.eta-card small{display:block;color:#9fb0cd;font-size:10px;margin-top:2px}.eta-card small{color:#facc15}.precompute-card{padding:11px 13px;margin:9px 0 13px;border-radius:13px;font-size:10px;font-weight:800;line-height:1.5}.precompute-card.waiting{border:1px solid #64748b55;background:#0f172a99;color:#a9b9d3}.precompute-card.working{border:1px solid #22d3ee66;background:linear-gradient(90deg,#06b6d418,#7c3aed18);color:#a5f3fc;animation:yfGlow 1.8s ease-in-out infinite alternate}.precompute-card.ready{border:1px solid #34d39966;background:#10b98118;color:#a7f3d0}.precompute-card.error{border:1px solid #fb718566;background:#fb718514;color:#fecdd3}@keyframes yfGlow{to{box-shadow:0 0 22px #22d3ee35}}
     .clean-audio-badge{padding:10px;border-radius:12px;background:#34d3990c;border:1px solid #34d39935;color:#a7f3d0;font-size:10px;font-weight:850}.generate-summary{padding:12px;border-radius:14px;background:#07111f;border:1px solid #243852;color:#9fb0cb;font-size:10px;line-height:1.7;margin-bottom:12px}.generate-summary b{color:#e0f2fe}
     #auto-recap-btn{min-height:64px!important;border:0!important;border-radius:16px!important;font-size:17px!important;font-weight:950!important;background:linear-gradient(100deg,#6d28d9,#2563eb 50%,#0891b2)!important;box-shadow:0 14px 40px #2563eb40!important;color:white!important}.final-stage{border-color:#22d3ee42!important;background:linear-gradient(155deg,#0b1327,#0e1932)!important}.final-badge{display:inline-flex;padding:6px 9px;border-radius:999px;background:#22c55e12;border:1px solid #22c55e40;color:#86efac;font-size:9px;font-weight:950}.final-copy{font-size:10px;color:#93a4c5;line-height:1.5;margin-bottom:10px}#yf-download-btn{min-height:58px!important;border-radius:15px!important;border:1px solid #67e8f944!important;background:linear-gradient(100deg,#059669,#0891b2,#2563eb)!important;color:white!important;font-weight:950!important;font-size:15px!important;margin-top:10px!important}.download-note{padding:9px 10px;border-radius:11px;background:#07111f99;border:1px solid #334155;color:#8fa3c5;font-size:9px;line-height:1.45;margin-top:8px}.footer-note{text-align:center;color:#52617d;font-size:9px;padding:16px 0}
     input,textarea,select{max-width:100%!important}.gradio-container video{max-height:56vh!important}
@@ -4880,6 +4971,7 @@ def create_app():
             # ---------------- STEP 3 ----------------
             with gr.Column(visible=False, elem_classes=["wizard-card"]) as step3_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 3 • NARRATION</div><div class='wizard-title'>🎙 Choose Voice</div><div class='wizard-copy'>Fast Burmese voice သို့ VoxCPM2 Voice Clone ရွေးပါ။ Voice Clone ရွေးမှသာ reference controls ပေါ်ပါမယ်။</div>")
+                precompute_status = gr.HTML("<div class='precompute-card waiting'>Gemini Key ထည့်ပြီး NEXT နှိပ်ပါက script ကို နောက်ကွယ်မှာ ကြိုရေးပေးပါမယ်။</div>")
                 voice_engine = gr.Radio(
                     choices=["⚡ Edge TTS • Fast", "🎙️ VoxCPM2 Voice Clone"],
                     value="⚡ Edge TTS • Fast",
@@ -5038,7 +5130,21 @@ def create_app():
             show_progress="hidden",
         )
         step2_back.click(lambda: _wizard_payload(1), outputs=wizard_outputs, queue=False, show_progress="hidden")
-        step2_next.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
+        precompute_evt = step2_next.click(
+            _background_script_notice,
+            inputs=[user_api_key],
+            outputs=[*wizard_outputs, precompute_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        precompute_evt.then(
+            precompute_recap_in_background,
+            inputs=[video_input, user_api_key, tone_style, recap_length, vip_access_state, session_id_state],
+            outputs=[precompute_status],
+            concurrency_limit=1,
+            concurrency_id="yf_recap_work",
+            show_progress="hidden",
+        )
         step3_back.click(lambda: _wizard_payload(2), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step3_next.click(_wizard_validate_voice, [voice_engine, clone_reference, clone_consent, voxcpm_confirmed], wizard_outputs, queue=False, show_progress="hidden")
         step4_back.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
@@ -5053,6 +5159,7 @@ def create_app():
                 video_input, analysis_state, script_editor,
                 final_video, fast_download, srt_file, mp3_file, script_file,
                 render_status, eta_card, processing_card,
+                precompute_status,
             ],
             queue=False,
             show_progress="hidden",
@@ -5130,7 +5237,7 @@ def create_app():
             outputs=[final_video, fast_download, srt_file, mp3_file, script_file, render_status],
             trigger_mode="once",
             concurrency_limit=1,
-            concurrency_id="yf_auto_recap",
+            concurrency_id="yf_recap_work",
             show_progress="full",
         )
         # Result page must open only when the long render actually succeeds.
