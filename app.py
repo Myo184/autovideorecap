@@ -14,7 +14,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.11.0 • BACKGROUND GEMINI SCRIPT • NEW VIDEO HOME • EARLY QUOTA GATE"
+YF_BUILD = "V6.11.1 • TRUE SCENE SYNC • VOXCPM CLONE FIX • BACKGROUND GEMINI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -1390,10 +1390,9 @@ def generate_voxcpm_audio(
             kwargs["prompt_text"] = transcript
             kwargs["reference_wav_path"] = reference_wav_path
         else:
-            # Controllable / isolated reference cloning.
+            # Isolated reference cloning.  Do not prepend an English pace
+            # instruction to the spoken text: some VoxCPM builds pronounce it.
             kwargs["reference_wav_path"] = reference_wav_path
-            pace = voxcpm_pace_instruction(desired_speed)
-            kwargs["text"] = f"({pace}){clean_text}"
     else:
         desc = VOXCPM_VOICE_PRESETS.get(voice_preset, "")
         if voice_preset == "✍️ Custom Voice Description":
@@ -2946,7 +2945,7 @@ def group_transcript_scenes(raw_segments, max_scene_seconds=28.0, silence_gap=2.
     return out
 
 
-def _sample_video_frames_for_story(video_path, duration, max_frames=18):
+def _sample_video_frames_for_story(video_path, duration, max_frames=30):
     """Return small, timestamped RGB frames for Gemini visual story analysis.
 
     Sampling frames (instead of uploading the whole movie) keeps the request
@@ -3229,7 +3228,7 @@ Create chapter {batch_index} of {len(scene_batches)} from the chronological SOUR
 
 Narrative tone: {tone_style}
 This chapter's narration target: {int(batch_target)} seconds.
-Write approximately {int(batch_target * 14.5)} Burmese visible characters for THIS CHAPTER.
+Write approximately {int(batch_target * 11.5)} Burmese visible characters for THIS CHAPTER.
 Cover nearly every meaningful event in this chapter. Do not compress it into a brief summary.
 Write detailed connected narration that fills 92–100% of the chapter duration at a NORMAL steady pace.
 
@@ -3270,9 +3269,23 @@ SOURCE SCENES:
                     text = str(item.get("text", "")).strip()
                     if not text:
                         continue
-                    st = max(0.0, float(item.get("start", 0.0)))
-                    en = max(st + 0.35, float(item.get("end", st + 3.0)))
-                    en = min(max(en, st + 0.35), source_duration if source_duration > 0 else en)
+                    raw_st = max(0.0, float(item.get("start", 0.0)))
+                    raw_en = max(raw_st + 0.35, float(item.get("end", raw_st + 3.0)))
+                    # Bind every model timestamp to the supplied source scene
+                    # with the greatest overlap (or nearest midpoint).  Prompt
+                    # instructions alone are not a sufficient sync guarantee.
+                    def _scene_match_score(scene):
+                        ss, se = float(scene["start"]), float(scene["end"])
+                        overlap = max(0.0, min(raw_en, se) - max(raw_st, ss))
+                        distance = abs(((raw_st + raw_en) / 2.0) - ((ss + se) / 2.0))
+                        return (overlap, -distance)
+                    matched_scene = max(batch_scenes, key=_scene_match_score)
+                    scene_st = max(0.0, float(matched_scene["start"]))
+                    scene_en = min(source_duration, float(matched_scene["end"]))
+                    st = max(scene_st, min(raw_st, scene_en - 0.35))
+                    en = min(scene_en, max(st + 0.35, raw_en))
+                    if en <= st:
+                        st, en = scene_st, max(scene_st + 0.35, scene_en)
                     generated_batches.append({"start": st, "end": en, "text": text})
             except Exception as exc:
                 print(f"⚠️ Script chapter {batch_index} failed:", exc)
@@ -3334,53 +3347,77 @@ def parse_script_editor(text):
     return segments
 
 
-def _coalesce_voxcpm_segments(segments, source_duration):
-    """Reduce expensive VoxCPM calls for short clips without shortening text.
+def normalize_script_timeline(segments, source_duration):
+    """Clamp, de-duplicate and merge overlapping Gemini timestamps.
 
-    The complete narration is preserved in chronological order; only adjacent
-    TTS requests are joined. Subtitle text is still split into readable phrases
-    after synthesis. Long videos retain their original scene-level requests.
+    Gemini can return two narration items for the same visual scene.  Feeding
+    those items to FFmpeg as independent overlapping trims makes the picture
+    jump backwards.  Merge them before TTS so both story text and chronology
+    are preserved on one monotonic source timeline.
     """
+    duration = max(0.5, float(source_duration or 0.5))
+    clean = []
+    for raw in sorted((segments or []), key=lambda s: (float(s.get("start", 0)), float(s.get("end", 0)))):
+        text = str(raw.get("text", "")).strip()
+        if not text:
+            continue
+        start = max(0.0, min(float(raw.get("start", 0.0)), duration - 0.35))
+        end = min(duration, max(start + 0.35, float(raw.get("end", start + 0.35))))
+        if clean and start < clean[-1]["end"] - 0.02:
+            previous = clean[-1]
+            previous["end"] = max(previous["end"], end)
+            previous["text"] = (previous["text"].rstrip() + " " + text).strip()
+        else:
+            clean.append({"start": start, "end": end, "text": text})
+    return clean
+
+
+def expand_scene_windows_to_full_video(segments, source_duration):
+    """Create monotonic, non-overlapping source windows covering the video.
+
+    The narration marker remains inside its matching window, but unused gaps
+    are shared between neighbouring scenes.  This provides enough real footage
+    for the 93% duration rule without freezing or slow-motion stretching a few
+    short Gemini-selected clips.
+    """
+    items = [dict(s) for s in (segments or [])]
+    if not items:
+        return []
+    duration = max(0.5, float(source_duration or 0.5))
+    boundaries = [0.0]
+    for left, right in zip(items, items[1:]):
+        gap_mid = (float(left["end"]) + float(right["start"])) / 2.0
+        boundary = max(boundaries[-1] + 0.05, min(gap_mid, duration - 0.05))
+        boundaries.append(boundary)
+    boundaries.append(duration)
+    expanded = []
+    for idx, item in enumerate(items):
+        start = max(0.0, min(boundaries[idx], duration - 0.05))
+        end = min(duration, max(start + 0.05, boundaries[idx + 1]))
+        expanded.append({"start": start, "end": end, "text": item["text"]})
+    return expanded
+
+
+def _coalesce_voxcpm_segments(segments, source_duration):
+    """Join only small adjacent items without destroying scene granularity."""
     items = [dict(s) for s in (segments or []) if (s.get("text") or "").strip()]
     if len(items) <= 1:
         return items
 
-    duration = max(0.0, float(source_duration or 0.0))
-    if duration <= 35.0:
-        target_calls = 1
-    elif duration <= 75.0:
-        target_calls = 2
-    elif duration <= 150.0:
-        target_calls = min(3, len(items))
-    else:
-        return items
-
-    if len(items) <= target_calls:
-        return items
-
-    total_chars = sum(max(1, len(s["text"])) for s in items)
-    groups, current, current_chars = [], [], 0
-    consumed_chars = 0
-    for item in items:
-        current.append(item)
-        current_chars += max(1, len(item["text"]))
-        groups_left = target_calls - len(groups)
-        items_left = len(items) - (sum(len(g) for g in groups) + len(current))
-        target_end = total_chars * (len(groups) + 1) / target_calls
-        reached_balance = consumed_chars + current_chars >= target_end
-        if groups_left > 1 and reached_balance and items_left >= groups_left - 1:
-            groups.append(current)
-            consumed_chars += current_chars
-            current, current_chars = [], 0
-    if current:
-        groups.append(current)
-
     merged = []
-    for group in groups:
+    for item in items:
+        if merged:
+            prev = merged[-1]
+            combined_chars = len(prev["text"]) + 1 + len(item["text"])
+            combined_span = float(item["end"]) - float(prev["start"])
+            source_gap = float(item["start"]) - float(prev["end"])
+            if combined_chars <= 220 and combined_span <= 18.0 and source_gap <= 0.8:
+                prev["end"] = float(item["end"])
+                prev["text"] = f"{prev['text']} {item['text']}".strip()
+                continue
         merged.append({
-            "start": float(group[0]["start"]),
-            "end": float(group[-1]["end"]),
-            "text": " ".join(str(s["text"]).strip() for s in group if str(s["text"]).strip()),
+            "start": float(item["start"]), "end": float(item["end"]),
+            "text": str(item["text"]).strip(),
         })
     return merged
 
@@ -3738,7 +3775,14 @@ def render_reviewed_script_v3(
     source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
     if source_duration <= 0.5:
         source_duration = max(0.5, probe_duration(video_path, fallback=1.0))
+    script_segments = normalize_script_timeline(script_segments, source_duration)
+    if not script_segments:
+        raise gr.Error("✏️ Script timestamps ကိုစစ်ဆေးပါ။ အသုံးပြုနိုင်သော scene မရှိပါ။")
+    clone_reference_16k = None
     if "Voice Clone" in str(voice_engine):
+        # Always feed VoxCPM one predictable 16 kHz mono WAV (maximum 15 sec),
+        # regardless of whether the user uploaded MP3, stereo WAV or 48 kHz.
+        clone_reference_16k = normalize_clone_reference(clone_reference_path, work_dir, max_seconds=15)
         original_tts_calls = len(script_segments)
         script_segments = _coalesce_voxcpm_segments(script_segments, source_duration)
         if len(script_segments) < original_tts_calls:
@@ -3807,9 +3851,10 @@ def render_reviewed_script_v3(
                     text, audio,
                     mode="clone",
                     voice_preset="", custom_voice_description="",
-                    reference_wav_path=clone_reference_path, reference_transcript=clone_transcript,
+                    reference_wav_path=clone_reference_16k, reference_transcript=clone_transcript,
                     desired_speed=1.0, cfg_value=voxcpm_cfg,
-                    inference_timesteps=voxcpm_steps, seed=(int(voxcpm_seed or 42) + idx),
+                    # Fixed seed keeps timbre/prosody stable across segments.
+                    inference_timesteps=voxcpm_steps, seed=int(voxcpm_seed or 42),
                 )
             except Exception as vox_exc:
                 raise gr.Error(
@@ -3825,18 +3870,6 @@ def render_reviewed_script_v3(
         voice_files.append(audio)
         voice_durations.append(dur)
         successful_source_segments.append({"start": slot_start, "end": slot_end, "text": text})
-        display_chunks = split_subtitle_display_chunks(text, min_chars=25, max_chars=35)
-        if not display_chunks:
-            display_chunks = [text]
-        total_chars = max(1, sum(len(c) for c in display_chunks))
-        chunk_cursor = sum(voice_durations[:-1])
-        for chunk in display_chunks:
-            chunk_share = len(chunk) / total_chars
-            chunk_dur = max(0.65, dur * chunk_share)
-            subtitle_segments.append({"start": chunk_cursor, "end": chunk_cursor + chunk_dur, "text": chunk})
-            chunk_cursor += chunk_dur
-        if subtitle_segments:
-            subtitle_segments[-1]["end"] = sum(voice_durations)
         completed = idx + 1
         voice_elapsed = max(0.01, time.time() - voice_started_at)
         voice_eta = (voice_elapsed / completed) * max(0, total - completed)
@@ -3847,8 +3880,11 @@ def render_reviewed_script_v3(
 
     if not voice_files:
         raise gr.Error("Voice narration ထုတ်မရပါ။")
-    # Ensure source list matches exactly the voice clips that succeeded.
+    # Ensure source list matches exactly the voice clips that succeeded, then
+    # extend neighbouring scene windows across unused source gaps.  Their total
+    # source footage now equals the original video duration.
     source_segments = successful_source_segments
+    render_source_segments = expand_scene_windows_to_full_video(source_segments, source_duration)
 
     narration_duration = max(0.5, sum(voice_durations))
     requested_duration = min(
@@ -3859,14 +3895,62 @@ def render_reviewed_script_v3(
     # natural pace, but it may not collapse below 93% of its chosen target.
     # Example: 4:30 source -> minimum 4:11 final output.
     minimum_output_duration = requested_duration * 0.93
+    # Auto mode stays between 93% and 100% of the source.  Because expanded
+    # source windows cover the whole upload, every output slot is shorter than
+    # or equal to its real footage: video is never rendered in slow motion.
     final_output_duration = min(
-        source_duration,
-        max(narration_duration, minimum_output_duration)
+        requested_duration,
+        max(minimum_output_duration, min(narration_duration, requested_duration)),
     )
-    duration_scale = final_output_duration / max(narration_duration, 0.5)
-    render_video_durations = [d * duration_scale for d in voice_durations]
+    source_spans = [max(0.05, s["end"] - s["start"]) for s in render_source_segments]
+    span_total = max(0.05, sum(source_spans))
+    render_video_durations = [final_output_duration * span / span_total for span in source_spans]
+
+    # Keep normal speech whenever it fits.  Only an objectively overlong line
+    # is tempo-fitted to its own scene slot; this is the last-resort guard that
+    # prevents overlap, cut-off narration and later-scene drift.
+    timeline_voice_files, timeline_voice_durations = [], []
+    for idx, (audio_path, voice_dur, slot_dur) in enumerate(zip(voice_files, voice_durations, render_video_durations)):
+        if voice_dur > slot_dur + 0.04:
+            fitted_path = os.path.join(work_dir, f"voice_sync_{idx:03d}.wav")
+            fit_narration_clip_to_slot(audio_path, slot_dur, fitted_path)
+            timeline_voice_files.append(fitted_path)
+            timeline_voice_durations.append(slot_dur)
+        else:
+            timeline_voice_files.append(audio_path)
+            timeline_voice_durations.append(voice_dur)
+
+    output_timeline, output_cursor = [], 0.0
+    for source_seg, voice_dur, slot_dur in zip(source_segments, timeline_voice_durations, render_video_durations):
+        output_seg = {
+            "start": output_cursor,
+            "end": output_cursor + slot_dur,
+            "text": source_seg["text"],
+        }
+        output_timeline.append(output_seg)
+
+        display_chunks = split_subtitle_display_chunks(source_seg["text"], min_chars=25, max_chars=35)
+        if not display_chunks:
+            display_chunks = [source_seg["text"]]
+        total_chars = max(1, sum(len(c) for c in display_chunks))
+        chunk_cursor = output_cursor
+        spoken_end = output_cursor + voice_dur
+        for chunk_index, chunk in enumerate(display_chunks):
+            remaining = max(0.05, spoken_end - chunk_cursor)
+            if chunk_index == len(display_chunks) - 1:
+                chunk_end = spoken_end
+            else:
+                chunk_end = min(spoken_end, chunk_cursor + max(0.25, voice_dur * len(chunk) / total_chars))
+            subtitle_segments.append({"start": chunk_cursor, "end": max(chunk_cursor + 0.05, chunk_end), "text": chunk})
+            chunk_cursor = min(spoken_end, chunk_end)
+            if remaining <= 0.05:
+                break
+        output_cursor += slot_dur
+
     merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
-    build_continuous_narration_track(voice_files, merged_voice)
+    build_timeline_narration_track(
+        timeline_voice_files, output_timeline, final_output_duration, merged_voice
+    )
 
     narration_mp3 = os.path.join(work_dir, "YF_Recap_Narration.mp3")
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", merged_voice,
@@ -3900,7 +3984,7 @@ def render_reviewed_script_v3(
     input_args += ["-i", final_audio]
 
     graph = build_story_video_filter_graph(
-        source_segments, render_video_durations, target_w, target_h, render_fps, final_output_duration,
+        render_source_segments, render_video_durations, target_w, target_h, render_fps, final_output_duration,
         background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
         blur_y_percent, blur_height_percent, blur_strength, ass_path, logo_idx,
         subtitle_font_style
