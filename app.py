@@ -8,13 +8,12 @@ import os, sys, subprocess, importlib.util, shutil, math
 from importlib import metadata as importlib_metadata
 import threading
 import base64
-import hashlib
 import socket
 import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.9 • NEW VIDEO RESET • STABLE VOICE/FONT UI • BACKGROUND GEMINI SCRIPT"
+YF_BUILD = "V6.10.9 • NEW VIDEO HOME • FIXED VOXCPM NOTICE • EARLY QUOTA GATE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -288,12 +287,6 @@ SYSTEM_INSTRUCTION = (
 )
 
 USER_LIMIT_TRACKER = {}
-
-# Background Gemini pre-generation jobs, keyed by browser/session id.
-# The heavy Analyze + Script stages can run while the user chooses Voice / Subtitle settings.
-_BG_SCRIPT_JOBS = {}
-_BG_SCRIPT_LOCK = threading.Lock()
-
 
 # ================================================================
 # 3) FONT DETECTION
@@ -2163,99 +2156,42 @@ def refresh_member_quota(vip_access_state):
         return _member_quota_html(vip_access_state)
 
 
-def verify_video_quota_available(vip_access_state):
-    """Freshly verify today's quota without consuming a video credit.
-
-    This is used immediately after upload / before Step 2 so an exhausted user
-    does not spend time on analysis, TTS, or rendering only to be rejected at
-    the very end.  The successful render still calls ``consume_video_quota``.
-    """
+def verify_video_quota_available(vip_access_state, show_available_notice=False):
+    """Fail closed before expensive analysis/TTS when today's quota is exhausted."""
     if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
-        raise gr.Error("🔒 VIP Access မရှိပါ။ Login ပြန်ဝင်ပါ။")
-
+        raise gr.Error("🔒 VIP Login ပြန်ဝင်ပါ။")
     code = str(vip_access_state.get("code", "")).strip().upper()
     if not code:
         raise gr.Error("🔒 VIP Code မရှိပါ။ Login ပြန်ဝင်ပါ။")
-
     try:
         client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
         data = _vip_api_dict(client.predict(code, api_name="/verify"))
     except Exception as exc:
-        print(f"[VIP PRECHECK ERROR] {type(exc).__name__}: {exc}")
+        print(f"[VIP EARLY QUOTA CHECK ERROR] {type(exc).__name__}: {exc}")
         raise gr.Error(
-            "❌ Video limit ကို အခုမစစ်နိုင်ပါ။ VIP Server connection ကိုစစ်ပြီး ထပ်ကြိုးစားပါ။"
-        )
+            "❌ Video limit ကိုစစ်ဆေးတဲ့ server နဲ့ ချိတ်ဆက်မရပါ။ "
+            "Analysis မစတင်သေးပါ—ခဏနေရင် ပြန်စမ်းပါ။"
+        ) from exc
 
     if not data.get("valid"):
-        raise gr.Error(data.get("msg") or "❌ VIP Code သက်တမ်း/အသုံးပြုခွင့် မမှန်ပါ။")
+        raise gr.Error(data.get("msg") or "❌ VIP Code သက်တမ်းကုန်နေပါပြီ။")
 
     limit = data.get("daily_limit")
     used = int(data.get("used_today", 0) or 0)
-
-    if limit is None:
-        data["_quota_remaining"] = None
-        data["_quota_used"] = used
-        data["_quota_limit"] = None
-        return data
-
-    try:
-        limit = int(limit)
-    except Exception:
-        raise gr.Error("❌ VIP Server မှ daily limit data မမှန်ပါ။ Admin ကိုဆက်သွယ်ပါ။")
-
-    remaining_raw = data.get("remaining_today")
-    try:
-        remaining = int(remaining_raw) if remaining_raw is not None else limit - used
-    except Exception:
-        remaining = limit - used
-    remaining = max(0, remaining)
-
-    data["_quota_remaining"] = remaining
-    data["_quota_used"] = used
-    data["_quota_limit"] = limit
-
-    if remaining <= 0:
-        raise gr.Error(
-            f"🚫 ဒီနေ့ Video Limit ပြည့်ပါပြီ ({used}/{limit})။ Daily limit reset ဖြစ်ပြီးမှ ပြန်အသုံးပြုနိုင်ပါမယ်။"
-        )
-
+    if limit is not None:
+        limit = max(0, int(limit))
+        remaining_raw = data.get("remaining_today")
+        remaining = max(0, int(remaining_raw if remaining_raw is not None else limit - used))
+        if remaining <= 0 or used >= limit:
+            raise gr.Error(
+                f"🚫 ဒီနေ့ Video Limit ပြည့်ပါပြီ ({used}/{limit})။ "
+                "Video analysis နဲ့ အသံထုတ်လုပ်မှု မစတင်သေးပါ။ နောက်နေ့မှ ပြန်အသုံးပြုပါ။"
+            )
+        if show_available_notice:
+            gr.Info(f"✅ Video limit စစ်ပြီးပါပြီ • ဒီနေ့ {remaining} ပုဒ် ကျန်ရှိပါတယ်။")
+    elif show_available_notice:
+        gr.Info("✅ Video limit စစ်ပြီးပါပြီ • Unlimited access ဖြစ်ပါတယ်။")
     return data
-
-
-def video_upload_quota_notice(video_value, vip_access_state):
-    """Show quota status as soon as the uploaded video becomes available."""
-    video_path = normalize_file_path(video_value)
-    if not video_path or not os.path.exists(video_path):
-        return ""
-
-    try:
-        data = verify_video_quota_available(vip_access_state)
-    except gr.Error as exc:
-        # A visible card remains on Step 1 even after the toast disappears.
-        raw_message = exc.args[0] if getattr(exc, "args", None) else str(exc)
-        message = (str(raw_message).replace("&", "&amp;").replace("<", "&lt;")
-                   .replace(">", "&gt;").replace("'", "&#39;").replace('"', '&quot;'))
-        gr.Warning(str(raw_message))
-        return (
-            "<div class='quota-precheck quota-stop'>"
-            "<b>🚫 Video Limit Check</b><span>" + message + "</span>"
-            "</div>"
-        )
-
-    limit = data.get("_quota_limit")
-    used = data.get("_quota_used", 0)
-    remaining = data.get("_quota_remaining")
-    if limit is None:
-        message = f"✅ Video upload ပြီးပါပြီ • Unlimited plan • ဒီနေ့ထုတ်ပြီး {used}"
-    else:
-        message = f"✅ Video upload ပြီးပါပြီ • ဒီနေ့ {used}/{limit} သုံးပြီး • ကျန် {remaining} Videos"
-
-    gr.Info(message)
-    return (
-        "<div class='quota-precheck quota-ok'>"
-        "<b>✅ Video Limit Check</b><span>" + message + "</span>"
-        "</div>"
-    )
 
 
 def consume_video_quota(vip_access_state):
@@ -2442,36 +2378,6 @@ def create_app_legacy():
       #auto-recap-btn{font-size:16px!important}
     }
     """
-    # V6.10.9 — prevent layout/scroll jumps in Voice + Font controls.
-    css += r"""
-    .voice-stable-zone{
-      min-height:300px!important;position:relative!important;overflow-anchor:none!important;
-      border-radius:16px!important;
-    }
-    .voice-stable-zone>.form,.voice-stable-zone>div{min-width:0!important}
-    .voice-dynamic-panel{width:100%!important;margin-bottom:0!important;overflow-anchor:none!important}
-    .voice-footer-stable-zone{min-height:92px!important;overflow-anchor:none!important}
-    .clone-reference-status-slot{min-height:46px!important}
-    .font-stable-zone{
-      min-height:270px!important;overflow-anchor:none!important;
-    }
-    .font-live-preview{height:168px!important;min-height:168px!important;max-height:168px!important;overflow:hidden!important}
-    .font-preview-stage{height:88px!important;min-height:88px!important;max-height:88px!important;overflow:hidden!important}
-    .font-status-slot{min-height:48px!important;overflow:hidden!important}
-    #subtitle-font-picker,#edge-voice-picker{position:relative!important;overflow-anchor:none!important;scroll-margin-top:105px!important}
-    #subtitle-font-picker [role="listbox"],#edge-voice-picker [role="listbox"]{
-      position:absolute!important;top:calc(100% + 6px)!important;bottom:auto!important;left:0!important;right:0!important;
-      transform:none!important;z-index:9999!important;max-height:260px!important;overflow-y:auto!important;
-    }
-    #voice-engine-radio{overflow-anchor:none!important;scroll-margin-top:105px!important}
-    .new-video-btn{min-height:50px!important;border:0!important;border-radius:13px!important;font-weight:950!important;background:linear-gradient(90deg,#059669,#0891b2,#2563eb)!important;color:#fff!important}
-    @media(max-width:720px){
-      .voice-stable-zone{min-height:350px!important}
-      .font-stable-zone{min-height:285px!important}
-      .font-live-preview{height:160px!important;min-height:160px!important;max-height:160px!important}
-      .font-preview-stage{height:82px!important;min-height:82px!important;max-height:82px!important}
-    }
-    """
     # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
     # older V6.8.2 palette while keeping all backend/component IDs intact.
     css += r"""
@@ -2535,8 +2441,6 @@ def create_app_legacy():
     .clone-panel{background:linear-gradient(145deg,#25153b8c,#0a1018dc)!important;border-color:#9b6cff52!important}
     .generate-summary,.download-note{background:#070b12d9!important;border-color:#26354c!important;color:#9eacc0!important}
     .clean-audio-badge{background:#56f2c70a!important;border-color:#56f2c738!important;color:#8affe0!important}
-    .quota-precheck{margin-top:10px;padding:11px 13px;border-radius:14px;display:flex;flex-direction:column;gap:4px;border:1px solid #ffffff16;background:#091018d9;font-size:11px;line-height:1.55}
-    .quota-precheck b{font-size:11px;letter-spacing:.02em}.quota-precheck span{color:#a7b5c8}.quota-ok{border-color:#56f2c73d;background:#56f2c709}.quota-ok b{color:#86efc9}.quota-stop{border-color:#ff6b8150;background:#ff4d6810}.quota-stop b{color:#ff93a3}.quota-stop span{color:#ffc1ca}
 
     /* Gradio form controls */
     .gradio-container input,.gradio-container textarea,.gradio-container select{
@@ -2631,7 +2535,7 @@ def create_app_legacy():
     .font-live-preview{position:relative;overflow:hidden;margin:10px 0 13px;padding:13px;border:1px solid #8b5cf66b;border-radius:17px;background:linear-gradient(145deg,#140f29,#071827);box-shadow:inset 0 1px #ffffff12,0 12px 34px #0005}
     .font-live-preview:before{content:"";position:absolute;inset:-80% -20%;background:conic-gradient(from 90deg,transparent,#ff4fd817,transparent,#38bdf818,transparent);animation:yfLogoSpin 9s linear infinite;pointer-events:none}
     .font-preview-top,.font-preview-stage,.font-live-preview small{position:relative;z-index:1}.font-preview-top{display:flex;justify-content:space-between;align-items:center;gap:9px}.font-preview-top span{font-size:8px;font-weight:950;letter-spacing:.15em;color:#67e8f9}.font-preview-top b{font-size:10px;color:#f5d0fe;overflow-wrap:anywhere;text-align:right}.font-preview-stage{min-height:82px;margin-top:10px;padding:14px;display:grid;place-items:center;text-align:center;border-radius:12px;background:#030712b8;border:1px solid #ffffff12;color:#ffe45e;font-size:25px;line-height:1.6;text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000;word-break:break-word}.font-live-preview small{display:block;margin-top:8px;color:#a7f3d0;font-size:9px}
-    .vox-confirm-card{position:relative;overflow:hidden;border:1px solid #fbbf2473!important;border-radius:18px!important;padding:14px!important;margin:10px 0!important;background:linear-gradient(145deg,#321b10e8,#19102be8)!important;box-shadow:0 16px 40px #0007,0 0 28px #f59e0b15!important}.vox-confirm-title{font-size:15px;font-weight:950;color:#fde68a;margin-bottom:6px}.vox-confirm-copy{font-size:10px;line-height:1.65;color:#f1dfbd}.vox-confirm-copy b{color:#fff7d6}.vox-confirm-actions{margin-top:11px!important;gap:8px!important}.vox-confirm-yes,.vox-confirm-no{min-height:47px!important;border-radius:12px!important;font-weight:900!important}.vox-confirm-yes{background:linear-gradient(100deg,#b45309,#db2777,#7c3aed)!important;color:#fff!important;border:1px solid #fbbf2466!important}.vox-confirm-no{background:#111827!important;color:#bae6fd!important;border:1px solid #38bdf855!important}
+    .vox-confirm-card{position:relative;overflow:hidden;border:1px solid #fbbf2473!important;border-radius:18px!important;padding:14px!important;margin:10px 0!important;background:linear-gradient(145deg,#321b10e8,#19102be8)!important;box-shadow:0 16px 40px #0007,0 0 28px #f59e0b15!important}.vox-confirm-title{font-size:15px;font-weight:950;color:#fde68a;margin-bottom:6px}.vox-confirm-copy{font-size:10px;line-height:1.65;color:#f1dfbd}.vox-confirm-copy b{color:#fff7d6}.vox-confirm-actions{margin-top:11px!important;gap:8px!important}.vox-confirm-yes,.vox-confirm-no{min-height:47px!important;border-radius:12px!important;font-weight:900!important}.vox-confirm-yes{background:linear-gradient(100deg,#b45309,#db2777,#7c3aed)!important;color:#fff!important;border:1px solid #fbbf2466!important}.vox-confirm-no{background:#111827!important;color:#bae6fd!important;border:1px solid #38bdf855!important}.new-video-home{background:linear-gradient(100deg,#059669,#0891b2,#7c3aed)!important;background-size:220% 100%!important;color:#fff!important;border:1px solid #67e8f966!important;box-shadow:0 10px 28px #22d3ee24!important;animation:yfButtonFlow 5s ease infinite!important}
     @keyframes yfTitleSpectrum{to{background-position:260% 0}}
     @keyframes yfTitleFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
     @keyframes yfSpectrumBorder{to{background-position:300% 0}}
@@ -4137,27 +4041,22 @@ def _fmt_eta_seconds(seconds):
 
 
 def request_voice_engine_change(engine, voxcpm_confirmed=False):
-    """Require explicit confirmation before VoxCPM becomes the committed engine.
-
-    IMPORTANT: bind this handler with ``voice_engine.input(...)`` rather than
-    ``voice_engine.change(...)``.  ``change`` also fires for programmatic
-    updates, so rolling the radio back to Edge could immediately call this
-    handler a second time and hide the confirmation card before the user sees it.
-    """
+    """Require an explicit time-cost confirmation before selecting VoxCPM."""
     engine = str(engine or "")
     if "Voice Clone" in engine and not bool(voxcpm_confirmed):
-        # Toast + persistent confirmation card. Keep Edge as the actual selected
-        # engine until the user presses the VoxCPM confirmation button.
+        # Do not write Edge back into the triggering Radio here. Doing so fires
+        # a second change event that immediately hides the confirmation card.
+        # The visible VoxCPM selection remains pending and cannot pass NEXT
+        # until the user explicitly confirms it.
         gr.Warning(
-            "မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။ "
-            "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။"
+            "⏳ VoxCPM Voice Clone သည် အချိန်ပိုကြာနိုင်ပါတယ်။ "
+            "အောက်က အတည်ပြုခလုတ်ကို ရွေးပေးပါ။"
         )
         return (
-            gr.update(value="⚡ Edge TTS • Fast"),
-            gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
+            gr.update(),
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
             gr.update(visible=True), False,
         )
-
     is_clone = "Voice Clone" in engine
     return (
         gr.update(value=engine or "⚡ Edge TTS • Fast"),
@@ -4428,154 +4327,6 @@ def estimate_auto_recap_eta(video_value, recap_length, voice_engine, render_mode
     return f"""<div class='eta-card ready'><div class='eta-icon'>⏱</div><div class='eta-main'><b>AUTO RECAP started • estimated {_fmt_eta_seconds(low)} – {_fmt_eta_seconds(high)}</b><span>Analyze → Viral Script → Voice → Render → Export ကို တစ်ခါတည်းလုပ်နေမယ်။</span><small>{note}</small></div></div>"""
 
 
-def _background_script_fingerprint(video_value, user_api_key, tone_style, recap_length):
-    video_path = normalize_file_path(video_value)
-    if not video_path or not os.path.exists(video_path):
-        return ""
-    key = (user_api_key or "").strip()
-    try:
-        stat = os.stat(video_path)
-        video_sig = f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}"
-    except OSError:
-        video_sig = os.path.abspath(video_path)
-    raw = "|".join([
-        video_sig,
-        hashlib.sha256(key.encode("utf-8")).hexdigest(),
-        str(tone_style or ""),
-        str(recap_length or ""),
-    ])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-class _SilentProgress:
-    def __call__(self, *args, **kwargs):
-        return None
-
-
-def _background_script_status_html(session_id):
-    with _BG_SCRIPT_LOCK:
-        job = dict(_BG_SCRIPT_JOBS.get(str(session_id or ""), {}) or {})
-    state = job.get("state")
-    if state == "running":
-        stage = job.get("stage") or "Movie ကို analyze လုပ်ပြီး AI script ရေးနေပါတယ်…"
-        return f"<div class='font-warn'>🧠 <b>AI Script Background Mode</b><br>{stage}<br><small>Voice / Subtitle settings ကို ဆက်ရွေးနိုင်ပါတယ်။</small></div>"
-    if state == "ready":
-        elapsed = _fmt_eta_seconds(job.get("elapsed", 0))
-        return f"<div class='font-ok'>✅ <b>AI Script အဆင်သင့်ဖြစ်ပါပြီ</b><br>Final Generate နှိပ်ရင် Gemini ကို ထပ်မခေါ်ဘဲ ဒီ script ကို တန်းသုံးပါမယ်။ <small>({elapsed})</small></div>"
-    if state == "error":
-        return f"<div class='font-warn'>⚠️ Background script မပြီးပါ: {str(job.get('error',''))[:240]}<br><small>Final Generate မှာ ပုံမှန်နည်းနဲ့ ပြန်စမ်းပါမယ်။</small></div>"
-    return "<div class='eta-card waiting'><div class='eta-icon'>🧠</div><div><b>Background AI Script</b><span>Gemini API Key ထည့်ပြီး textbox ကနေထွက်တာနဲ့ အလိုအလျောက်စပါမယ်။</span></div></div>"
-
-
-def _run_background_script_job(session_id, fingerprint, video_value, user_api_key, tone_style, recap_length, vip_access_state):
-    started = time.time()
-    sid = str(session_id or "")
-    try:
-        with _BG_SCRIPT_LOCK:
-            current = _BG_SCRIPT_JOBS.get(sid)
-            if not current or current.get("fingerprint") != fingerprint:
-                return
-            current["stage"] = "🎙️ Video speech / scenes ကို analyze လုပ်နေပါတယ်…"
-
-        analysis, _summary, _rows = analyze_movie_v3(
-            video_value, vip_access_state, user_api_key=user_api_key, progress=_SilentProgress()
-        )
-        with _BG_SCRIPT_LOCK:
-            current = _BG_SCRIPT_JOBS.get(sid)
-            if not current or current.get("fingerprint") != fingerprint:
-                return
-            current["stage"] = "✍️ Gemini က Burmese recap script ကို ရေးနေပါတယ်…"
-            current["analysis"] = analysis
-
-        script_text, script_summary = generate_recap_script_v3(
-            analysis, user_api_key, tone_style, recap_length, progress=_SilentProgress()
-        )
-        with _BG_SCRIPT_LOCK:
-            current = _BG_SCRIPT_JOBS.get(sid)
-            if not current or current.get("fingerprint") != fingerprint:
-                return
-            current.update({
-                "state": "ready",
-                "analysis": analysis,
-                "script_text": script_text,
-                "script_summary": script_summary,
-                "finished": time.time(),
-                "elapsed": time.time() - started,
-                "stage": "✅ AI Script အဆင်သင့်ဖြစ်ပါပြီ",
-                "error": "",
-            })
-    except Exception as exc:
-        print(f"[BACKGROUND SCRIPT ERROR] {type(exc).__name__}: {exc}")
-        with _BG_SCRIPT_LOCK:
-            current = _BG_SCRIPT_JOBS.get(sid)
-            if current and current.get("fingerprint") == fingerprint:
-                current.update({
-                    "state": "error", "error": str(exc), "finished": time.time(),
-                    "elapsed": time.time() - started, "stage": "⚠️ Background script failed",
-                })
-
-
-def start_background_script_generation(video_value, user_api_key, tone_style, recap_length, session_id, vip_access_state):
-    """Start Analyze + Gemini script in a daemon thread and return immediately."""
-    video_path = normalize_file_path(video_value)
-    if not video_path or not os.path.exists(video_path):
-        return "<div class='font-warn'>🎬 Background script စဖို့ Video ကို အရင် upload လုပ်ပါ။</div>"
-    api_key = (user_api_key or "").strip()
-    if len(api_key) < 20:
-        return "<div class='font-warn'>🔑 Gemini API Key အပြည့်အစုံထည့်ပြီး textbox ကနေထွက်ပါ။</div>"
-    try:
-        verify_video_quota_available(vip_access_state)
-    except Exception as exc:
-        return f"<div class='font-warn'>🚫 {str(exc)}</div>"
-
-    sid = str(session_id or "")
-    fingerprint = _background_script_fingerprint(video_value, api_key, tone_style, recap_length)
-    with _BG_SCRIPT_LOCK:
-        existing = _BG_SCRIPT_JOBS.get(sid)
-        if existing and existing.get("fingerprint") == fingerprint:
-            if existing.get("state") in ("running", "ready"):
-                return _background_script_status_html(sid)
-        _BG_SCRIPT_JOBS[sid] = {
-            "fingerprint": fingerprint,
-            "state": "running",
-            "stage": "🎬 Background AI preparation စတင်နေပါတယ်…",
-            "started": time.time(),
-            "analysis": None,
-            "script_text": "",
-            "error": "",
-        }
-
-    threading.Thread(
-        target=_run_background_script_job,
-        args=(sid, fingerprint, video_value, api_key, tone_style, recap_length, vip_access_state),
-        daemon=True,
-        name=f"yf-script-{sid[:8]}",
-    ).start()
-    gr.Info("🧠 AI Script ကို နောက်ကွယ်မှာ စရေးနေပါပြီ။ Voice / Subtitle settings ကို ဆက်ရွေးနိုင်ပါတယ်။")
-    return _background_script_status_html(sid)
-
-
-def poll_background_script_status(session_id):
-    return _background_script_status_html(session_id)
-
-
-def _get_or_wait_background_script(session_id, fingerprint, max_wait_seconds=900):
-    """Reuse the exact matching background job; wait rather than launch duplicate Gemini work."""
-    sid = str(session_id or "")
-    deadline = time.time() + max(1.0, float(max_wait_seconds))
-    while time.time() < deadline:
-        with _BG_SCRIPT_LOCK:
-            job = dict(_BG_SCRIPT_JOBS.get(sid, {}) or {})
-        if not job or job.get("fingerprint") != fingerprint:
-            return None
-        if job.get("state") == "ready" and job.get("analysis") and job.get("script_text"):
-            return job
-        if job.get("state") == "error":
-            return None
-        time.sleep(0.35)
-    return None
-
-
 def auto_recap_pipeline_v5(
     video_value, user_api_key, tone_style, recap_length,
     ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
@@ -4593,6 +4344,9 @@ def auto_recap_pipeline_v5(
     if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
         _set_process_status(session_id, state="error", error="VIP Login ပြန်ဝင်ပါ။")
         raise gr.Error("🔒 VIP Login ပြန်ဝင်ပါ။")
+    # Recheck immediately before expensive work in case another tab/session
+    # used the final remaining video after Step 1 was opened.
+    verify_video_quota_available(vip_access_state, show_available_notice=False)
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         _set_process_status(session_id, state="error", error="Movie / clip ကိုအရင် Upload လုပ်ပါ။")
@@ -4623,32 +4377,18 @@ def auto_recap_pipeline_v5(
     try:
         live_progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
 
-        # Reuse background Analyze + Gemini Script when the exact Video/API/Tone/Length matches.
-        bg_fingerprint = _background_script_fingerprint(video_value, user_api_key, tone_style, recap_length)
-        with _BG_SCRIPT_LOCK:
-            bg_now = dict(_BG_SCRIPT_JOBS.get(str(session_id or ""), {}) or {})
-        bg_job = None
-        if bg_now.get("fingerprint") == bg_fingerprint and bg_now.get("state") == "running":
-            live_progress(0.03, desc="🧠 Background AI Script မပြီးသေးပါ — အသစ်မရေးဘဲ အဲဒီ job ကိုစောင့်နေသည်…")
-            bg_job = _get_or_wait_background_script(session_id, bg_fingerprint, max_wait_seconds=900)
-        elif bg_now.get("fingerprint") == bg_fingerprint and bg_now.get("state") == "ready":
-            bg_job = bg_now
+        # Stage 1: speech / scene analysis (hidden from the user UI).
+        analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
+            video_value, vip_access_state, user_api_key=user_api_key,
+            progress=_ProgressSlice(live_progress, 0.01, 0.18),
+        )
 
-        if bg_job and bg_job.get("analysis") and bg_job.get("script_text"):
-            analysis = bg_job["analysis"]
-            script_text = bg_job["script_text"]
-            live_progress(0.34, desc="✅ Background AI Script ready — Gemini ကို ထပ်မခေါ်ဘဲ ဆက် render လုပ်မယ်…")
-        else:
-            # Fallback when no matching background job exists or it failed.
-            analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
-                video_value, vip_access_state, user_api_key=user_api_key,
-                progress=_ProgressSlice(live_progress, 0.01, 0.18),
-            )
-            live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
-            script_text, _script_summary = generate_recap_script_v3(
-                analysis, user_api_key, tone_style, recap_length,
-                progress=_ProgressSlice(live_progress, 0.18, 0.34),
-            )
+        # Stage 2: viral storytelling script (hidden from the user UI).
+        live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
+        script_text, _script_summary = generate_recap_script_v3(
+            analysis, user_api_key, tone_style, recap_length,
+            progress=_ProgressSlice(live_progress, 0.18, 0.34),
+        )
 
         # Stage 3: narration + scene render + exports. The child function's
         # Gradio progress (including FFmpeg render ETA) is mirrored live.
@@ -4717,6 +4457,24 @@ def _wizard_payload(step):
     )
 
 
+def _start_new_recap(session_id):
+    """Return to Upload and clear only the completed video's working state."""
+    _set_process_status(
+        session_id,
+        state="idle", progress=0, stage="Waiting to start",
+        eta_low=None, eta_high=None, error="",
+    )
+    ready_eta = (
+        "<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div>"
+        "<b>Ready</b><span>Video အသစ်တင်ပြီး AUTO RECAP ကိုနှိပ်ပါ။</span></div></div>"
+    )
+    return (
+        *_wizard_payload(1),
+        None, {}, "", None, None, None, None, None, "",
+        ready_eta, _processing_status_html(session_id),
+    )
+
+
 def _restore_wizard_after_reconnect(saved_step):
     """Keep the user on the same wizard page after a tunnel/browser reconnect.
 
@@ -4738,16 +4496,9 @@ def _wizard_after_upload(video_value, vip_access_state):
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         raise gr.Error("🎬 အရင်ဆုံး Video ကို upload လုပ်ပေးပါ။")
-
-    # Fresh quota check BEFORE any analysis / script / TTS work begins.
-    data = verify_video_quota_available(vip_access_state)
-    limit = data.get("_quota_limit")
-    used = data.get("_quota_used", 0)
-    remaining = data.get("_quota_remaining")
-    if limit is None:
-        gr.Info(f"✅ Video limit OK • Unlimited plan • ဒီနေ့ထုတ်ပြီး {used}")
-    else:
-        gr.Info(f"✅ Video limit OK • {used}/{limit} သုံးပြီး • ကျန် {remaining} Videos")
+    # Check the live server before allowing Step 2. If the quota is full,
+    # gr.Error appears as a notification and the wizard remains on Step 1.
+    verify_video_quota_available(vip_access_state, show_available_notice=True)
     return _wizard_payload(2)
 
 
@@ -4789,43 +4540,6 @@ def _start_auto_recap_feedback(video_value, recap_length, voice_engine, render_m
         "အောက်က **Live Processing** card မှာ loading, လက်ရှိအဆင့်, %, elapsed နဲ့ remaining time ကိုကြည့်နိုင်ပါတယ်။"
     )
     return eta_html, status, _processing_status_html(session_id)
-
-def start_new_video_session(old_session_id):
-    """Clear per-video work/results and return to Step 1 without losing user preferences.
-
-    Voice, font and visual preferences intentionally stay selected so a user can
-    process several videos in a row without reconfiguring the studio each time.
-    A fresh session id isolates the next background Gemini job and live render state.
-    """
-    old_sid = str(old_session_id or "")
-    if old_sid:
-        with _BG_SCRIPT_LOCK:
-            _BG_SCRIPT_JOBS.pop(old_sid, None)
-        with PROCESS_STATUS_LOCK:
-            PROCESS_STATUS.pop(old_sid, None)
-
-    new_sid = str(uuid.uuid4())
-    gr.Info("🎬 New Video အတွက် အစကနေ ပြန်စနိုင်ပါပြီ။ Voice / Font settings ကို မပြောင်းဘဲ ထိန်းထားပါတယ်။")
-
-    # wizard payload (8) + per-video components/state below
-    return (
-        *_wizard_payload(1),
-        None,  # video_input
-        "",  # video_quota_notice
-        _background_script_status_html(None),
-        "",  # analysis_status
-        "",  # script_editor
-        None,  # final_video
-        gr.update(value=None),  # fast_download
-        None,  # srt_file
-        None,  # mp3_file
-        None,  # script_file
-        "",  # render_status
-        "<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div><b>Ready</b><span>Video အသစ်တင်ပြီး ဆက်လုပ်ပါ။</span></div></div>",
-        _processing_status_html(None),
-        new_sid,
-    )
-
 
 def _subtitle_size_preview_html(size_value):
     """Tiny live visual confirmation that the size slider is really changing."""
@@ -5139,7 +4853,6 @@ def create_app():
                 gr.HTML("<div class='wizard-badge'>STEP 1 • SOURCE</div><div class='wizard-title'>🎬 Upload Movie</div><div class='wizard-copy'>Recap လုပ်မယ့် movie / clip ကိုအရင် upload လုပ်ပါ။ မူရင်း video duration ကို Auto mode မှာ final duration အဖြစ်ထိန်းထားပါတယ်။</div>")
                 video_input = gr.Video(label="Original Movie / Clip", sources=["upload"], elem_id="yf-video-upload")
                 gr.HTML("""<div id='yf-upload-progress-card'><div class='yf-up-head'><b class='yf-up-name'>📤 Video Uploading</b><strong class='yf-up-pct'>0%</strong></div><div class='yf-up-track'><i></i></div><div class='yf-up-meta'><span class='yf-up-size'>0 MB / 0 MB</span><span class='yf-up-eta'>တွက်ချက်နေသည်…</span></div></div>""")
-                video_quota_notice = gr.HTML("")
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step1_next = gr.Button("NEXT  →", variant="primary", elem_classes=["wiz-next"])
 
@@ -5147,7 +4860,6 @@ def create_app():
             with gr.Column(visible=False, elem_classes=["wizard-card"]) as step2_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 2 • STORY</div><div class='wizard-title'>🧠 Recap Settings</div><div class='wizard-copy'>AI script ကို user မမြင်ရအောင် backend မှာ auto analyze + generate လုပ်ပါမယ်။ Viral Story Recap ကို default ထားထားပါတယ်။</div>")
                 user_api_key = gr.Textbox(label="Gemini API Key", type="password", placeholder="Gemini Flash models auto fallback")
-                background_script_status = gr.HTML(_background_script_status_html(None))
                 tone_style = gr.Dropdown(choices=["Viral Story Recap", "Thriller", "Comedy", "Dramatic", "Action/Epic", "Neutral"], value="Viral Story Recap", label="Narrative Tone")
                 recap_length = gr.Dropdown(
                     choices=[
@@ -5175,51 +4887,45 @@ def create_app():
                     elem_classes=["voice-engine-radio"],
                 )
                 voxcpm_confirmed = gr.State(False)
-                # Stable-height shell prevents the whole page from jumping when
-                # Edge / confirmation / clone panels swap visibility.
-                with gr.Column(elem_classes=["voice-stable-zone"]):
-                    with gr.Column(visible=False, elem_classes=["vox-confirm-card", "voice-dynamic-panel"]) as voxcpm_confirm_panel:
-                        gr.HTML(
-                            "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone ကို ဆက်သုံးမလား?</div>"
-                            "<div class='vox-confirm-copy'><b>မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။</b><br>"
-                            "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။ "
-                            "Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
-                            "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။</div>"
-                        )
-                        with gr.Row(elem_classes=["vox-confirm-actions"]):
-                            voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
-                            voxcpm_confirm_btn = gr.Button("🎙 VoxCPM ကိုပဲ သုံးမယ်", variant="primary", elem_classes=["vox-confirm-yes"])
-                    with gr.Column(visible=True, elem_classes=["engine-panel", "voice-dynamic-panel"]) as edge_voice_panel:
-                        gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
-                        edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice", elem_id="edge-voice-picker")
+                with gr.Column(visible=False, elem_classes=["vox-confirm-card"]) as voxcpm_confirm_panel:
+                    gr.HTML(
+                        "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone သည် အချိန်ပိုကြာနိုင်ပါတယ်</div>"
+                        "<div class='vox-confirm-copy'>Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
+                        "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။ "
+                        "မြန်နှုန်းလိုပါက Edge TTS ကိုရွေးပါ။ ကိုယ့် reference အသံအတိုင်းလိုမှ VoxCPM ကို ဆက်သုံးပါ။</div>"
+                    )
+                    with gr.Row(elem_classes=["vox-confirm-actions"]):
+                        voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
+                        voxcpm_confirm_btn = gr.Button("🎙 VoxCPM ကိုပဲ သုံးမယ်", variant="primary", elem_classes=["vox-confirm-yes"])
+                with gr.Column(visible=True, elem_classes=["engine-panel"]) as edge_voice_panel:
+                    gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
+                    edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice")
 
-                    voice_preset = gr.State("")
-                    custom_voice_description = gr.State("")
+                voice_preset = gr.State("")
+                custom_voice_description = gr.State("")
 
-                    with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card", "voice-dynamic-panel"]) as voxcpm_clone_panel:
-                        gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                        # UploadButton stays visually identical after selecting a
-                        # file. Unlike gr.File it does not replace the drop area.
-                        clone_reference = gr.State("")
-                        clone_upload_button = gr.UploadButton(
-                            "📤  UPLOAD REFERENCE MP3 / WAV",
-                            file_types=["audio"], file_count="single", type="filepath",
-                            variant="primary", elem_id="clone-reference-upload",
-                        )
-                        with gr.Column(elem_classes=["clone-reference-status-slot"]):
-                            clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
-                        clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
-                        clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
+                with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
+                    gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
+                    # UploadButton stays visually identical after selecting a
+                    # file.  Unlike gr.File it does not replace the drop area
+                    # with a filename preview, so mobile layout never jumps.
+                    clone_reference = gr.State("")
+                    clone_upload_button = gr.UploadButton(
+                        "📤  UPLOAD REFERENCE MP3 / WAV",
+                        file_types=["audio"], file_count="single", type="filepath",
+                        variant="primary", elem_id="clone-reference-upload",
+                    )
+                    with gr.Column(elem_classes=["clone-reference-status-slot"]):
+                        clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
+                    clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
+                    clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
 
-                # Keep a reserved footer slot too; showing VoxCPM quality controls
-                # must not push the NEXT button up/down.
-                with gr.Column(elem_classes=["voice-footer-stable-zone"]):
-                    desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
-                    with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
-                        with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
-                            voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
-                            voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Steps")
-                            voxcpm_seed = gr.Number(value=42, precision=0, label="Seed")
+                desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
+                with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
+                    with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
+                        voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
+                        voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Steps")
+                        voxcpm_seed = gr.Number(value=42, precision=0, label="Seed")
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step3_back = gr.Button("←  BACK", elem_classes=["wiz-back"])
                     step3_next = gr.Button("NEXT  →", variant="primary", elem_classes=["wiz-next"])
@@ -5236,22 +4942,19 @@ def create_app():
                     stroke_color = gr.ColorPicker(label="Outline", value="#000000")
                 subtitle_size = gr.Slider(1.0, 10.0, value=5.5, step=.5, label="Subtitle Size • 1 Small — 10 Large")
                 subtitle_size_preview = gr.HTML(_subtitle_size_preview_html(5.5))
-                # Stable font zone keeps dropdown/preview/status at a fixed footprint
-                # so changing fonts does not move the rest of Step 4 up and down.
-                with gr.Column(elem_classes=["font-stable-zone"]):
-                    subtitle_font_style = gr.Dropdown(
-                        choices=list(FONT_STYLE_FILES.keys()),
-                        value="Noto Sans Myanmar (Default)",
-                        label="Subtitle Font Style",
-                        filterable=False,
-                        allow_custom_value=False,
-                        elem_id="subtitle-font-picker",
-                    )
-                    subtitle_font_preview = gr.HTML(
-                        subtitle_font_preview_html("Noto Sans Myanmar (Default)")
-                    )
-                    font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"), elem_classes=["font-status-slot"])
+                subtitle_font_style = gr.Dropdown(
+                    choices=list(FONT_STYLE_FILES.keys()),
+                    value="Noto Sans Myanmar (Default)",
+                    label="Subtitle Font Style",
+                    filterable=False,
+                    allow_custom_value=False,
+                    elem_id="subtitle-font-picker",
+                )
+                subtitle_font_preview = gr.HTML(
+                    subtitle_font_preview_html("Noto Sans Myanmar (Default)")
+                )
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
+                font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
                 with gr.Accordion("📁 Custom Myanmar Font", open=False):
                     gr.HTML(f"<div class='hint'>Unicode Myanmar TTF/OTF font ကို upload လုပ်နိုင်ပါတယ်။ Premium Font ZIP တင်ရင် ZIP ထဲက font အားလုံးကို dropdown မှာ search/ရွေးလို့ရပါတယ်။ လက်ရှိ auto-loaded premium fonts: <b>{PREMIUM_FONT_COUNT}</b></div>")
                     premium_font_zip_upload = gr.File(label="Premium Font ZIP • Add All Fonts", file_types=[".zip"], type="filepath")
@@ -5301,7 +5004,11 @@ def create_app():
                 script_file = gr.File(visible=False)
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
-                    new_video_btn = gr.Button("➕  NEW VIDEO", variant="primary", elem_classes=["new-video-btn"])
+                    new_video_home_btn = gr.Button(
+                        "🏠  HOME • NEW VIDEO",
+                        variant="primary",
+                        elem_classes=["new-video-home"],
+                    )
 
             gr.HTML(f"<div class='footer-note'>YF RECAP {YF_BUILD} • AURORA UI • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
@@ -5322,51 +5029,14 @@ def create_app():
         vip_code_input.submit(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
         logout_btn.click(logout_vip, [], [vip_access_state, login_panel, main_panel, login_status, member_status_html, vip_code_input])
 
-        # Check today's video quota as soon as upload completes, then check again
-        # on NEXT so exhausted accounts can never enter the expensive workflow.
-        video_input.change(
-            video_upload_quota_notice,
-            inputs=[video_input, vip_access_state],
-            outputs=[video_quota_notice],
+        # Wizard navigation.
+        step1_next.click(
+            _wizard_after_upload,
+            [video_input, vip_access_state],
+            wizard_outputs,
             queue=False,
             show_progress="hidden",
         )
-
-        # Background AI script pre-generation. Blur/Enter starts it; a lightweight
-        # timer refreshes the status card while the user continues through later steps.
-        user_api_key.blur(
-            start_background_script_generation,
-            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
-            outputs=[background_script_status],
-            queue=False, show_progress="hidden",
-        )
-        user_api_key.submit(
-            start_background_script_generation,
-            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
-            outputs=[background_script_status],
-            queue=False, show_progress="hidden",
-        )
-        # If tone/length changes after a key was entered, pre-generate the matching new script.
-        tone_style.change(
-            start_background_script_generation,
-            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
-            outputs=[background_script_status],
-            queue=False, show_progress="hidden",
-        )
-        recap_length.change(
-            start_background_script_generation,
-            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
-            outputs=[background_script_status],
-            queue=False, show_progress="hidden",
-        )
-        bg_script_timer = gr.Timer(value=1.0, active=True)
-        bg_script_timer.tick(
-            poll_background_script_status, inputs=[session_id_state], outputs=[background_script_status],
-            queue=False, show_progress="hidden",
-        )
-
-        # Wizard navigation.
-        step1_next.click(_wizard_after_upload, [video_input, vip_access_state], wizard_outputs, queue=False, show_progress="hidden")
         step2_back.click(lambda: _wizard_payload(1), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step2_next.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step3_back.click(lambda: _wizard_payload(2), outputs=wizard_outputs, queue=False, show_progress="hidden")
@@ -5375,26 +5045,20 @@ def create_app():
         step4_next.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step5_back.click(lambda: _wizard_payload(4), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step6_back.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
-
-        # Start another recap immediately from Step 1. Per-video state/results are
-        # cleared, while the user's voice/font/look preferences remain selected.
-        new_video_outputs = wizard_outputs + [
-            video_input, video_quota_notice, background_script_status, analysis_status, script_editor,
-            final_video, fast_download, srt_file, mp3_file, script_file, render_status,
-            eta_card, processing_card, session_id_state,
-        ]
-        new_video_btn.click(
-            start_new_video_session,
+        new_video_home_btn.click(
+            _start_new_recap,
             inputs=[session_id_state],
-            outputs=new_video_outputs,
+            outputs=[
+                *wizard_outputs,
+                video_input, analysis_state, script_editor,
+                final_video, fast_download, srt_file, mp3_file, script_file,
+                render_status, eta_card, processing_card,
+            ],
             queue=False,
             show_progress="hidden",
         )
 
-        # Use .input (user action only), NOT .change. The handler deliberately
-        # rolls the radio back to Edge while the confirmation card is open;
-        # .change would fire again for that programmatic rollback and hide it.
-        voice_engine.input(
+        voice_engine.change(
             request_voice_engine_change,
             [voice_engine, voxcpm_confirmed],
             [voice_engine, edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel, voxcpm_confirm_panel, voxcpm_confirmed],
