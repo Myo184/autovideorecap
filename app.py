@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.9.1 • ONE-RUN PACKAGE SETUP • STEADY VOICE"
+YF_BUILD = "V6.9.2 • GRADIO 6 FIX • ONE-RUN SETUP • STEADY VOICE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -2619,7 +2619,7 @@ def create_app_legacy():
                                 value=False,
                             )
 
-                        desired_speed = gr.Slider(1.0, 1.0, value=1.0, step=0.05, label="Voice Pace • Normal (Fixed)", interactive=False)
+                        desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=0.05, label="Voice Pace • Normal (Fixed)", interactive=False)
                         with gr.Accordion("⚙️ VoxCPM2 Quality Settings", open=False):
                             voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label="CFG Guidance")
                             voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Inference Steps")
@@ -4585,7 +4585,7 @@ def create_app():
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
 
-                desired_speed = gr.Slider(1.0, 1.0, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
+                desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
                 with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
                     with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
                         voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
