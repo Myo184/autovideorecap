@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.5 • CHROMA MOTION UI • LIVE FONT PREVIEW • FAST VOXCPM"
+YF_BUILD = "V6.10.6 • VOXCPM CONFIRMATION • CHROMA MOTION UI • LIVE FONT PREVIEW"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -2497,6 +2497,7 @@ def create_app_legacy():
     .font-live-preview{position:relative;overflow:hidden;margin:10px 0 13px;padding:13px;border:1px solid #8b5cf66b;border-radius:17px;background:linear-gradient(145deg,#140f29,#071827);box-shadow:inset 0 1px #ffffff12,0 12px 34px #0005}
     .font-live-preview:before{content:"";position:absolute;inset:-80% -20%;background:conic-gradient(from 90deg,transparent,#ff4fd817,transparent,#38bdf818,transparent);animation:yfLogoSpin 9s linear infinite;pointer-events:none}
     .font-preview-top,.font-preview-stage,.font-live-preview small{position:relative;z-index:1}.font-preview-top{display:flex;justify-content:space-between;align-items:center;gap:9px}.font-preview-top span{font-size:8px;font-weight:950;letter-spacing:.15em;color:#67e8f9}.font-preview-top b{font-size:10px;color:#f5d0fe;overflow-wrap:anywhere;text-align:right}.font-preview-stage{min-height:82px;margin-top:10px;padding:14px;display:grid;place-items:center;text-align:center;border-radius:12px;background:#030712b8;border:1px solid #ffffff12;color:#ffe45e;font-size:25px;line-height:1.6;text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000;word-break:break-word}.font-live-preview small{display:block;margin-top:8px;color:#a7f3d0;font-size:9px}
+    .vox-confirm-card{position:relative;overflow:hidden;border:1px solid #fbbf2473!important;border-radius:18px!important;padding:14px!important;margin:10px 0!important;background:linear-gradient(145deg,#321b10e8,#19102be8)!important;box-shadow:0 16px 40px #0007,0 0 28px #f59e0b15!important}.vox-confirm-title{font-size:15px;font-weight:950;color:#fde68a;margin-bottom:6px}.vox-confirm-copy{font-size:10px;line-height:1.65;color:#f1dfbd}.vox-confirm-copy b{color:#fff7d6}.vox-confirm-actions{margin-top:11px!important;gap:8px!important}.vox-confirm-yes,.vox-confirm-no{min-height:47px!important;border-radius:12px!important;font-weight:900!important}.vox-confirm-yes{background:linear-gradient(100deg,#b45309,#db2777,#7c3aed)!important;color:#fff!important;border:1px solid #fbbf2466!important}.vox-confirm-no{background:#111827!important;color:#bae6fd!important;border:1px solid #38bdf855!important}
     @keyframes yfTitleSpectrum{to{background-position:260% 0}}
     @keyframes yfTitleFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
     @keyframes yfSpectrumBorder{to{background-position:300% 0}}
@@ -4001,15 +4002,37 @@ def _fmt_eta_seconds(seconds):
     return f"{hours}h {minutes:02d}m"
 
 
-def update_voice_engine_panels_v6(engine):
-    """V6 exposes only Edge TTS and VoxCPM2 Voice Clone."""
+def request_voice_engine_change(engine, voxcpm_confirmed=False):
+    """Require an explicit time-cost confirmation before selecting VoxCPM."""
     engine = str(engine or "")
-    is_edge = "Edge TTS" in engine
+    if "Voice Clone" in engine and not bool(voxcpm_confirmed):
+        # Keep Edge as the committed value until the user confirms VoxCPM.
+        return (
+            gr.update(value="⚡ Edge TTS • Fast"),
+            gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
+            gr.update(visible=True), False,
+        )
     is_clone = "Voice Clone" in engine
     return (
-        gr.update(visible=is_edge),
-        gr.update(visible=is_clone),
-        gr.update(visible=is_clone),
+        gr.update(value=engine or "⚡ Edge TTS • Fast"),
+        gr.update(visible=not is_clone), gr.update(visible=is_clone), gr.update(visible=is_clone),
+        gr.update(visible=False), bool(is_clone),
+    )
+
+
+def confirm_voxcpm_engine():
+    return (
+        gr.update(value="🎙️ VoxCPM2 Voice Clone"),
+        gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
+        gr.update(visible=False), True,
+    )
+
+
+def cancel_voxcpm_engine():
+    return (
+        gr.update(value="⚡ Edge TTS • Fast"),
+        gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
+        gr.update(visible=False), False,
     )
 
 
@@ -4410,8 +4433,10 @@ def _wizard_after_upload(video_value):
     return _wizard_payload(2)
 
 
-def _wizard_validate_voice(engine, clone_reference, clone_consent):
+def _wizard_validate_voice(engine, clone_reference, clone_consent, voxcpm_confirmed=False):
     if "Voice Clone" in str(engine):
+        if not voxcpm_confirmed:
+            raise gr.Error("VoxCPM ကြာချိန် အသိပေးချက်ကို အရင်အတည်ပြုပေးပါ။")
         ref = normalize_file_path(clone_reference)
         if not ref or not os.path.exists(ref):
             raise gr.Error("🎙 Voice Clone ရွေးထားပါက Reference Voice MP3/WAV ထည့်ပေးပါ။")
@@ -4792,6 +4817,17 @@ def create_app():
                     label="Narration Voice",
                     elem_classes=["voice-engine-radio"],
                 )
+                voxcpm_confirmed = gr.State(False)
+                with gr.Column(visible=False, elem_classes=["vox-confirm-card"]) as voxcpm_confirm_panel:
+                    gr.HTML(
+                        "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone သည် အချိန်ပိုကြာနိုင်ပါတယ်</div>"
+                        "<div class='vox-confirm-copy'>Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
+                        "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။ "
+                        "မြန်နှုန်းလိုပါက Edge TTS ကိုရွေးပါ။ ကိုယ့် reference အသံအတိုင်းလိုမှ VoxCPM ကို ဆက်သုံးပါ။</div>"
+                    )
+                    with gr.Row(elem_classes=["vox-confirm-actions"]):
+                        voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
+                        voxcpm_confirm_btn = gr.Button("🎙 VoxCPM ကိုပဲ သုံးမယ်", variant="primary", elem_classes=["vox-confirm-yes"])
                 with gr.Column(visible=True, elem_classes=["engine-panel"]) as edge_voice_panel:
                     gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
                     edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice")
@@ -4924,13 +4960,31 @@ def create_app():
         step2_back.click(lambda: _wizard_payload(1), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step2_next.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step3_back.click(lambda: _wizard_payload(2), outputs=wizard_outputs, queue=False, show_progress="hidden")
-        step3_next.click(_wizard_validate_voice, [voice_engine, clone_reference, clone_consent], wizard_outputs, queue=False, show_progress="hidden")
+        step3_next.click(_wizard_validate_voice, [voice_engine, clone_reference, clone_consent, voxcpm_confirmed], wizard_outputs, queue=False, show_progress="hidden")
         step4_back.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step4_next.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step5_back.click(lambda: _wizard_payload(4), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step6_back.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
 
-        voice_engine.change(update_voice_engine_panels_v6, [voice_engine], [edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel], queue=False, show_progress="hidden")
+        voice_engine.change(
+            request_voice_engine_change,
+            [voice_engine, voxcpm_confirmed],
+            [voice_engine, edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel, voxcpm_confirm_panel, voxcpm_confirmed],
+            queue=False,
+            show_progress="hidden",
+        )
+        voxcpm_confirm_btn.click(
+            confirm_voxcpm_engine,
+            outputs=[voice_engine, edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel, voxcpm_confirm_panel, voxcpm_confirmed],
+            queue=False,
+            show_progress="hidden",
+        )
+        voxcpm_cancel_btn.click(
+            cancel_voxcpm_engine,
+            outputs=[voice_engine, edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel, voxcpm_confirm_panel, voxcpm_confirmed],
+            queue=False,
+            show_progress="hidden",
+        )
         clone_upload_button.upload(
             accept_clone_upload,
             inputs=[clone_upload_button],
