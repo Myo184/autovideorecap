@@ -14,7 +14,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.8 • EARLY QUOTA CHECK • VOXCPM CONFIRM FIX • CHROMA MOTION UI"
+YF_BUILD = "V6.10.9 • NEW VIDEO RESET • STABLE VOICE/FONT UI • BACKGROUND GEMINI SCRIPT"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -2442,6 +2442,36 @@ def create_app_legacy():
       #auto-recap-btn{font-size:16px!important}
     }
     """
+    # V6.10.9 — prevent layout/scroll jumps in Voice + Font controls.
+    css += r"""
+    .voice-stable-zone{
+      min-height:300px!important;position:relative!important;overflow-anchor:none!important;
+      border-radius:16px!important;
+    }
+    .voice-stable-zone>.form,.voice-stable-zone>div{min-width:0!important}
+    .voice-dynamic-panel{width:100%!important;margin-bottom:0!important;overflow-anchor:none!important}
+    .voice-footer-stable-zone{min-height:92px!important;overflow-anchor:none!important}
+    .clone-reference-status-slot{min-height:46px!important}
+    .font-stable-zone{
+      min-height:270px!important;overflow-anchor:none!important;
+    }
+    .font-live-preview{height:168px!important;min-height:168px!important;max-height:168px!important;overflow:hidden!important}
+    .font-preview-stage{height:88px!important;min-height:88px!important;max-height:88px!important;overflow:hidden!important}
+    .font-status-slot{min-height:48px!important;overflow:hidden!important}
+    #subtitle-font-picker,#edge-voice-picker{position:relative!important;overflow-anchor:none!important;scroll-margin-top:105px!important}
+    #subtitle-font-picker [role="listbox"],#edge-voice-picker [role="listbox"]{
+      position:absolute!important;top:calc(100% + 6px)!important;bottom:auto!important;left:0!important;right:0!important;
+      transform:none!important;z-index:9999!important;max-height:260px!important;overflow-y:auto!important;
+    }
+    #voice-engine-radio{overflow-anchor:none!important;scroll-margin-top:105px!important}
+    .new-video-btn{min-height:50px!important;border:0!important;border-radius:13px!important;font-weight:950!important;background:linear-gradient(90deg,#059669,#0891b2,#2563eb)!important;color:#fff!important}
+    @media(max-width:720px){
+      .voice-stable-zone{min-height:350px!important}
+      .font-stable-zone{min-height:285px!important}
+      .font-live-preview{height:160px!important;min-height:160px!important;max-height:160px!important}
+      .font-preview-stage{height:82px!important;min-height:82px!important;max-height:82px!important}
+    }
+    """
     # V6.8.3 — complete Aurora UI redesign. This intentionally overrides the
     # older V6.8.2 palette while keeping all backend/component IDs intact.
     css += r"""
@@ -4760,6 +4790,43 @@ def _start_auto_recap_feedback(video_value, recap_length, voice_engine, render_m
     )
     return eta_html, status, _processing_status_html(session_id)
 
+def start_new_video_session(old_session_id):
+    """Clear per-video work/results and return to Step 1 without losing user preferences.
+
+    Voice, font and visual preferences intentionally stay selected so a user can
+    process several videos in a row without reconfiguring the studio each time.
+    A fresh session id isolates the next background Gemini job and live render state.
+    """
+    old_sid = str(old_session_id or "")
+    if old_sid:
+        with _BG_SCRIPT_LOCK:
+            _BG_SCRIPT_JOBS.pop(old_sid, None)
+        with PROCESS_STATUS_LOCK:
+            PROCESS_STATUS.pop(old_sid, None)
+
+    new_sid = str(uuid.uuid4())
+    gr.Info("🎬 New Video အတွက် အစကနေ ပြန်စနိုင်ပါပြီ။ Voice / Font settings ကို မပြောင်းဘဲ ထိန်းထားပါတယ်။")
+
+    # wizard payload (8) + per-video components/state below
+    return (
+        *_wizard_payload(1),
+        None,  # video_input
+        "",  # video_quota_notice
+        _background_script_status_html(None),
+        "",  # analysis_status
+        "",  # script_editor
+        None,  # final_video
+        gr.update(value=None),  # fast_download
+        None,  # srt_file
+        None,  # mp3_file
+        None,  # script_file
+        "",  # render_status
+        "<div class='eta-card waiting'><div class='eta-icon'>⏱</div><div><b>Ready</b><span>Video အသစ်တင်ပြီး ဆက်လုပ်ပါ။</span></div></div>",
+        _processing_status_html(None),
+        new_sid,
+    )
+
+
 def _subtitle_size_preview_html(size_value):
     """Tiny live visual confirmation that the size slider is really changing."""
     try:
@@ -5108,46 +5175,51 @@ def create_app():
                     elem_classes=["voice-engine-radio"],
                 )
                 voxcpm_confirmed = gr.State(False)
-                with gr.Column(visible=False, elem_classes=["vox-confirm-card"]) as voxcpm_confirm_panel:
-                    gr.HTML(
-                        "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone ကို ဆက်သုံးမလား?</div>"
-                        "<div class='vox-confirm-copy'><b>မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။</b><br>"
-                        "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။ "
-                        "Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
-                        "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။</div>"
-                    )
-                    with gr.Row(elem_classes=["vox-confirm-actions"]):
-                        voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
-                        voxcpm_confirm_btn = gr.Button("🎙 VoxCPM ကိုပဲ သုံးမယ်", variant="primary", elem_classes=["vox-confirm-yes"])
-                with gr.Column(visible=True, elem_classes=["engine-panel"]) as edge_voice_panel:
-                    gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
-                    edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice")
+                # Stable-height shell prevents the whole page from jumping when
+                # Edge / confirmation / clone panels swap visibility.
+                with gr.Column(elem_classes=["voice-stable-zone"]):
+                    with gr.Column(visible=False, elem_classes=["vox-confirm-card", "voice-dynamic-panel"]) as voxcpm_confirm_panel:
+                        gr.HTML(
+                            "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone ကို ဆက်သုံးမလား?</div>"
+                            "<div class='vox-confirm-copy'><b>မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။</b><br>"
+                            "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။ "
+                            "Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
+                            "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။</div>"
+                        )
+                        with gr.Row(elem_classes=["vox-confirm-actions"]):
+                            voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
+                            voxcpm_confirm_btn = gr.Button("🎙 VoxCPM ကိုပဲ သုံးမယ်", variant="primary", elem_classes=["vox-confirm-yes"])
+                    with gr.Column(visible=True, elem_classes=["engine-panel", "voice-dynamic-panel"]) as edge_voice_panel:
+                        gr.HTML("<div class='voice-mode-title'>⚡ Fast Burmese Voice</div><div class='hint'>Edge TTS fail ဖြစ်ရင် gTTS Burmese fallback ကို backend က auto သုံးပါတယ်။</div>")
+                        edge_voice_select = gr.Dropdown(choices=list(EDGE_VOICES.keys()), value="👩 Myanmar Female • Nilar", label="Voice", elem_id="edge-voice-picker")
 
-                voice_preset = gr.State("")
-                custom_voice_description = gr.State("")
+                    voice_preset = gr.State("")
+                    custom_voice_description = gr.State("")
 
-                with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card"]) as voxcpm_clone_panel:
-                    gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
-                    # UploadButton stays visually identical after selecting a
-                    # file.  Unlike gr.File it does not replace the drop area
-                    # with a filename preview, so mobile layout never jumps.
-                    clone_reference = gr.State("")
-                    clone_upload_button = gr.UploadButton(
-                        "📤  UPLOAD REFERENCE MP3 / WAV",
-                        file_types=["audio"], file_count="single", type="filepath",
-                        variant="primary", elem_id="clone-reference-upload",
-                    )
-                    with gr.Column(elem_classes=["clone-reference-status-slot"]):
-                        clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
-                    clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
-                    clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
+                    with gr.Column(visible=False, elem_classes=["engine-panel", "clone-panel", "voice-clone-card", "voice-dynamic-panel"]) as voxcpm_clone_panel:
+                        gr.HTML("<div class='clone-title'>🎙 VoxCPM2 Voice Clone</div><div class='clone-copy'>အသုံးပြုခွင့်ရှိတဲ့ 5–15 sec reference MP3/WAV ကိုထည့်ပါ။</div>")
+                        # UploadButton stays visually identical after selecting a
+                        # file. Unlike gr.File it does not replace the drop area.
+                        clone_reference = gr.State("")
+                        clone_upload_button = gr.UploadButton(
+                            "📤  UPLOAD REFERENCE MP3 / WAV",
+                            file_types=["audio"], file_count="single", type="filepath",
+                            variant="primary", elem_id="clone-reference-upload",
+                        )
+                        with gr.Column(elem_classes=["clone-reference-status-slot"]):
+                            clone_reference_status = gr.HTML("<div class='hint'>Reference voice မထည့်ရသေးပါ။</div>")
+                        clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
+                        clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
 
-                desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
-                with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
-                    with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
-                        voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
-                        voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Steps")
-                        voxcpm_seed = gr.Number(value=42, precision=0, label="Seed")
+                # Keep a reserved footer slot too; showing VoxCPM quality controls
+                # must not push the NEXT button up/down.
+                with gr.Column(elem_classes=["voice-footer-stable-zone"]):
+                    desired_speed = gr.Slider(0.9, 1.1, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
+                    with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
+                        with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
+                            voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
+                            voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Steps")
+                            voxcpm_seed = gr.Number(value=42, precision=0, label="Seed")
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step3_back = gr.Button("←  BACK", elem_classes=["wiz-back"])
                     step3_next = gr.Button("NEXT  →", variant="primary", elem_classes=["wiz-next"])
@@ -5164,19 +5236,22 @@ def create_app():
                     stroke_color = gr.ColorPicker(label="Outline", value="#000000")
                 subtitle_size = gr.Slider(1.0, 10.0, value=5.5, step=.5, label="Subtitle Size • 1 Small — 10 Large")
                 subtitle_size_preview = gr.HTML(_subtitle_size_preview_html(5.5))
-                subtitle_font_style = gr.Dropdown(
-                    choices=list(FONT_STYLE_FILES.keys()),
-                    value="Noto Sans Myanmar (Default)",
-                    label="Subtitle Font Style",
-                    filterable=False,
-                    allow_custom_value=False,
-                    elem_id="subtitle-font-picker",
-                )
-                subtitle_font_preview = gr.HTML(
-                    subtitle_font_preview_html("Noto Sans Myanmar (Default)")
-                )
+                # Stable font zone keeps dropdown/preview/status at a fixed footprint
+                # so changing fonts does not move the rest of Step 4 up and down.
+                with gr.Column(elem_classes=["font-stable-zone"]):
+                    subtitle_font_style = gr.Dropdown(
+                        choices=list(FONT_STYLE_FILES.keys()),
+                        value="Noto Sans Myanmar (Default)",
+                        label="Subtitle Font Style",
+                        filterable=False,
+                        allow_custom_value=False,
+                        elem_id="subtitle-font-picker",
+                    )
+                    subtitle_font_preview = gr.HTML(
+                        subtitle_font_preview_html("Noto Sans Myanmar (Default)")
+                    )
+                    font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"), elem_classes=["font-status-slot"])
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
-                font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
                 with gr.Accordion("📁 Custom Myanmar Font", open=False):
                     gr.HTML(f"<div class='hint'>Unicode Myanmar TTF/OTF font ကို upload လုပ်နိုင်ပါတယ်။ Premium Font ZIP တင်ရင် ZIP ထဲက font အားလုံးကို dropdown မှာ search/ရွေးလို့ရပါတယ်။ လက်ရှိ auto-loaded premium fonts: <b>{PREMIUM_FONT_COUNT}</b></div>")
                     premium_font_zip_upload = gr.File(label="Premium Font ZIP • Add All Fonts", file_types=[".zip"], type="filepath")
@@ -5226,6 +5301,7 @@ def create_app():
                 script_file = gr.File(visible=False)
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step6_back = gr.Button("←  SETTINGS", elem_classes=["wiz-back"])
+                    new_video_btn = gr.Button("➕  NEW VIDEO", variant="primary", elem_classes=["new-video-btn"])
 
             gr.HTML(f"<div class='footer-note'>YF RECAP {YF_BUILD} • AURORA UI • LIVE ETA • MOBILE FIRST • NO BGM • NO ORIGINAL AUDIO</div>")
 
@@ -5299,6 +5375,21 @@ def create_app():
         step4_next.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step5_back.click(lambda: _wizard_payload(4), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step6_back.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
+
+        # Start another recap immediately from Step 1. Per-video state/results are
+        # cleared, while the user's voice/font/look preferences remain selected.
+        new_video_outputs = wizard_outputs + [
+            video_input, video_quota_notice, background_script_status, analysis_status, script_editor,
+            final_video, fast_download, srt_file, mp3_file, script_file, render_status,
+            eta_card, processing_card, session_id_state,
+        ]
+        new_video_btn.click(
+            start_new_video_session,
+            inputs=[session_id_state],
+            outputs=new_video_outputs,
+            queue=False,
+            show_progress="hidden",
+        )
 
         # Use .input (user action only), NOT .change. The handler deliberately
         # rolls the radio back to Edge while the confirmation card is open;
