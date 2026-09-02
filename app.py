@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.9.0 • COLAB 3.13 COMPATIBLE LOCK • STEADY VOICE"
+YF_BUILD = "V6.9.1 • ONE-RUN PACKAGE SETUP • STEADY VOICE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -125,6 +125,8 @@ def install_locked_packages():
         print("✅ All YF packages match the lock — install skipped")
         return False
 
+    changed_packages = {package for package, _current, _wanted in mismatches}
+
     print("🔒 Restoring tested package lock:")
     for package, current, wanted in mismatches:
         print(f"   • {package}: {current or 'missing'} → {wanted}")
@@ -155,14 +157,22 @@ def install_locked_packages():
     if failed:
         raise RuntimeError("Package lock verification failed: " + ", ".join(failed))
 
-    # NumPy/SciPy/Pillow may already be loaded by the Colab notebook process.
-    # Never import the newly installed Python files against old C extensions.
-    if any(name in sys.modules for name in ("numpy", "scipy", "PIL", "cv2")):
+    # Restart only if THIS run actually replaced a loaded binary package.
+    # Installing pure/app packages such as VoxCPM, Edge-TTS or faster-whisper
+    # can continue directly in the same run.
+    binary_distributions = {
+        "numpy", "scipy", "opencv-python-headless", "Pillow", "soundfile"
+    }
+    loaded_binary_modules = any(
+        name in sys.modules for name in ("numpy", "scipy", "PIL", "cv2", "soundfile")
+    )
+    if changed_packages.intersection(binary_distributions) and loaded_binary_modules:
         raise RuntimeError(
             "✅ Locked packages were installed successfully. Please restart the "
             "Colab runtime once, then run this cell again. This one-time restart "
             "prevents NumPy binary incompatibility."
         )
+    print("✅ Missing app packages installed — continuing without restart")
     return True
 
 
