@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.8.8 • LOCKED PACKAGES • STEADY VOICE • EMERALD GOLD UI"
+YF_BUILD = "V6.8.9 • PYTHON 3.13 LOCK • STEADY VOICE • EMERALD GOLD UI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -63,10 +63,14 @@ def _module_is_available(module_name):
         return False
 
 
+PYTHON_313_PLUS = sys.version_info[:2] >= (3, 13)
+
 LOCKED_PACKAGES = {
     # Binary/scientific stack: keep these together to prevent ABI errors.
-    "numpy": "1.26.4",
-    "scipy": "1.13.1",
+    # Python 3.13 needs NumPy 2.x/SciPy 1.15 wheels. Older Colab runtimes use
+    # the stable NumPy 1.26 ABI instead.
+    "numpy": "2.2.6" if PYTHON_313_PLUS else "1.26.4",
+    "scipy": "1.15.3" if PYTHON_313_PLUS else "1.13.1",
     "opencv-python-headless": "4.11.0.86",
     "Pillow": "11.3.0",
     "librosa": "0.11.0",
@@ -98,13 +102,13 @@ LOCKED_IMPORTS = {
 
 
 def ensure_supported_python():
-    # VoxCPM2 officially requires Python 3.10–3.12. NumPy 1.26.4 also has no
-    # CPython 3.13 wheel, so continuing on 3.13 creates binary-size errors.
-    if not ((3, 10) <= sys.version_info[:2] < (3, 13)):
+    # Select a matching scientific lock above instead of forcing Colab users to
+    # downgrade Python. Python 3.13 is supported by the NumPy 2.2 lock.
+    if not ((3, 10) <= sys.version_info[:2] < (3, 14)):
         raise RuntimeError(
-            f"YF Recap requires Python 3.10, 3.11 or 3.12; current Python is "
+            f"YF Recap requires Python 3.10–3.13; current Python is "
             f"{sys.version_info.major}.{sys.version_info.minor}. "
-            "Please select a Colab runtime using Python 3.12."
+            "Please use a supported Google Colab runtime."
         )
 
 
