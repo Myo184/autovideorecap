@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.0 • FULL-LENGTH SCRIPT • SAFE VIDEO SPEED • STEADY VOICE"
+YF_BUILD = "V6.10.2 • LIVE UPLOAD ETA • 93% DURATION GUARD • STEADY VOICE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -2365,6 +2365,9 @@ def create_app_legacy():
     .process-top strong{color:#72f7d4!important}.process-track{height:9px!important;background:#03060b!important;border-color:#243249!important}.process-track i{background:linear-gradient(90deg,#56f2c7,#43d9ff,#9b6cff,#ff5fb7)!important;background-size:220% 100%!important;animation:yfProgressFlow 2s linear infinite!important;box-shadow:0 0 18px #43d9ff54!important}
     @keyframes yfProgressFlow{to{background-position:220% 0}}
     .eta-card.ready{border-color:#56f2c732!important;background:linear-gradient(105deg,#56f2c70d,#43d9ff0c,#9b6cff0d)!important}.eta-icon{background:#56f2c70e!important;border-color:#56f2c72b!important}
+    #yf-upload-progress-card{display:none;margin:10px 0 4px;padding:13px 14px;border-radius:15px;background:linear-gradient(135deg,#071a18,#0c1425);border:1px solid #34d3994d;box-shadow:inset 0 1px #ffffff0b,0 12px 28px #0004}
+    #yf-upload-progress-card.active,#yf-upload-progress-card.done{display:block}
+    .yf-up-head,.yf-up-meta{display:flex;align-items:center;justify-content:space-between;gap:10px}.yf-up-head b{font-size:12px;color:#dffdf5}.yf-up-head strong{font-size:12px;color:#72f7d4}.yf-up-track{height:9px;margin:10px 0 8px;border-radius:999px;overflow:hidden;background:#020807;border:1px solid #25483f}.yf-up-track i{display:block;width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,#10b981,#22d3ee,#8b5cf6);background-size:200% 100%;animation:yfProgressFlow 1.7s linear infinite;box-shadow:0 0 16px #22d3ee80;transition:width .22s ease}.yf-up-meta{font-size:9px;color:#91a8a0}.yf-up-meta span:last-child{color:#c4b5fd;font-weight:800}
 
     /* Button system — hover lift + glow + press feedback + shimmer */
     .gradio-container button,#yf-download-btn{
@@ -3637,9 +3640,9 @@ def render_reviewed_script_v3(
         max(1.0, float(analysis_state.get("target_recap_seconds", source_duration)))
     )
     # Hard safety rule: an automatic/full-length recap may keep narration at a
-    # natural pace, but it may not collapse below 90% of its chosen target.
-    # Example: 4:30 source -> minimum 4:03 final output.
-    minimum_output_duration = requested_duration * 0.90
+    # natural pace, but it may not collapse below 93% of its chosen target.
+    # Example: 4:30 source -> minimum 4:11 final output.
+    minimum_output_duration = requested_duration * 0.93
     final_output_duration = min(
         source_duration,
         max(narration_duration, minimum_output_duration)
@@ -3718,7 +3721,7 @@ def render_reviewed_script_v3(
     progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
     return (
         published_video, srt_path, narration_mp3, script_path,
-        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **90%** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **93%** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
     )
 
 
@@ -4520,7 +4523,17 @@ def create_app():
     """
     theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
     connection_js = r"""
-    (()=>{if(document.getElementById('yf-conn'))return;const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d);})();
+    (()=>{
+      if(!document.getElementById('yf-conn')){const d=document.createElement('div');d.id='yf-conn';d.style='position:fixed;right:10px;bottom:10px;z-index:99999;background:#07111be8;color:#86efac;border:1px solid #34d39955;border-radius:999px;padding:7px 10px;font:700 9px Arial;backdrop-filter:blur(8px)';d.textContent='● YF Connected';document.body.appendChild(d)}
+      if(window.__yfUploadEtaInstalled)return;window.__yfUploadEtaInstalled=true;
+      let state=null;
+      const fmtBytes=n=>{if(!n)return '0 MB';const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++}return `${n.toFixed(i<2?0:1)} ${u[i]}`};
+      const fmtTime=s=>{if(!isFinite(s)||s<0)return 'တွက်ချက်နေသည်…';s=Math.ceil(s);if(s<60)return `${s} sec ကျန်`;return `${Math.floor(s/60)} min ${s%60} sec ကျန်`};
+      const card=()=>document.getElementById('yf-upload-progress-card');
+      const paint=(pct,complete=false)=>{const c=card();if(!c||!state)return;pct=Math.max(0,Math.min(100,pct||0));const elapsed=Math.max(.2,(performance.now()-state.started)/1000);const sent=state.size*pct/100;const speed=sent/elapsed;const eta=pct>0?(state.size-sent)/Math.max(speed,1):Infinity;c.className=complete?'done':'active';c.querySelector('.yf-up-name').textContent=complete?'✅ Upload Complete':'📤 Video Uploading';c.querySelector('.yf-up-pct').textContent=complete?'100%':`${Math.round(pct)}%`;c.querySelector('.yf-up-track i').style.width=`${complete?100:pct}%`;c.querySelector('.yf-up-size').textContent=`${fmtBytes(complete?state.size:sent)} / ${fmtBytes(state.size)} • ${fmtBytes(speed)}/s`;c.querySelector('.yf-up-eta').textContent=complete?'တင်ပြီးပါပြီ':fmtTime(eta)};
+      document.addEventListener('change',e=>{const input=e.target;if(!(input instanceof HTMLInputElement)||input.type!=='file'||!input.files?.length)return;const f=input.files[0];if(!(f.type||'').startsWith('video/'))return;state={size:f.size,started:performance.now(),last:1};paint(1)},true);
+      setInterval(()=>{if(!state)return;let pct=0;for(const el of document.querySelectorAll('[role="progressbar"],progress')){let v=parseFloat(el.getAttribute('aria-valuenow')||el.value||'');let max=parseFloat(el.getAttribute('aria-valuemax')||el.max||'100');if(isFinite(v)){if(max>0&&max!==100)v=v/max*100;pct=Math.max(pct,v)}}if(!pct){for(const el of document.querySelectorAll('[class*="progress"]')){const m=(el.textContent||'').match(/(\d{1,3})\s*%/);if(m)pct=Math.max(pct,parseFloat(m[1]))}}if(pct>0){state.last=Math.max(state.last,pct);paint(state.last,state.last>=99.5)}const video=document.querySelector('#yf-video-upload video[src],#yf-video-upload video source[src]');if(video&&performance.now()-state.started>800){paint(100,true);state=null}},250);
+    })();
     """
 
     with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
@@ -4569,7 +4582,8 @@ def create_app():
             # ---------------- STEP 1 ----------------
             with gr.Column(visible=True, elem_classes=["wizard-card"]) as step1_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 1 • SOURCE</div><div class='wizard-title'>🎬 Upload Movie</div><div class='wizard-copy'>Recap လုပ်မယ့် movie / clip ကိုအရင် upload လုပ်ပါ။ မူရင်း video duration ကို Auto mode မှာ final duration အဖြစ်ထိန်းထားပါတယ်။</div>")
-                video_input = gr.Video(label="Original Movie / Clip", sources=["upload"])
+                video_input = gr.Video(label="Original Movie / Clip", sources=["upload"], elem_id="yf-video-upload")
+                gr.HTML("""<div id='yf-upload-progress-card'><div class='yf-up-head'><b class='yf-up-name'>📤 Video Uploading</b><strong class='yf-up-pct'>0%</strong></div><div class='yf-up-track'><i></i></div><div class='yf-up-meta'><span class='yf-up-size'>0 MB / 0 MB</span><span class='yf-up-eta'>တွက်ချက်နေသည်…</span></div></div>""")
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step1_next = gr.Button("NEXT  →", variant="primary", elem_classes=["wiz-next"])
 
