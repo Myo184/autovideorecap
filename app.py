@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.8.7 • PERSISTENT RENDER PAGE • EMERALD GOLD UI"
+YF_BUILD = "V6.8.8 • LOCKED PACKAGES • STEADY VOICE • EMERALD GOLD UI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -63,65 +63,124 @@ def _module_is_available(module_name):
         return False
 
 
-def install_missing_core_packages():
-    """Install only packages that are missing; do not slow every Colab restart."""
-    requirements = {
-        "gradio": "gradio",
-        "gradio_client": "gradio_client",
-        "faster_whisper": "faster-whisper",
-        "edge_tts": "edge-tts",
-        "gtts": "gTTS",
-        "google.genai": "google-genai",
-        "cv2": "opencv-python-headless",
-        "voxcpm": "voxcpm",
-    }
-    missing = [package for module, package in requirements.items() if not _module_is_available(module)]
-    if missing:
-        print("📦 Installing missing packages:", ", ".join(missing))
-        run_pip("install", "-q", *missing)
-    else:
-        print("✅ Core packages already installed — reuse mode")
+LOCKED_PACKAGES = {
+    # Binary/scientific stack: keep these together to prevent ABI errors.
+    "numpy": "1.26.4",
+    "scipy": "1.13.1",
+    "opencv-python-headless": "4.11.0.86",
+    "Pillow": "11.3.0",
+    "librosa": "0.11.0",
+    "soundfile": "0.13.1",
+    # Web UI/API stack: exact versions stop Gradio/FastAPI drift.
+    "gradio": "5.49.1",
+    "gradio_client": "1.13.3",
+    "fastapi": "0.115.12",
+    "starlette": "0.46.2",
+    "pydantic": "2.11.7",
+    # App services.
+    "faster-whisper": "1.2.0",
+    "edge-tts": "7.2.3",
+    "gTTS": "2.5.4",
+    "google-genai": "1.29.0",
+    "voxcpm": "2.0.3",
+}
+
+# Distribution name -> import name. Distribution-version checks are more
+# reliable than importing packages while pip may still need to repair them.
+LOCKED_IMPORTS = {
+    "numpy": "numpy", "scipy": "scipy", "opencv-python-headless": "cv2",
+    "Pillow": "PIL", "librosa": "librosa", "soundfile": "soundfile",
+    "gradio": "gradio", "gradio_client": "gradio_client", "fastapi": "fastapi",
+    "starlette": "starlette", "pydantic": "pydantic",
+    "faster-whisper": "faster_whisper", "edge-tts": "edge_tts", "gTTS": "gtts",
+    "google-genai": "google.genai", "voxcpm": "voxcpm",
+}
 
 
-def ensure_voxcpm_audio_stack():
-    """Install only the VoxCPM audio helpers without replacing NumPy/SciPy.
+def ensure_supported_python():
+    # VoxCPM2 officially requires Python 3.10–3.12. NumPy 1.26.4 also has no
+    # CPython 3.13 wheel, so continuing on 3.13 creates binary-size errors.
+    if not ((3, 10) <= sys.version_info[:2] < (3, 13)):
+        raise RuntimeError(
+            f"YF Recap requires Python 3.10, 3.11 or 3.12; current Python is "
+            f"{sys.version_info.major}.{sys.version_info.minor}. "
+            "Please select a Colab runtime using Python 3.12."
+        )
 
-    Colab itself may already have NumPy's compiled C extension loaded.  A
-    force-reinstall of NumPy/SciPy inside that live kernel can leave Python
-    files from one version next to a C extension from another, causing the
-    ``numpy.ufunc.__module__`` crash.  Keep Colab's working NumPy/SciPy intact.
-    """
-    expected = {
-        "librosa": "0.11.0",
-        "soundfile": "0.13.1",
-    }
-    mismatch = [name for name, wanted in expected.items() if _installed_distribution_version(name) != wanted]
-    if not mismatch:
-        print("✅ VoxCPM2 audio stack already compatible — reuse mode")
-        return
 
-    print("🎙️ Installing VoxCPM2 audio helpers:", ", ".join(mismatch))
-    # Do not use --force-reinstall and do not pin NumPy/SciPy here.  pip keeps
-    # Colab's already-compatible compiled scientific stack in place.
+def install_locked_packages():
+    """Install exact tested versions only when the environment differs."""
+    mismatches = []
+    for package, wanted in LOCKED_PACKAGES.items():
+        current = _installed_distribution_version(package)
+        if current != wanted:
+            mismatches.append((package, current, wanted))
+
+    if not mismatches:
+        print("✅ All YF packages match the lock — install skipped")
+        return False
+
+    print("🔒 Restoring tested package lock:")
+    for package, current, wanted in mismatches:
+        print(f"   • {package}: {current or 'missing'} → {wanted}")
+
+    pinned = [f"{name}=={version}" for name, version in LOCKED_PACKAGES.items()]
     run_pip(
-        "install", "-q", "--no-cache-dir", "--upgrade-strategy", "only-if-needed",
-        "librosa==0.11.0",
-        "soundfile==0.13.1",
+        "install", "-q", "--upgrade", "--upgrade-strategy", "only-if-needed",
+        *pinned,
     )
-    print("✅ VoxCPM2 audio helpers ready.")
+
+    failed = []
+    for package, wanted in LOCKED_PACKAGES.items():
+        actual = _installed_distribution_version(package)
+        if actual != wanted:
+            failed.append(f"{package}={actual or 'missing'} (wanted {wanted})")
+    if failed:
+        raise RuntimeError("Package lock verification failed: " + ", ".join(failed))
+
+    # NumPy/SciPy/Pillow may already be loaded by the Colab notebook process.
+    # Never import the newly installed Python files against old C extensions.
+    if any(name in sys.modules for name in ("numpy", "scipy", "PIL", "cv2")):
+        raise RuntimeError(
+            "✅ Locked packages were installed successfully. Please restart the "
+            "Colab runtime once, then run this cell again. This one-time restart "
+            "prevents NumPy binary incompatibility."
+        )
+    return True
 
 
-def ensure_pillow():
-    if not _module_is_available("PIL"):
-        print("📦 Installing Pillow...")
-        run_pip("install", "-q", "Pillow==11.3.0")
-    else:
-        print("✅ Pillow already installed — reuse mode")
+def verify_locked_imports():
+    missing = [module for package, module in LOCKED_IMPORTS.items()
+               if not _module_is_available(module)]
+    if missing:
+        raise RuntimeError("Locked package import check failed: " + ", ".join(missing))
+    print("✅ Locked package import check passed")
 
-print("📦 Installing Python packages...")
-install_missing_core_packages()
-ensure_voxcpm_audio_stack()
-ensure_pillow()
+
+def verify_torch_audio_pair():
+    """Preserve Colab's CUDA-matched Torch; verify Torchaudio uses same release."""
+    torch_version = _installed_distribution_version("torch")
+    if not torch_version:
+        raise RuntimeError("Colab PyTorch is missing. Select a T4 GPU runtime and reconnect.")
+    torch_base = torch_version.split("+")[0]
+    torchaudio_version = _installed_distribution_version("torchaudio")
+    if not torchaudio_version or torchaudio_version.split("+")[0] != torch_base:
+        print(f"🎧 Matching torchaudio to Colab torch {torch_base}...")
+        run_pip("install", "-q", "--no-deps", f"torchaudio=={torch_base}")
+    final_audio_version = _installed_distribution_version("torchaudio")
+    if not final_audio_version or final_audio_version.split("+")[0] != torch_base:
+        raise RuntimeError(
+            f"Torch/Torchaudio mismatch: torch={torch_version}, "
+            f"torchaudio={final_audio_version or 'missing'}"
+        )
+    print(f"✅ CUDA audio pair: torch {torch_version} / torchaudio {final_audio_version}")
+
+
+print("📦 Checking locked Python packages...")
+ensure_supported_python()
+install_locked_packages()
+verify_locked_imports()
+verify_torch_audio_pair()
 
 print("🎞️ Installing FFmpeg & Myanmar fonts...")
 subprocess.run(["apt-get", "update", "-qq"], check=False)
@@ -2533,7 +2592,7 @@ def create_app_legacy():
                                 value=False,
                             )
 
-                        desired_speed = gr.Slider(0.9, 1.6, value=1.25, step=0.05, label="Voice Pace")
+                        desired_speed = gr.Slider(1.0, 1.0, value=1.0, step=0.05, label="Voice Pace • Normal (Fixed)", interactive=False)
                         with gr.Accordion("⚙️ VoxCPM2 Quality Settings", open=False):
                             voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label="CFG Guidance")
                             voxcpm_steps = gr.Slider(4, 20, value=10, step=1, label="Inference Steps")
@@ -2974,9 +3033,10 @@ Create a coherent narrator script from the chronological SOURCE SCENES below.
 
 Narrative tone: {tone_style}
 Approximate final narration target: {int(target_sec)} seconds.
-Target spoken-script size: approximately {int(target_sec * 15.5)} Burmese visible characters overall.
+Target spoken-script size: approximately {int(target_sec * 14.5)} Burmese visible characters overall.
 When the target is close to the source duration, preserve nearly all meaningful chronological events instead of aggressively summarizing.
-Write enough connected narration to reasonably fill the requested duration at normal Burmese narration speed.
+Write a detailed, connected narration that fills about 92–100% of the requested duration at a NORMAL,
+steady Burmese speaking pace. Prefer a fuller script over a short summary, while never adding unsupported facts.
 
 CRITICAL STORY RULES:
 - Retell the story like a skilled Burmese YouTube/TikTok movie recap narrator.
@@ -3257,6 +3317,28 @@ def build_timeline_narration_track(voice_files, source_segments, total_duration,
     return output_path
 
 
+def build_continuous_narration_track(voice_files, output_path):
+    """Join generated clips without changing their natural speaking speed."""
+    if not voice_files:
+        raise RuntimeError("Narration track has no voice clips.")
+    inputs, labels = [], []
+    for idx, audio_path in enumerate(voice_files):
+        inputs.extend(["-i", audio_path])
+        labels.append(f"[{idx}:a]")
+    filters = (
+        "".join(labels)
+        + f"concat=n={len(labels)}:v=0:a=1,aresample=48000,alimiter=limit=0.95[aout]"
+    )
+    r = subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
+        "-filter_complex", filters, "-map", "[aout]",
+        "-c:a", "aac", "-b:a", "192k", output_path,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError("Continuous narration build failed: " + (r.stderr or "Unknown error")[-700:])
+    return output_path
+
+
 def build_full_source_video_filter_graph(target_w, target_h, render_fps, total_duration,
                                          background_fill, enable_zoom, zoom_level,
                                          mirror_flip, filter_color, blur_y_percent,
@@ -3421,8 +3503,8 @@ def render_reviewed_script_v3(
             try:
                 generate_voice_sync(
                     text, voice_id, audio,
-                    desired_tts_rate=desired_speed,
-                    target_duration_sec=src_dur,
+                    desired_tts_rate=1.0,
+                    target_duration_sec=None,
                     retries=3,
                 )
             except Exception as edge_exc:
@@ -3433,8 +3515,8 @@ def render_reviewed_script_v3(
                 try:
                     generate_voice_sync(
                         text, alternate_voice, audio,
-                        desired_tts_rate=desired_speed,
-                        target_duration_sec=src_dur,
+                        desired_tts_rate=1.0,
+                        target_duration_sec=None,
                         retries=3,
                     )
                 except Exception as second_exc:
@@ -3443,7 +3525,7 @@ def render_reviewed_script_v3(
                         generate_gtts_burmese_fallback(
                             text,
                             audio,
-                            desired_speed=desired_speed,
+                            desired_speed=1.0,
                         )
                     except Exception as gtts_exc:
                         raise gr.Error(
@@ -3458,35 +3540,30 @@ def render_reviewed_script_v3(
                 mode="clone",
                 voice_preset="", custom_voice_description="",
                 reference_wav_path=clone_reference_path, reference_transcript=clone_transcript,
-                desired_speed=desired_speed, cfg_value=voxcpm_cfg,
+                desired_speed=1.0, cfg_value=voxcpm_cfg,
                 inference_timesteps=voxcpm_steps, seed=(int(voxcpm_seed or 42) + idx),
             )
         if not os.path.exists(audio) or os.path.getsize(audio) == 0:
             continue
-        # Fit every generated line to the script's original video time slot.
-        # The timeline stays tied to the video; it no longer starts every line
-        # immediately after the prior one and then leaves silence at the end.
+        # Preserve the voice at its natural pace. Retiming happens to video.
         slot_start = max(0.0, min(float(seg["start"]), source_duration - 0.35))
         slot_end = min(source_duration, max(slot_start + 0.35, float(seg["end"])))
-        slot_duration = max(0.35, slot_end - slot_start)
-        fitted_audio = os.path.join(work_dir, f"voice_fit_{idx:03d}.wav")
-        fit_narration_clip_to_slot(audio, slot_duration, fitted_audio)
-        dur = slot_duration
-        voice_files.append(fitted_audio)
+        dur = max(0.1, probe_duration(audio, fallback=src_dur))
+        voice_files.append(audio)
         voice_durations.append(dur)
         successful_source_segments.append({"start": slot_start, "end": slot_end, "text": text})
         display_chunks = split_subtitle_display_chunks(text, min_chars=25, max_chars=35)
         if not display_chunks:
             display_chunks = [text]
         total_chars = max(1, sum(len(c) for c in display_chunks))
-        chunk_cursor = slot_start
+        chunk_cursor = sum(voice_durations[:-1])
         for chunk in display_chunks:
             chunk_share = len(chunk) / total_chars
             chunk_dur = max(0.65, dur * chunk_share)
             subtitle_segments.append({"start": chunk_cursor, "end": chunk_cursor + chunk_dur, "text": chunk})
             chunk_cursor += chunk_dur
         if subtitle_segments:
-            subtitle_segments[-1]["end"] = slot_end
+            subtitle_segments[-1]["end"] = sum(voice_durations)
         completed = idx + 1
         voice_elapsed = max(0.01, time.time() - voice_started_at)
         voice_eta = (voice_elapsed / completed) * max(0, total - completed)
@@ -3500,10 +3577,9 @@ def render_reviewed_script_v3(
     # Ensure source list matches exactly the voice clips that succeeded.
     source_segments = successful_source_segments
 
+    narration_duration = max(0.5, sum(voice_durations))
     merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
-    build_timeline_narration_track(
-        voice_files, successful_source_segments, source_duration, merged_voice
-    )
+    build_continuous_narration_track(voice_files, merged_voice)
 
     narration_mp3 = os.path.join(work_dir, "YF_Recap_Narration.mp3")
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", merged_voice,
@@ -3512,7 +3588,7 @@ def render_reviewed_script_v3(
     progress(0.45, desc="🎙️ Narration-only audio ပြင်နေသည်...")
     final_audio = mix_story_audio_full_duration(
         merged_voice, video_path, bgm_path, narration_volume, original_volume,
-        bgm_volume, auto_duck_bgm, source_duration,
+        bgm_volume, auto_duck_bgm, narration_duration,
         os.path.join(work_dir, "final_mix_full_duration.m4a")
     )
 
@@ -3536,8 +3612,8 @@ def render_reviewed_script_v3(
     audio_idx = next_idx
     input_args += ["-i", final_audio]
 
-    graph = build_full_source_video_filter_graph(
-        target_w, target_h, render_fps, source_duration,
+    graph = build_story_video_filter_graph(
+        source_segments, voice_durations, target_w, target_h, render_fps, narration_duration,
         background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
         blur_y_percent, blur_height_percent, blur_strength, ass_path, logo_idx,
         subtitle_font_style
@@ -3548,20 +3624,20 @@ def render_reviewed_script_v3(
     base = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *input_args,
         "-filter_complex_script", graph_path, "-map", "[vout]", "-map", f"{audio_idx}:a:0",
-        "-t", f"{source_duration:.3f}", "-r", str(render_fps), "-pix_fmt", "yuv420p",
+        "-t", f"{narration_duration:.3f}", "-r", str(render_fps), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
     ]
     if HAS_NVENC:
         cmd = base + ["-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23", "-b:v", "0", out_video]
         try:
-            run_ffmpeg_with_progress(cmd, source_duration, progress, 0.60, 0.97, "⚡ GPU Full-Length Render")
+            run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "⚡ GPU Story Render")
         except Exception as exc:
             print("⚠️ NVENC fallback:", exc)
             cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
-            run_ffmpeg_with_progress(cmd, source_duration, progress, 0.60, 0.97, "🚀 CPU Full-Length Render")
+            run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
     else:
         cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
-        run_ffmpeg_with_progress(cmd, source_duration, progress, 0.60, 0.97, "🚀 CPU Full-Length Render")
+        run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
 
     if not os.path.exists(out_video):
         raise RuntimeError("Final MP4 was not created.")
@@ -3574,7 +3650,7 @@ def render_reviewed_script_v3(
     progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
     return (
         published_video, srt_path, narration_mp3, script_path,
-        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(source_duration)}** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(narration_duration)}** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
     )
 
 
@@ -4482,7 +4558,7 @@ def create_app():
                     clone_transcript = gr.Textbox(label="Reference Transcript (Optional)", lines=2, placeholder="Reference audio ထဲက စကားကို အတိအကျရေးနိုင်ပါတယ်။")
                     clone_consent = gr.Checkbox(label="ဒီ reference အသံကို clone အသုံးပြုရန် ခွင့်ပြုချက်ရှိပါသည်")
 
-                desired_speed = gr.Slider(0.9, 1.6, value=1.22, step=.05, label="Voice Pace")
+                desired_speed = gr.Slider(1.0, 1.0, value=1.0, step=.05, label="Voice Pace • Normal (Fixed)", interactive=False)
                 with gr.Column(visible=False, elem_classes=["engine-panel"]) as voxcpm_quality_panel:
                     with gr.Accordion("⚙️ VoxCPM2 Quality", open=False):
                         voxcpm_cfg = gr.Slider(1.0, 3.0, value=2.0, step=.1, label="CFG")
