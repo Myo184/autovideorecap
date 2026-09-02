@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.8.9 • PYTHON 3.13 LOCK • STEADY VOICE • EMERALD GOLD UI"
+YF_BUILD = "V6.9.0 • COLAB 3.13 COMPATIBLE LOCK • STEADY VOICE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -67,25 +67,26 @@ PYTHON_313_PLUS = sys.version_info[:2] >= (3, 13)
 
 LOCKED_PACKAGES = {
     # Binary/scientific stack: keep these together to prevent ABI errors.
-    # Python 3.13 needs NumPy 2.x/SciPy 1.15 wheels. Older Colab runtimes use
-    # the stable NumPy 1.26 ABI instead.
-    "numpy": "2.2.6" if PYTHON_313_PLUS else "1.26.4",
-    "scipy": "1.15.3" if PYTHON_313_PLUS else "1.13.1",
-    "opencv-python-headless": "4.11.0.86",
+    # Keep the current Colab 3.13 binary stack intact. Downgrading these inside
+    # a live notebook is what causes numpy.dtype-size / ufunc ABI crashes.
+    "numpy": "2.1.3" if PYTHON_313_PLUS else "1.26.4",
+    "scipy": "1.16.3" if PYTHON_313_PLUS else "1.13.1",
+    "opencv-python-headless": "5.0.0.93" if PYTHON_313_PLUS else "4.11.0.86",
     "Pillow": "11.3.0",
     "librosa": "0.11.0",
-    "soundfile": "0.13.1",
-    # Web UI/API stack: exact versions stop Gradio/FastAPI drift.
-    "gradio": "5.49.1",
-    "gradio_client": "1.13.3",
-    "fastapi": "0.115.12",
-    "starlette": "0.46.2",
-    "pydantic": "2.11.7",
+    "soundfile": "0.14.0" if PYTHON_313_PLUS else "0.13.1",
+    # VoxCPM 2.x explicitly requires Gradio >=6,<7. Keep this entire web stack
+    # on the mutually compatible versions already supplied by current Colab.
+    "gradio": "6.26.0" if PYTHON_313_PLUS else "6.26.0",
+    "gradio_client": "2.6.1" if PYTHON_313_PLUS else "2.6.1",
+    "fastapi": "0.141.1" if PYTHON_313_PLUS else "0.141.1",
+    "starlette": "1.6.0" if PYTHON_313_PLUS else "1.6.0",
+    "pydantic": "2.13.4" if PYTHON_313_PLUS else "2.13.4",
     # App services.
     "faster-whisper": "1.2.0",
     "edge-tts": "7.2.3",
     "gTTS": "2.5.4",
-    "google-genai": "1.29.0",
+    "google-genai": "2.12.1" if PYTHON_313_PLUS else "2.12.1",
     "voxcpm": "2.0.3",
 }
 
@@ -103,7 +104,7 @@ LOCKED_IMPORTS = {
 
 def ensure_supported_python():
     # Select a matching scientific lock above instead of forcing Colab users to
-    # downgrade Python. Python 3.13 is supported by the NumPy 2.2 lock.
+    # downgrade Python. Python 3.13 is supported by the Colab NumPy 2.1 lock.
     if not ((3, 10) <= sys.version_info[:2] < (3, 14)):
         raise RuntimeError(
             f"YF Recap requires Python 3.10–3.13; current Python is "
@@ -129,10 +130,22 @@ def install_locked_packages():
         print(f"   • {package}: {current or 'missing'} → {wanted}")
 
     pinned = [f"{name}=={version}" for name, version in LOCKED_PACKAGES.items()]
-    run_pip(
-        "install", "-q", "--upgrade", "--upgrade-strategy", "only-if-needed",
-        *pinned,
+    command = [
+        sys.executable, "-m", "pip", "install",
+        "--upgrade", "--upgrade-strategy", "only-if-needed", *pinned,
+    ]
+    install = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, check=False,
     )
+    if install.returncode != 0:
+        # Do not hide pip's useful resolver message behind CalledProcessError.
+        details = (install.stdout or "No pip details returned.")[-6000:]
+        print("❌ pip dependency resolver output:\n" + details)
+        raise RuntimeError(
+            "Locked package installation failed. Read the pip resolver output "
+            "printed immediately above to see the exact conflicting package."
+        )
 
     failed = []
     for package, wanted in LOCKED_PACKAGES.items():
