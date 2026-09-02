@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.3 • GEMINI TIMEOUT FALLBACK • LIVE UPLOAD ETA • 93% DURATION GUARD"
+YF_BUILD = "V6.10.5 • CHROMA MOTION UI • LIVE FONT PREVIEW • FAST VOXCPM"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -407,18 +407,21 @@ def install_premium_font_bundle(zip_value):
             f"<div class='font-warn'>⚠️ Premium font ZIP မထည့်နိုင်ပါ: {exc}</div>",
             gr.update(choices=list(FONT_STYLE_FILES.keys())),
             gr.update(),
+            subtitle_font_preview_html("Noto Sans Myanmar (Default)"),
         )
     if not registered:
         return (
             "<div class='font-warn'>⚠️ ZIP ထဲမှာ TTF/OTF font မတွေ့ပါ။</div>",
             gr.update(choices=list(FONT_STYLE_FILES.keys())),
             gr.update(),
+            subtitle_font_preview_html("Noto Sans Myanmar (Default)"),
         )
     preferred = registered[0]
     return (
         f"<div class='font-ok'>✅ Premium fonts <b>{len(registered)}</b> ခု ထည့်ပြီးပါပြီ။ Subtitle Font Style မှာ search လုပ်ပြီးရွေးပါ။</div>",
         gr.update(choices=list(FONT_STYLE_FILES.keys()), value=preferred),
         subtitle_font_status(preferred),
+        subtitle_font_preview_html(preferred),
     )
 
 
@@ -478,6 +481,7 @@ def install_uploaded_subtitle_fonts(files, selected_style):
             "<div class='font-warn'>⚠️ Font files မတင်ရသေးပါ။ TTF/OTF font ကို upload လုပ်နိုင်ပါတယ်။</div>",
             subtitle_font_status(selected_style),
             gr.update(),
+            subtitle_font_preview_html(selected_style),
         )
     if not isinstance(files, (list, tuple)):
         files = [files]
@@ -526,7 +530,12 @@ def install_uploaded_subtitle_fonts(files, selected_style):
     if failed:
         parts.append("❌ Failed: " + ", ".join(failed))
     msg = "<div class='font-ok'>" + "<br>".join(parts or ["Font upload completed."]) + "</div>"
-    return msg, subtitle_font_status(selected_after_upload), gr.update(value=selected_after_upload)
+    return (
+        msg,
+        subtitle_font_status(selected_after_upload),
+        gr.update(value=selected_after_upload),
+        subtitle_font_preview_html(selected_after_upload),
+    )
 
 
 def resolve_subtitle_font(font_style):
@@ -578,6 +587,45 @@ def subtitle_font_status(font_style):
         f"<div class='font-warn'>⚠️ <b>{requested}</b> file မတွေ့သေးပါ။ "
         "TTF/OTF file ကို Upload လုပ်ပါ။ အခု Noto fallback သုံးမယ်။</div>"
     )
+
+
+def subtitle_font_preview_html(font_style):
+    """Render a real browser preview using the exact font selected for FFmpeg."""
+    requested = str(font_style or "Noto Sans Myanmar (Default)")
+    path = resolve_subtitle_font(requested)
+    safe_name = (requested.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace('"', "&quot;"))
+    font_rule = ""
+    preview_family = '"Noto Sans Myanmar", sans-serif'
+    actual = False
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "rb") as font_file:
+                encoded = base64.b64encode(font_file.read()).decode("ascii")
+            mime = "font/otf" if path.lower().endswith(".otf") else "font/ttf"
+            fmt = "opentype" if path.lower().endswith(".otf") else "truetype"
+            font_rule = (
+                "@font-face{font-family:'YFSelectedPreview';"
+                f"src:url(data:{mime};base64,{encoded}) format('{fmt}');font-display:swap;}}"
+            )
+            preview_family = "'YFSelectedPreview', sans-serif"
+            actual = True
+        except Exception as exc:
+            print(f"⚠️ Browser font preview unavailable for {requested}: {exc}")
+    badge = "ရွေးထားသော Font အစစ်" if actual else "Noto fallback preview"
+    return f"""
+    <style>{font_rule}</style>
+    <div class='font-live-preview'>
+      <div class='font-preview-top'><span>LIVE FONT PREVIEW</span><b>{safe_name}</b></div>
+      <div class='font-preview-stage' style="font-family:{preview_family}">
+        မမျှော်လင့်ထားတဲ့ အဖြစ်အပျက်က အခုမှ စတင်လာပါတော့တယ်…
+      </div>
+      <small>✓ {badge} • Final subtitle မှာ ဒီစာလုံးပုံစံအတိုင်း အသုံးပြုမယ်</small>
+    </div>"""
+
+
+def subtitle_font_ui(font_style):
+    return subtitle_font_status(font_style), subtitle_font_preview_html(font_style)
 
 # ================================================================
 # 4) WHISPER MODEL LOADING
@@ -1113,6 +1161,7 @@ Chronological subtitle JSON:
             prompt,
             system_instruction=SYSTEM_INSTRUCTION,
             purpose="Recap translation",
+            max_attempts=2,
         )
         res_text = (response.text or "").strip()
         res_text = re.sub(r"^```(?:json)?\s*", "", res_text)
@@ -2419,7 +2468,40 @@ def create_app_legacy():
       .sub-size-stage{min-height:70px}.process-card{padding:12px!important}.process-main>span{font-size:9.5px!important}
 
     }
-    @media(prefers-reduced-motion:reduce){.wiz-logo:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
+    /* V6.10.5 — Chroma Motion: a visibly different animated spectrum theme. */
+    :root{--chroma-pink:#ff4fd8;--chroma-purple:#8b5cf6;--chroma-blue:#38bdf8;--chroma-lime:#a3e635;--chroma-gold:#fbbf24}
+    body,.gradio-container{
+      background:
+        radial-gradient(720px 430px at 8% 4%,#8b5cf62b,transparent 66%),
+        radial-gradient(680px 420px at 92% 8%,#ff4fd824,transparent 64%),
+        radial-gradient(760px 500px at 52% 105%,#38bdf821,transparent 68%),
+        linear-gradient(155deg,#070617,#090b1b 48%,#050816)!important;
+      background-attachment:fixed!important;
+    }
+    .wiz-hero,.wizard-card,.login-card-pro{border-color:#ffffff1c!important;background:linear-gradient(145deg,#151229e8,#091323e8)!important;box-shadow:0 24px 70px #0009,0 0 45px #8b5cf60e,inset 0 1px #ffffff12!important}
+    .wiz-hero:before{background:linear-gradient(110deg,#ff4fd8,#8b5cf6,#38bdf8,#a3e635,#fbbf24,#ff4fd8)!important;background-size:300% 100%!important;animation:yfSpectrumBorder 7s linear infinite!important}
+    .wiz-logo{border-color:#ffffff36!important;background:#090817!important}.wiz-logo:before{background:conic-gradient(#ff4fd8,#8b5cf6,#38bdf8,#a3e635,#fbbf24,#ff4fd8)!important;animation:yfLogoSpin 4.8s linear infinite!important}
+    .wiz-name,.wizard-title,.login-head,.clone-title,.voice-mode-title{
+      color:transparent!important;
+      background:linear-gradient(90deg,#ff79df,#b79cff,#63d7ff,#c5f65b,#ffd66b,#ff79df)!important;
+      background-size:260% 100%!important;
+      -webkit-background-clip:text!important;background-clip:text!important;
+      animation:yfTitleSpectrum 5.5s linear infinite,yfTitleFloat 3s ease-in-out infinite!important;
+      filter:drop-shadow(0 0 12px #8b5cf62f);
+    }
+    .wizard-badge{border-color:#a78bfa55!important;background:linear-gradient(90deg,#ff4fd814,#8b5cf618,#38bdf814)!important;color:#e9d5ff!important;box-shadow:0 0 20px #8b5cf615!important}
+    .wiz-note b,.wiz-step-label,.process-top strong{color:#67e8f9!important}.wiz-sub{color:#b6a9dc!important}.wizard-copy,.hint,.clone-copy,.login-copy{color:#aeb9d1!important}
+    .wiz-node.active span{border-color:#f0abfc!important;background:linear-gradient(135deg,#db2777,#7c3aed,#0284c7)!important;box-shadow:0 0 24px #d946ef55!important}.wiz-node.done span{border-color:#67e8f9!important;background:linear-gradient(135deg,#0891b2,#7c3aed)!important}
+    .wiz-next,#auto-recap-btn,#yf-download-btn{background:linear-gradient(100deg,#db2777,#7c3aed,#0284c7,#65a30d,#d97706)!important;background-size:300% 100%!important;animation:yfButtonFlow 5s ease infinite!important}
+    .engine-panel,.generate-summary,.sub-size-preview,.eta-card,.download-note{border-color:#7c6daf66!important;background:linear-gradient(145deg,#121126e8,#091523e8)!important}.clone-panel{border-color:#e879f977!important;background:linear-gradient(145deg,#3b14524f,#10132ad9)!important}
+    .font-live-preview{position:relative;overflow:hidden;margin:10px 0 13px;padding:13px;border:1px solid #8b5cf66b;border-radius:17px;background:linear-gradient(145deg,#140f29,#071827);box-shadow:inset 0 1px #ffffff12,0 12px 34px #0005}
+    .font-live-preview:before{content:"";position:absolute;inset:-80% -20%;background:conic-gradient(from 90deg,transparent,#ff4fd817,transparent,#38bdf818,transparent);animation:yfLogoSpin 9s linear infinite;pointer-events:none}
+    .font-preview-top,.font-preview-stage,.font-live-preview small{position:relative;z-index:1}.font-preview-top{display:flex;justify-content:space-between;align-items:center;gap:9px}.font-preview-top span{font-size:8px;font-weight:950;letter-spacing:.15em;color:#67e8f9}.font-preview-top b{font-size:10px;color:#f5d0fe;overflow-wrap:anywhere;text-align:right}.font-preview-stage{min-height:82px;margin-top:10px;padding:14px;display:grid;place-items:center;text-align:center;border-radius:12px;background:#030712b8;border:1px solid #ffffff12;color:#ffe45e;font-size:25px;line-height:1.6;text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000;word-break:break-word}.font-live-preview small{display:block;margin-top:8px;color:#a7f3d0;font-size:9px}
+    @keyframes yfTitleSpectrum{to{background-position:260% 0}}
+    @keyframes yfTitleFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+    @keyframes yfSpectrumBorder{to{background-position:300% 0}}
+    @media(max-width:720px){.font-preview-stage{font-size:21px;min-height:76px;padding:11px}.wizard-title{animation-duration:5.5s,3.4s!important}}
+    @media(prefers-reduced-motion:reduce){.wiz-logo:before,.wiz-hero:before,.wiz-name,.wizard-title,.login-head,.clone-title,.voice-mode-title,.font-live-preview:before,.process-track i,#auto-recap-btn,#auto-recap-btn:before,#yf-download-btn:before{animation:none!important}.gradio-container button,#yf-download-btn{transition:none!important}}
     """
     theme = gr.themes.Soft(primary_hue="emerald", secondary_hue="violet", neutral_hue="slate")
 
@@ -3138,6 +3220,7 @@ SOURCE SCENES:
                 response, selected_model = gemini_generate_auto(
                     client, prompt, system_instruction=SYSTEM_INSTRUCTION,
                     purpose=f"Viral recap chapter {batch_index}",
+                    max_attempts=2,
                 )
                 raw = (response.text or "").strip()
                 raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -3209,6 +3292,57 @@ def parse_script_editor(text):
         if narration and en > st:
             segments.append({"start": st, "end": en, "text": narration})
     return segments
+
+
+def _coalesce_voxcpm_segments(segments, source_duration):
+    """Reduce expensive VoxCPM calls for short clips without shortening text.
+
+    The complete narration is preserved in chronological order; only adjacent
+    TTS requests are joined. Subtitle text is still split into readable phrases
+    after synthesis. Long videos retain their original scene-level requests.
+    """
+    items = [dict(s) for s in (segments or []) if (s.get("text") or "").strip()]
+    if len(items) <= 1:
+        return items
+
+    duration = max(0.0, float(source_duration or 0.0))
+    if duration <= 35.0:
+        target_calls = 1
+    elif duration <= 75.0:
+        target_calls = 2
+    elif duration <= 150.0:
+        target_calls = min(3, len(items))
+    else:
+        return items
+
+    if len(items) <= target_calls:
+        return items
+
+    total_chars = sum(max(1, len(s["text"])) for s in items)
+    groups, current, current_chars = [], [], 0
+    consumed_chars = 0
+    for item in items:
+        current.append(item)
+        current_chars += max(1, len(item["text"]))
+        groups_left = target_calls - len(groups)
+        items_left = len(items) - (sum(len(g) for g in groups) + len(current))
+        target_end = total_chars * (len(groups) + 1) / target_calls
+        reached_balance = consumed_chars + current_chars >= target_end
+        if groups_left > 1 and reached_balance and items_left >= groups_left - 1:
+            groups.append(current)
+            consumed_chars += current_chars
+            current, current_chars = [], 0
+    if current:
+        groups.append(current)
+
+    merged = []
+    for group in groups:
+        merged.append({
+            "start": float(group[0]["start"]),
+            "end": float(group[-1]["end"]),
+            "text": " ".join(str(s["text"]).strip() for s in group if str(s["text"]).strip()),
+        })
+    return merged
 
 
 def write_srt_file(subtitle_segments, path):
@@ -3564,6 +3698,14 @@ def render_reviewed_script_v3(
     source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
     if source_duration <= 0.5:
         source_duration = max(0.5, probe_duration(video_path, fallback=1.0))
+    if "Voice Clone" in str(voice_engine):
+        original_tts_calls = len(script_segments)
+        script_segments = _coalesce_voxcpm_segments(script_segments, source_duration)
+        if len(script_segments) < original_tts_calls:
+            print(
+                f"⚡ VoxCPM short-clip optimization: {original_tts_calls} narration calls "
+                f"→ {len(script_segments)} (all script text preserved)"
+            )
     total = len(script_segments)
 
     total_started_at = time.time()
@@ -3572,6 +3714,15 @@ def render_reviewed_script_v3(
     for idx, seg in enumerate(script_segments):
         text = seg["text"].strip()
         src_dur = max(0.3, seg["end"] - seg["start"])
+        if idx == 0:
+            current_eta = "calculating…"
+        else:
+            elapsed_so_far = max(0.01, time.time() - voice_started_at)
+            current_eta = _fmt_eta_seconds((elapsed_so_far / idx) * (total - idx))
+        progress(
+            0.04 + 0.37 * (idx / max(1, total)),
+            desc=f"🎙️ Narration {idx + 1}/{total} ထုတ်နေသည် • ETA {current_eta}",
+        )
         if "Edge TTS" in str(voice_engine):
             audio = os.path.join(work_dir, f"voice_{idx:03d}.mp3")
             voice_id = EDGE_VOICES.get(edge_voice_name, "my-MM-NilarNeural")
@@ -3608,16 +3759,23 @@ def render_reviewed_script_v3(
                             f"({gtts_exc})"
                         )
         else:
-            # The only non-Edge engine in V6 is VoxCPM2 Voice Clone.
+            # VoxCPM stays VoxCPM: never silently switch a selected cloned
+            # voice to Edge TTS or gTTS when synthesis fails.
             audio = os.path.join(work_dir, f"voice_{idx:03d}.wav")
-            generate_voxcpm_audio(
-                text, audio,
-                mode="clone",
-                voice_preset="", custom_voice_description="",
-                reference_wav_path=clone_reference_path, reference_transcript=clone_transcript,
-                desired_speed=1.0, cfg_value=voxcpm_cfg,
-                inference_timesteps=voxcpm_steps, seed=(int(voxcpm_seed or 42) + idx),
-            )
+            try:
+                generate_voxcpm_audio(
+                    text, audio,
+                    mode="clone",
+                    voice_preset="", custom_voice_description="",
+                    reference_wav_path=clone_reference_path, reference_transcript=clone_transcript,
+                    desired_speed=1.0, cfg_value=voxcpm_cfg,
+                    inference_timesteps=voxcpm_steps, seed=(int(voxcpm_seed or 42) + idx),
+                )
+            except Exception as vox_exc:
+                raise gr.Error(
+                    "VoxCPM Voice Clone အသံထုတ်မရပါ။ Edge TTS သို့ အလိုအလျောက် "
+                    f"မပြောင်းထားပါ။ ({vox_exc})"
+                ) from vox_exc
         if not os.path.exists(audio) or os.path.getsize(audio) == 0:
             continue
         # Preserve the voice at its natural pace. Retiming happens to video.
@@ -4008,18 +4166,17 @@ def _processing_status_html(session_id):
           <span>{message}</span></div>
         </div>"""
 
-    # During a long stage, keep the bar visibly moving toward (but never past)
-    # 95% using the original ETA as a secondary estimate. Actual backend
-    # progress remains the lower bound and wins whenever it advances.
-    projected = progress_pct
-    if eta_high and float(eta_high) > 0:
-        projected = max(projected, min(95, int((elapsed / float(eta_high)) * 95)))
-    progress_pct = projected
+    # Show only progress reported by completed backend work.  Time-based fake
+    # projection previously showed 95% while VoxCPM was still on Narration 2/3.
+    # Keeping this truthful makes a slow TTS call clearly distinguishable from
+    # an almost-complete render.
 
     if eta_low is not None and eta_high is not None:
         remain_low = max(0.0, float(eta_low) - elapsed)
         remain_high = max(0.0, float(eta_high) - elapsed)
-        if remain_high <= 1:
+        if elapsed > float(eta_high):
+            remaining = "estimate ကျော်နေသည် • လက်ရှိအဆင့်ကို ဆက်လုပ်နေသည်"
+        elif remain_high <= 1:
             remaining = "finishing…"
         else:
             remaining = f"~ {_fmt_eta_seconds(remain_low)} – {_fmt_eta_seconds(remain_high)}"
@@ -4688,6 +4845,9 @@ def create_app():
                     allow_custom_value=False,
                     elem_id="subtitle-font-picker",
                 )
+                subtitle_font_preview = gr.HTML(
+                    subtitle_font_preview_html("Noto Sans Myanmar (Default)")
+                )
                 blur_strength = gr.Slider(5, 151, value=51, step=2, label="Blur Strength")
                 font_style_status = gr.HTML(subtitle_font_status("Noto Sans Myanmar (Default)"))
                 with gr.Accordion("📁 Custom Myanmar Font", open=False):
@@ -4780,18 +4940,24 @@ def create_app():
         )
         layout_editor.change(sync_layout_editor, outputs=[blur_y_percent, blur_height_percent, sub_pos_percent], queue=False, show_progress="hidden")
         subtitle_size.change(_subtitle_size_preview_html, [subtitle_size], [subtitle_size_preview], queue=False, show_progress="hidden")
-        subtitle_font_style.change(subtitle_font_status, [subtitle_font_style], [font_style_status], queue=False, show_progress="hidden")
+        subtitle_font_style.change(
+            subtitle_font_ui,
+            [subtitle_font_style],
+            [font_style_status, subtitle_font_preview],
+            queue=False,
+            show_progress="hidden",
+        )
         subtitle_font_upload.change(
             install_uploaded_subtitle_fonts,
             inputs=[subtitle_font_upload, subtitle_font_style],
-            outputs=[font_upload_status, font_style_status, subtitle_font_style],
+            outputs=[font_upload_status, font_style_status, subtitle_font_style, subtitle_font_preview],
             queue=False,
             show_progress="hidden",
         )
         premium_font_zip_upload.change(
             install_premium_font_bundle,
             inputs=[premium_font_zip_upload],
-            outputs=[premium_font_status, subtitle_font_style, font_style_status],
+            outputs=[premium_font_status, subtitle_font_style, font_style_status, subtitle_font_preview],
             queue=False,
             show_progress="hidden",
         )
