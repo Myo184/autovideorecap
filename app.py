@@ -8,12 +8,13 @@ import os, sys, subprocess, importlib.util, shutil, math
 from importlib import metadata as importlib_metadata
 import threading
 import base64
+import hashlib
 import socket
 import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.7 • EARLY QUOTA CHECK • VOXCPM CONFIRM FIX • CHROMA MOTION UI"
+YF_BUILD = "V6.10.8 • EARLY QUOTA CHECK • VOXCPM CONFIRM FIX • CHROMA MOTION UI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -287,6 +288,12 @@ SYSTEM_INSTRUCTION = (
 )
 
 USER_LIMIT_TRACKER = {}
+
+# Background Gemini pre-generation jobs, keyed by browser/session id.
+# The heavy Analyze + Script stages can run while the user chooses Voice / Subtitle settings.
+_BG_SCRIPT_JOBS = {}
+_BG_SCRIPT_LOCK = threading.Lock()
+
 
 # ================================================================
 # 3) FONT DETECTION
@@ -4391,6 +4398,154 @@ def estimate_auto_recap_eta(video_value, recap_length, voice_engine, render_mode
     return f"""<div class='eta-card ready'><div class='eta-icon'>⏱</div><div class='eta-main'><b>AUTO RECAP started • estimated {_fmt_eta_seconds(low)} – {_fmt_eta_seconds(high)}</b><span>Analyze → Viral Script → Voice → Render → Export ကို တစ်ခါတည်းလုပ်နေမယ်။</span><small>{note}</small></div></div>"""
 
 
+def _background_script_fingerprint(video_value, user_api_key, tone_style, recap_length):
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return ""
+    key = (user_api_key or "").strip()
+    try:
+        stat = os.stat(video_path)
+        video_sig = f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        video_sig = os.path.abspath(video_path)
+    raw = "|".join([
+        video_sig,
+        hashlib.sha256(key.encode("utf-8")).hexdigest(),
+        str(tone_style or ""),
+        str(recap_length or ""),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class _SilentProgress:
+    def __call__(self, *args, **kwargs):
+        return None
+
+
+def _background_script_status_html(session_id):
+    with _BG_SCRIPT_LOCK:
+        job = dict(_BG_SCRIPT_JOBS.get(str(session_id or ""), {}) or {})
+    state = job.get("state")
+    if state == "running":
+        stage = job.get("stage") or "Movie ကို analyze လုပ်ပြီး AI script ရေးနေပါတယ်…"
+        return f"<div class='font-warn'>🧠 <b>AI Script Background Mode</b><br>{stage}<br><small>Voice / Subtitle settings ကို ဆက်ရွေးနိုင်ပါတယ်။</small></div>"
+    if state == "ready":
+        elapsed = _fmt_eta_seconds(job.get("elapsed", 0))
+        return f"<div class='font-ok'>✅ <b>AI Script အဆင်သင့်ဖြစ်ပါပြီ</b><br>Final Generate နှိပ်ရင် Gemini ကို ထပ်မခေါ်ဘဲ ဒီ script ကို တန်းသုံးပါမယ်။ <small>({elapsed})</small></div>"
+    if state == "error":
+        return f"<div class='font-warn'>⚠️ Background script မပြီးပါ: {str(job.get('error',''))[:240]}<br><small>Final Generate မှာ ပုံမှန်နည်းနဲ့ ပြန်စမ်းပါမယ်။</small></div>"
+    return "<div class='eta-card waiting'><div class='eta-icon'>🧠</div><div><b>Background AI Script</b><span>Gemini API Key ထည့်ပြီး textbox ကနေထွက်တာနဲ့ အလိုအလျောက်စပါမယ်။</span></div></div>"
+
+
+def _run_background_script_job(session_id, fingerprint, video_value, user_api_key, tone_style, recap_length, vip_access_state):
+    started = time.time()
+    sid = str(session_id or "")
+    try:
+        with _BG_SCRIPT_LOCK:
+            current = _BG_SCRIPT_JOBS.get(sid)
+            if not current or current.get("fingerprint") != fingerprint:
+                return
+            current["stage"] = "🎙️ Video speech / scenes ကို analyze လုပ်နေပါတယ်…"
+
+        analysis, _summary, _rows = analyze_movie_v3(
+            video_value, vip_access_state, user_api_key=user_api_key, progress=_SilentProgress()
+        )
+        with _BG_SCRIPT_LOCK:
+            current = _BG_SCRIPT_JOBS.get(sid)
+            if not current or current.get("fingerprint") != fingerprint:
+                return
+            current["stage"] = "✍️ Gemini က Burmese recap script ကို ရေးနေပါတယ်…"
+            current["analysis"] = analysis
+
+        script_text, script_summary = generate_recap_script_v3(
+            analysis, user_api_key, tone_style, recap_length, progress=_SilentProgress()
+        )
+        with _BG_SCRIPT_LOCK:
+            current = _BG_SCRIPT_JOBS.get(sid)
+            if not current or current.get("fingerprint") != fingerprint:
+                return
+            current.update({
+                "state": "ready",
+                "analysis": analysis,
+                "script_text": script_text,
+                "script_summary": script_summary,
+                "finished": time.time(),
+                "elapsed": time.time() - started,
+                "stage": "✅ AI Script အဆင်သင့်ဖြစ်ပါပြီ",
+                "error": "",
+            })
+    except Exception as exc:
+        print(f"[BACKGROUND SCRIPT ERROR] {type(exc).__name__}: {exc}")
+        with _BG_SCRIPT_LOCK:
+            current = _BG_SCRIPT_JOBS.get(sid)
+            if current and current.get("fingerprint") == fingerprint:
+                current.update({
+                    "state": "error", "error": str(exc), "finished": time.time(),
+                    "elapsed": time.time() - started, "stage": "⚠️ Background script failed",
+                })
+
+
+def start_background_script_generation(video_value, user_api_key, tone_style, recap_length, session_id, vip_access_state):
+    """Start Analyze + Gemini script in a daemon thread and return immediately."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return "<div class='font-warn'>🎬 Background script စဖို့ Video ကို အရင် upload လုပ်ပါ။</div>"
+    api_key = (user_api_key or "").strip()
+    if len(api_key) < 20:
+        return "<div class='font-warn'>🔑 Gemini API Key အပြည့်အစုံထည့်ပြီး textbox ကနေထွက်ပါ။</div>"
+    try:
+        verify_video_quota_available(vip_access_state)
+    except Exception as exc:
+        return f"<div class='font-warn'>🚫 {str(exc)}</div>"
+
+    sid = str(session_id or "")
+    fingerprint = _background_script_fingerprint(video_value, api_key, tone_style, recap_length)
+    with _BG_SCRIPT_LOCK:
+        existing = _BG_SCRIPT_JOBS.get(sid)
+        if existing and existing.get("fingerprint") == fingerprint:
+            if existing.get("state") in ("running", "ready"):
+                return _background_script_status_html(sid)
+        _BG_SCRIPT_JOBS[sid] = {
+            "fingerprint": fingerprint,
+            "state": "running",
+            "stage": "🎬 Background AI preparation စတင်နေပါတယ်…",
+            "started": time.time(),
+            "analysis": None,
+            "script_text": "",
+            "error": "",
+        }
+
+    threading.Thread(
+        target=_run_background_script_job,
+        args=(sid, fingerprint, video_value, api_key, tone_style, recap_length, vip_access_state),
+        daemon=True,
+        name=f"yf-script-{sid[:8]}",
+    ).start()
+    gr.Info("🧠 AI Script ကို နောက်ကွယ်မှာ စရေးနေပါပြီ။ Voice / Subtitle settings ကို ဆက်ရွေးနိုင်ပါတယ်။")
+    return _background_script_status_html(sid)
+
+
+def poll_background_script_status(session_id):
+    return _background_script_status_html(session_id)
+
+
+def _get_or_wait_background_script(session_id, fingerprint, max_wait_seconds=900):
+    """Reuse the exact matching background job; wait rather than launch duplicate Gemini work."""
+    sid = str(session_id or "")
+    deadline = time.time() + max(1.0, float(max_wait_seconds))
+    while time.time() < deadline:
+        with _BG_SCRIPT_LOCK:
+            job = dict(_BG_SCRIPT_JOBS.get(sid, {}) or {})
+        if not job or job.get("fingerprint") != fingerprint:
+            return None
+        if job.get("state") == "ready" and job.get("analysis") and job.get("script_text"):
+            return job
+        if job.get("state") == "error":
+            return None
+        time.sleep(0.35)
+    return None
+
+
 def auto_recap_pipeline_v5(
     video_value, user_api_key, tone_style, recap_length,
     ratio_select, background_fill, enable_zoom, zoom_level, logo_value,
@@ -4438,18 +4593,32 @@ def auto_recap_pipeline_v5(
     try:
         live_progress(0.01, desc="🎬 AUTO RECAP စတင်နေသည်…")
 
-        # Stage 1: speech / scene analysis (hidden from the user UI).
-        analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
-            video_value, vip_access_state, user_api_key=user_api_key,
-            progress=_ProgressSlice(live_progress, 0.01, 0.18),
-        )
+        # Reuse background Analyze + Gemini Script when the exact Video/API/Tone/Length matches.
+        bg_fingerprint = _background_script_fingerprint(video_value, user_api_key, tone_style, recap_length)
+        with _BG_SCRIPT_LOCK:
+            bg_now = dict(_BG_SCRIPT_JOBS.get(str(session_id or ""), {}) or {})
+        bg_job = None
+        if bg_now.get("fingerprint") == bg_fingerprint and bg_now.get("state") == "running":
+            live_progress(0.03, desc="🧠 Background AI Script မပြီးသေးပါ — အသစ်မရေးဘဲ အဲဒီ job ကိုစောင့်နေသည်…")
+            bg_job = _get_or_wait_background_script(session_id, bg_fingerprint, max_wait_seconds=900)
+        elif bg_now.get("fingerprint") == bg_fingerprint and bg_now.get("state") == "ready":
+            bg_job = bg_now
 
-        # Stage 2: viral storytelling script (hidden from the user UI).
-        live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
-        script_text, _script_summary = generate_recap_script_v3(
-            analysis, user_api_key, tone_style, recap_length,
-            progress=_ProgressSlice(live_progress, 0.18, 0.34),
-        )
+        if bg_job and bg_job.get("analysis") and bg_job.get("script_text"):
+            analysis = bg_job["analysis"]
+            script_text = bg_job["script_text"]
+            live_progress(0.34, desc="✅ Background AI Script ready — Gemini ကို ထပ်မခေါ်ဘဲ ဆက် render လုပ်မယ်…")
+        else:
+            # Fallback when no matching background job exists or it failed.
+            analysis, _analysis_summary, _scene_rows = analyze_movie_v3(
+                video_value, vip_access_state, user_api_key=user_api_key,
+                progress=_ProgressSlice(live_progress, 0.01, 0.18),
+            )
+            live_progress(0.18, desc="🧠 Movie story ကို recap script အဖြစ်ရေးနေသည်…")
+            script_text, _script_summary = generate_recap_script_v3(
+                analysis, user_api_key, tone_style, recap_length,
+                progress=_ProgressSlice(live_progress, 0.18, 0.34),
+            )
 
         # Stage 3: narration + scene render + exports. The child function's
         # Gradio progress (including FFmpeg render ETA) is mirrored live.
@@ -4911,6 +5080,7 @@ def create_app():
             with gr.Column(visible=False, elem_classes=["wizard-card"]) as step2_panel:
                 gr.HTML("<div class='wizard-badge'>STEP 2 • STORY</div><div class='wizard-title'>🧠 Recap Settings</div><div class='wizard-copy'>AI script ကို user မမြင်ရအောင် backend မှာ auto analyze + generate လုပ်ပါမယ်။ Viral Story Recap ကို default ထားထားပါတယ်။</div>")
                 user_api_key = gr.Textbox(label="Gemini API Key", type="password", placeholder="Gemini Flash models auto fallback")
+                background_script_status = gr.HTML(_background_script_status_html(None))
                 tone_style = gr.Dropdown(choices=["Viral Story Recap", "Thriller", "Comedy", "Dramatic", "Action/Epic", "Neutral"], value="Viral Story Recap", label="Narrative Tone")
                 recap_length = gr.Dropdown(
                     choices=[
@@ -5084,6 +5254,39 @@ def create_app():
             outputs=[video_quota_notice],
             queue=False,
             show_progress="hidden",
+        )
+
+        # Background AI script pre-generation. Blur/Enter starts it; a lightweight
+        # timer refreshes the status card while the user continues through later steps.
+        user_api_key.blur(
+            start_background_script_generation,
+            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
+            outputs=[background_script_status],
+            queue=False, show_progress="hidden",
+        )
+        user_api_key.submit(
+            start_background_script_generation,
+            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
+            outputs=[background_script_status],
+            queue=False, show_progress="hidden",
+        )
+        # If tone/length changes after a key was entered, pre-generate the matching new script.
+        tone_style.change(
+            start_background_script_generation,
+            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
+            outputs=[background_script_status],
+            queue=False, show_progress="hidden",
+        )
+        recap_length.change(
+            start_background_script_generation,
+            inputs=[video_input, user_api_key, tone_style, recap_length, session_id_state, vip_access_state],
+            outputs=[background_script_status],
+            queue=False, show_progress="hidden",
+        )
+        bg_script_timer = gr.Timer(value=1.0, active=True)
+        bg_script_timer.tick(
+            poll_background_script_status, inputs=[session_id_state], outputs=[background_script_status],
+            queue=False, show_progress="hidden",
         )
 
         # Wizard navigation.
