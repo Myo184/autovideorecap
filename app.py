@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.2 • LIVE UPLOAD ETA • 93% DURATION GUARD • STEADY VOICE"
+YF_BUILD = "V6.10.3 • GEMINI TIMEOUT FALLBACK • LIVE UPLOAD ETA • 93% DURATION GUARD"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -233,6 +233,7 @@ import glob
 import torch
 import soundfile as sf
 from google import genai
+from google.genai import types as genai_types
 from datetime import datetime
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
@@ -982,7 +983,16 @@ def _normalize_gemini_model_name(name):
     return name.split("models/", 1)[-1] if name.startswith("models/") else name
 
 
-def gemini_generate_auto(client, contents, system_instruction=None, purpose="Gemini"):
+def create_gemini_client(api_key, timeout_seconds=90):
+    """Create a Gemini client whose HTTP calls cannot wait forever."""
+    timeout_ms = max(5_000, int(float(timeout_seconds) * 1000))
+    return genai.Client(
+        api_key=(api_key or "").strip(),
+        http_options=genai_types.HttpOptions(timeout=timeout_ms),
+    )
+
+
+def gemini_generate_auto(client, contents, system_instruction=None, purpose="Gemini", max_attempts=None):
     """Try currently supported Flash models in priority order.
 
     The Gemini API changes model availability over time and availability can
@@ -1007,6 +1017,9 @@ def gemini_generate_auto(client, contents, system_instruction=None, purpose="Gem
             candidates = visible
     except Exception as list_exc:
         print(f"ℹ️ Gemini model listing unavailable; using fallback list: {list_exc}")
+
+    if max_attempts is not None:
+        candidates = candidates[:max(1, int(max_attempts))]
 
     last_error = None
     config = {"system_instruction": system_instruction} if system_instruction else None
@@ -1094,7 +1107,7 @@ Chronological subtitle JSON:
 """
     translated_map = {}
     try:
-        client = genai.Client(api_key=user_api_key.strip())
+        client = create_gemini_client(user_api_key, timeout_seconds=90)
         response, selected_model = gemini_generate_auto(
             client,
             prompt,
@@ -2874,11 +2887,15 @@ Rules:
         contents.extend([f"Frame timestamp: {item['time']:.2f} seconds", item["image"]])
 
     try:
-        client = genai.Client(api_key=api_key)
+        # Visual analysis is optional when Whisper already found dialogue.
+        # Keep this request short so a busy Gemini model cannot leave the UI
+        # apparently frozen at 95% for many minutes.
+        client = create_gemini_client(api_key, timeout_seconds=30)
         response, selected_model = gemini_generate_auto(
             client, contents,
             system_instruction="Analyze video frames faithfully. Never invent unseen story facts.",
             purpose="Visual movie analysis",
+            max_attempts=2,
         )
         raw = (response.text or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -2965,6 +2982,7 @@ def analyze_movie_v3(video_value, vip_access_state, user_api_key="", progress=gr
     audio_scenes = group_transcript_scenes(raw_segments)
     progress(0.55, desc="👁️ Video scenes ကိုဖတ်နေသည်...")
     visual_scenes = _visual_scenes_from_gemini(video_path, duration, user_api_key)
+    progress(0.68, desc="✅ Scene analysis ပြီးပါပြီ...")
     scenes = _combine_audio_and_visual_scenes(audio_scenes, visual_scenes)
     if not scenes:
         raise gr.Error(
@@ -3116,7 +3134,7 @@ SOURCE SCENES:
                     0.12 + 0.55 * (batch_index / max(1, len(scene_batches))),
                     desc=f"✨ Script chapter {batch_index}/{len(scene_batches)} ရေးနေသည်..."
                 )
-                client = genai.Client(api_key=api_key)
+                client = create_gemini_client(api_key, timeout_seconds=90)
                 response, selected_model = gemini_generate_auto(
                     client, prompt, system_instruction=SYSTEM_INSTRUCTION,
                     purpose=f"Viral recap chapter {batch_index}",
