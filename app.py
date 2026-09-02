@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.10.6 • VOXCPM CONFIRMATION • CHROMA MOTION UI • LIVE FONT PREVIEW"
+YF_BUILD = "V6.10.7 • EARLY QUOTA CHECK • VOXCPM CONFIRM FIX • CHROMA MOTION UI"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -2156,6 +2156,101 @@ def refresh_member_quota(vip_access_state):
         return _member_quota_html(vip_access_state)
 
 
+def verify_video_quota_available(vip_access_state):
+    """Freshly verify today's quota without consuming a video credit.
+
+    This is used immediately after upload / before Step 2 so an exhausted user
+    does not spend time on analysis, TTS, or rendering only to be rejected at
+    the very end.  The successful render still calls ``consume_video_quota``.
+    """
+    if not isinstance(vip_access_state, dict) or not vip_access_state.get("authenticated"):
+        raise gr.Error("🔒 VIP Access မရှိပါ။ Login ပြန်ဝင်ပါ။")
+
+    code = str(vip_access_state.get("code", "")).strip().upper()
+    if not code:
+        raise gr.Error("🔒 VIP Code မရှိပါ။ Login ပြန်ဝင်ပါ။")
+
+    try:
+        client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
+        data = _vip_api_dict(client.predict(code, api_name="/verify"))
+    except Exception as exc:
+        print(f"[VIP PRECHECK ERROR] {type(exc).__name__}: {exc}")
+        raise gr.Error(
+            "❌ Video limit ကို အခုမစစ်နိုင်ပါ။ VIP Server connection ကိုစစ်ပြီး ထပ်ကြိုးစားပါ။"
+        )
+
+    if not data.get("valid"):
+        raise gr.Error(data.get("msg") or "❌ VIP Code သက်တမ်း/အသုံးပြုခွင့် မမှန်ပါ။")
+
+    limit = data.get("daily_limit")
+    used = int(data.get("used_today", 0) or 0)
+
+    if limit is None:
+        data["_quota_remaining"] = None
+        data["_quota_used"] = used
+        data["_quota_limit"] = None
+        return data
+
+    try:
+        limit = int(limit)
+    except Exception:
+        raise gr.Error("❌ VIP Server မှ daily limit data မမှန်ပါ။ Admin ကိုဆက်သွယ်ပါ။")
+
+    remaining_raw = data.get("remaining_today")
+    try:
+        remaining = int(remaining_raw) if remaining_raw is not None else limit - used
+    except Exception:
+        remaining = limit - used
+    remaining = max(0, remaining)
+
+    data["_quota_remaining"] = remaining
+    data["_quota_used"] = used
+    data["_quota_limit"] = limit
+
+    if remaining <= 0:
+        raise gr.Error(
+            f"🚫 ဒီနေ့ Video Limit ပြည့်ပါပြီ ({used}/{limit})။ Daily limit reset ဖြစ်ပြီးမှ ပြန်အသုံးပြုနိုင်ပါမယ်။"
+        )
+
+    return data
+
+
+def video_upload_quota_notice(video_value, vip_access_state):
+    """Show quota status as soon as the uploaded video becomes available."""
+    video_path = normalize_file_path(video_value)
+    if not video_path or not os.path.exists(video_path):
+        return ""
+
+    try:
+        data = verify_video_quota_available(vip_access_state)
+    except gr.Error as exc:
+        # A visible card remains on Step 1 even after the toast disappears.
+        raw_message = exc.args[0] if getattr(exc, "args", None) else str(exc)
+        message = (str(raw_message).replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;").replace("'", "&#39;").replace('"', '&quot;'))
+        gr.Warning(str(raw_message))
+        return (
+            "<div class='quota-precheck quota-stop'>"
+            "<b>🚫 Video Limit Check</b><span>" + message + "</span>"
+            "</div>"
+        )
+
+    limit = data.get("_quota_limit")
+    used = data.get("_quota_used", 0)
+    remaining = data.get("_quota_remaining")
+    if limit is None:
+        message = f"✅ Video upload ပြီးပါပြီ • Unlimited plan • ဒီနေ့ထုတ်ပြီး {used}"
+    else:
+        message = f"✅ Video upload ပြီးပါပြီ • ဒီနေ့ {used}/{limit} သုံးပြီး • ကျန် {remaining} Videos"
+
+    gr.Info(message)
+    return (
+        "<div class='quota-precheck quota-ok'>"
+        "<b>✅ Video Limit Check</b><span>" + message + "</span>"
+        "</div>"
+    )
+
+
 def consume_video_quota(vip_access_state):
     """Register one successful render on the admin server and reject over-limit delivery."""
     code = str((vip_access_state or {}).get("code", "")).strip().upper()
@@ -2403,6 +2498,8 @@ def create_app_legacy():
     .clone-panel{background:linear-gradient(145deg,#25153b8c,#0a1018dc)!important;border-color:#9b6cff52!important}
     .generate-summary,.download-note{background:#070b12d9!important;border-color:#26354c!important;color:#9eacc0!important}
     .clean-audio-badge{background:#56f2c70a!important;border-color:#56f2c738!important;color:#8affe0!important}
+    .quota-precheck{margin-top:10px;padding:11px 13px;border-radius:14px;display:flex;flex-direction:column;gap:4px;border:1px solid #ffffff16;background:#091018d9;font-size:11px;line-height:1.55}
+    .quota-precheck b{font-size:11px;letter-spacing:.02em}.quota-precheck span{color:#a7b5c8}.quota-ok{border-color:#56f2c73d;background:#56f2c709}.quota-ok b{color:#86efc9}.quota-stop{border-color:#ff6b8150;background:#ff4d6810}.quota-stop b{color:#ff93a3}.quota-stop span{color:#ffc1ca}
 
     /* Gradio form controls */
     .gradio-container input,.gradio-container textarea,.gradio-container select{
@@ -4003,15 +4100,27 @@ def _fmt_eta_seconds(seconds):
 
 
 def request_voice_engine_change(engine, voxcpm_confirmed=False):
-    """Require an explicit time-cost confirmation before selecting VoxCPM."""
+    """Require explicit confirmation before VoxCPM becomes the committed engine.
+
+    IMPORTANT: bind this handler with ``voice_engine.input(...)`` rather than
+    ``voice_engine.change(...)``.  ``change`` also fires for programmatic
+    updates, so rolling the radio back to Edge could immediately call this
+    handler a second time and hide the confirmation card before the user sees it.
+    """
     engine = str(engine or "")
     if "Voice Clone" in engine and not bool(voxcpm_confirmed):
-        # Keep Edge as the committed value until the user confirms VoxCPM.
+        # Toast + persistent confirmation card. Keep Edge as the actual selected
+        # engine until the user presses the VoxCPM confirmation button.
+        gr.Warning(
+            "မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။ "
+            "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။"
+        )
         return (
             gr.update(value="⚡ Edge TTS • Fast"),
             gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
             gr.update(visible=True), False,
         )
+
     is_clone = "Voice Clone" in engine
     return (
         gr.update(value=engine or "⚡ Edge TTS • Fast"),
@@ -4426,10 +4535,20 @@ def _restore_wizard_after_reconnect(saved_step):
     return _wizard_payload(step)
 
 
-def _wizard_after_upload(video_value):
+def _wizard_after_upload(video_value, vip_access_state):
     video_path = normalize_file_path(video_value)
     if not video_path or not os.path.exists(video_path):
         raise gr.Error("🎬 အရင်ဆုံး Video ကို upload လုပ်ပေးပါ။")
+
+    # Fresh quota check BEFORE any analysis / script / TTS work begins.
+    data = verify_video_quota_available(vip_access_state)
+    limit = data.get("_quota_limit")
+    used = data.get("_quota_used", 0)
+    remaining = data.get("_quota_remaining")
+    if limit is None:
+        gr.Info(f"✅ Video limit OK • Unlimited plan • ဒီနေ့ထုတ်ပြီး {used}")
+    else:
+        gr.Info(f"✅ Video limit OK • {used}/{limit} သုံးပြီး • ကျန် {remaining} Videos")
     return _wizard_payload(2)
 
 
@@ -4784,6 +4903,7 @@ def create_app():
                 gr.HTML("<div class='wizard-badge'>STEP 1 • SOURCE</div><div class='wizard-title'>🎬 Upload Movie</div><div class='wizard-copy'>Recap လုပ်မယ့် movie / clip ကိုအရင် upload လုပ်ပါ။ မူရင်း video duration ကို Auto mode မှာ final duration အဖြစ်ထိန်းထားပါတယ်။</div>")
                 video_input = gr.Video(label="Original Movie / Clip", sources=["upload"], elem_id="yf-video-upload")
                 gr.HTML("""<div id='yf-upload-progress-card'><div class='yf-up-head'><b class='yf-up-name'>📤 Video Uploading</b><strong class='yf-up-pct'>0%</strong></div><div class='yf-up-track'><i></i></div><div class='yf-up-meta'><span class='yf-up-size'>0 MB / 0 MB</span><span class='yf-up-eta'>တွက်ချက်နေသည်…</span></div></div>""")
+                video_quota_notice = gr.HTML("")
                 with gr.Row(elem_classes=["wiz-nav"]):
                     step1_next = gr.Button("NEXT  →", variant="primary", elem_classes=["wiz-next"])
 
@@ -4820,10 +4940,11 @@ def create_app():
                 voxcpm_confirmed = gr.State(False)
                 with gr.Column(visible=False, elem_classes=["vox-confirm-card"]) as voxcpm_confirm_panel:
                     gr.HTML(
-                        "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone သည် အချိန်ပိုကြာနိုင်ပါတယ်</div>"
-                        "<div class='vox-confirm-copy'>Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
-                        "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။ "
-                        "မြန်နှုန်းလိုပါက Edge TTS ကိုရွေးပါ။ ကိုယ့် reference အသံအတိုင်းလိုမှ VoxCPM ကို ဆက်သုံးပါ။</div>"
+                        "<div class='vox-confirm-title'>⏳ VoxCPM Voice Clone ကို ဆက်သုံးမလား?</div>"
+                        "<div class='vox-confirm-copy'><b>မြန်နှုန်းလိုရင် ⚡ Edge TTS • Fast ကိုရွေးပါ။</b><br>"
+                        "ကိုယ့်အသံအတိုင်း clone လိုရင် VoxCPM ကိုသုံးရပေမယ့် အချိန်ပိုကြာပါမယ်။ "
+                        "Reference အသံပုံစံကို AI နဲ့ပြန်တည်ဆောက်ရတာကြောင့် "
+                        "<b>4 မိနစ် video တစ်ပုဒ်မှာ 1–3 နာရီခန့်</b> ကြာနိုင်ပါတယ်။</div>"
                     )
                     with gr.Row(elem_classes=["vox-confirm-actions"]):
                         voxcpm_cancel_btn = gr.Button("⚡ Edge TTS သုံးမယ်", elem_classes=["vox-confirm-no"])
@@ -4955,8 +5076,18 @@ def create_app():
         vip_code_input.submit(unlock_vip, [vip_code_input], [vip_access_state, login_panel, main_panel, login_status, member_status_html])
         logout_btn.click(logout_vip, [], [vip_access_state, login_panel, main_panel, login_status, member_status_html, vip_code_input])
 
+        # Check today's video quota as soon as upload completes, then check again
+        # on NEXT so exhausted accounts can never enter the expensive workflow.
+        video_input.change(
+            video_upload_quota_notice,
+            inputs=[video_input, vip_access_state],
+            outputs=[video_quota_notice],
+            queue=False,
+            show_progress="hidden",
+        )
+
         # Wizard navigation.
-        step1_next.click(_wizard_after_upload, [video_input], wizard_outputs, queue=False, show_progress="hidden")
+        step1_next.click(_wizard_after_upload, [video_input, vip_access_state], wizard_outputs, queue=False, show_progress="hidden")
         step2_back.click(lambda: _wizard_payload(1), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step2_next.click(lambda: _wizard_payload(3), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step3_back.click(lambda: _wizard_payload(2), outputs=wizard_outputs, queue=False, show_progress="hidden")
@@ -4966,7 +5097,10 @@ def create_app():
         step5_back.click(lambda: _wizard_payload(4), outputs=wizard_outputs, queue=False, show_progress="hidden")
         step6_back.click(lambda: _wizard_payload(5), outputs=wizard_outputs, queue=False, show_progress="hidden")
 
-        voice_engine.change(
+        # Use .input (user action only), NOT .change. The handler deliberately
+        # rolls the radio back to Edge while the confirmation card is open;
+        # .change would fire again for that programmatic rollback and hide it.
+        voice_engine.input(
             request_voice_engine_change,
             [voice_engine, voxcpm_confirmed],
             [voice_engine, edge_voice_panel, voxcpm_clone_panel, voxcpm_quality_panel, voxcpm_confirm_panel, voxcpm_confirmed],
