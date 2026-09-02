@@ -4,7 +4,7 @@
 # ================================================================
 # Recommended Runtime: T4 GPU (Runtime > Change runtime type > T4 GPU)
 
-import os, sys, subprocess, importlib.util, shutil
+import os, sys, subprocess, importlib.util, shutil, math
 from importlib import metadata as importlib_metadata
 import threading
 import base64
@@ -13,7 +13,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.9.2 • GRADIO 6 FIX • ONE-RUN SETUP • STEADY VOICE"
+YF_BUILD = "V6.10.0 • FULL-LENGTH SCRIPT • SAFE VIDEO SPEED • STEADY VOICE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -3031,6 +3031,9 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
     # This renderer deliberately preserves the uploaded video's duration, so a
     # requested 3/5/10-minute setting cannot create a longer visual timeline.
     target_sec = min(_target_seconds(recap_length, source_duration), max(1.0, source_duration))
+    # The renderer reads this guard later. Mutating the session-scoped state is
+    # intentional and prevents a short AI response from collapsing a long clip.
+    analysis_state["target_recap_seconds"] = float(target_sec)
     progress(0.08, desc="✍️ Viral recap structure စီနေသည်...")
 
     # Keep prompt payload bounded while retaining chronology.
@@ -3054,16 +3057,38 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
     script_segments = []
     api_key = (user_api_key or "").strip()
     if api_key:
-        prompt = f"""
+        # Long scripts are unreliable in one model response. Generate roughly
+        # 40-second chronological chapters so a four-minute source receives a
+        # genuinely long script instead of a one-minute summary.
+        batch_count = max(1, min(len(selected), int(math.ceil(target_sec / 40.0))))
+        scene_batches = []
+        for batch_index in range(batch_count):
+            lo = int(round(batch_index * len(selected) / batch_count))
+            hi = int(round((batch_index + 1) * len(selected) / batch_count))
+            if hi > lo:
+                scene_batches.append(selected[lo:hi])
+
+        generated_batches = []
+        for batch_index, batch_scenes in enumerate(scene_batches, 1):
+            batch_target = target_sec / max(1, len(scene_batches))
+            batch_payload = [
+                {
+                    "scene": int(s["scene"]),
+                    "start": round(float(s["start"]), 2),
+                    "end": round(float(s["end"]), 2),
+                    "source": s["text"][:1300],
+                }
+                for s in batch_scenes
+            ]
+            prompt = f"""
 You are editing a Burmese viral movie recap.
-Create a coherent narrator script from the chronological SOURCE SCENES below.
+Create chapter {batch_index} of {len(scene_batches)} from the chronological SOURCE SCENES below.
 
 Narrative tone: {tone_style}
-Approximate final narration target: {int(target_sec)} seconds.
-Target spoken-script size: approximately {int(target_sec * 14.5)} Burmese visible characters overall.
-When the target is close to the source duration, preserve nearly all meaningful chronological events instead of aggressively summarizing.
-Write a detailed, connected narration that fills about 92–100% of the requested duration at a NORMAL,
-steady Burmese speaking pace. Prefer a fuller script over a short summary, while never adding unsupported facts.
+This chapter's narration target: {int(batch_target)} seconds.
+Write approximately {int(batch_target * 14.5)} Burmese visible characters for THIS CHAPTER.
+Cover nearly every meaningful event in this chapter. Do not compress it into a brief summary.
+Write detailed connected narration that fills 92–100% of the chapter duration at a NORMAL steady pace.
 
 CRITICAL STORY RULES:
 - Retell the story like a skilled Burmese YouTube/TikTok movie recap narrator.
@@ -3081,31 +3106,33 @@ Return VALID JSON ONLY in exactly this shape:
 No markdown and no extra keys.
 
 SOURCE SCENES:
-{json.dumps(payload, ensure_ascii=False)}
+{json.dumps(batch_payload, ensure_ascii=False)}
 """
-        try:
-            progress(0.25, desc="✨ Gemini က Viral Recap Script ရေးနေသည်...")
-            client = genai.Client(api_key=api_key)
-            response, selected_model = gemini_generate_auto(
-                client,
-                prompt,
-                system_instruction=SYSTEM_INSTRUCTION,
-                purpose="Viral recap script",
-            )
-            raw = (response.text or "").strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = json.loads(raw)
-            for item in parsed.get("segments", []):
-                text = str(item.get("text", "")).strip()
-                if not text:
-                    continue
-                st = max(0.0, float(item.get("start", 0.0)))
-                en = max(st + 0.35, float(item.get("end", st + 3.0)))
-                en = min(max(en, st + 0.35), source_duration if source_duration > 0 else en)
-                script_segments.append({"start": st, "end": en, "text": text})
-        except Exception as exc:
-            print("⚠️ V3 script Gemini fallback:", exc)
+            try:
+                progress(
+                    0.12 + 0.55 * (batch_index / max(1, len(scene_batches))),
+                    desc=f"✨ Script chapter {batch_index}/{len(scene_batches)} ရေးနေသည်..."
+                )
+                client = genai.Client(api_key=api_key)
+                response, selected_model = gemini_generate_auto(
+                    client, prompt, system_instruction=SYSTEM_INSTRUCTION,
+                    purpose=f"Viral recap chapter {batch_index}",
+                )
+                raw = (response.text or "").strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                parsed = json.loads(raw)
+                for item in parsed.get("segments", []):
+                    text = str(item.get("text", "")).strip()
+                    if not text:
+                        continue
+                    st = max(0.0, float(item.get("start", 0.0)))
+                    en = max(st + 0.35, float(item.get("end", st + 3.0)))
+                    en = min(max(en, st + 0.35), source_duration if source_duration > 0 else en)
+                    generated_batches.append({"start": st, "end": en, "text": text})
+            except Exception as exc:
+                print(f"⚠️ Script chapter {batch_index} failed:", exc)
+        script_segments.extend(generated_batches)
 
     if not script_segments:
         progress(0.35, desc="📝 Backup recap script ပြင်ဆင်နေသည်...")
@@ -3605,6 +3632,20 @@ def render_reviewed_script_v3(
     source_segments = successful_source_segments
 
     narration_duration = max(0.5, sum(voice_durations))
+    requested_duration = min(
+        source_duration,
+        max(1.0, float(analysis_state.get("target_recap_seconds", source_duration)))
+    )
+    # Hard safety rule: an automatic/full-length recap may keep narration at a
+    # natural pace, but it may not collapse below 90% of its chosen target.
+    # Example: 4:30 source -> minimum 4:03 final output.
+    minimum_output_duration = requested_duration * 0.90
+    final_output_duration = min(
+        source_duration,
+        max(narration_duration, minimum_output_duration)
+    )
+    duration_scale = final_output_duration / max(narration_duration, 0.5)
+    render_video_durations = [d * duration_scale for d in voice_durations]
     merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
     build_continuous_narration_track(voice_files, merged_voice)
 
@@ -3615,7 +3656,7 @@ def render_reviewed_script_v3(
     progress(0.45, desc="🎙️ Narration-only audio ပြင်နေသည်...")
     final_audio = mix_story_audio_full_duration(
         merged_voice, video_path, bgm_path, narration_volume, original_volume,
-        bgm_volume, auto_duck_bgm, narration_duration,
+        bgm_volume, auto_duck_bgm, final_output_duration,
         os.path.join(work_dir, "final_mix_full_duration.m4a")
     )
 
@@ -3640,7 +3681,7 @@ def render_reviewed_script_v3(
     input_args += ["-i", final_audio]
 
     graph = build_story_video_filter_graph(
-        source_segments, voice_durations, target_w, target_h, render_fps, narration_duration,
+        source_segments, render_video_durations, target_w, target_h, render_fps, final_output_duration,
         background_fill, enable_zoom, zoom_level, mirror_flip, filter_color,
         blur_y_percent, blur_height_percent, blur_strength, ass_path, logo_idx,
         subtitle_font_style
@@ -3651,20 +3692,20 @@ def render_reviewed_script_v3(
     base = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *input_args,
         "-filter_complex_script", graph_path, "-map", "[vout]", "-map", f"{audio_idx}:a:0",
-        "-t", f"{narration_duration:.3f}", "-r", str(render_fps), "-pix_fmt", "yuv420p",
+        "-t", f"{final_output_duration:.3f}", "-r", str(render_fps), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
     ]
     if HAS_NVENC:
         cmd = base + ["-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23", "-b:v", "0", out_video]
         try:
-            run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "⚡ GPU Story Render")
+            run_ffmpeg_with_progress(cmd, final_output_duration, progress, 0.60, 0.97, "⚡ GPU Story Render")
         except Exception as exc:
             print("⚠️ NVENC fallback:", exc)
             cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
-            run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
+            run_ffmpeg_with_progress(cmd, final_output_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
     else:
         cmd = base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out_video]
-        run_ffmpeg_with_progress(cmd, narration_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
+        run_ffmpeg_with_progress(cmd, final_output_duration, progress, 0.60, 0.97, "🚀 CPU Story Render")
 
     if not os.path.exists(out_video):
         raise RuntimeError("Final MP4 was not created.")
@@ -3677,7 +3718,7 @@ def render_reviewed_script_v3(
     progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
     return (
         published_video, srt_path, narration_mp3, script_path,
-        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(narration_duration)}** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **90%** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
     )
 
 
