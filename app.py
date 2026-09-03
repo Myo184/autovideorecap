@@ -4,7 +4,7 @@
 # ================================================================
 # Recommended Runtime: T4 GPU (Runtime > Change runtime type > T4 GPU)
 
-import os, sys, subprocess, importlib.util, shutil, math
+import os, sys, subprocess, importlib.util, shutil, math, gc, html
 from importlib import metadata as importlib_metadata
 import threading
 import base64
@@ -14,7 +14,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.11.1 • TRUE SCENE SYNC • VOXCPM CLONE FIX • BACKGROUND GEMINI"
+YF_BUILD = "V6.12.0 • FULL ERROR REPAIR • SAFE SYNC • RESILIENT GEMINI + VOXCPM"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -182,7 +182,24 @@ def verify_locked_imports():
                if not _module_is_available(module)]
     if missing:
         raise RuntimeError("Locked package import check failed: " + ", ".join(missing))
-    print("✅ Locked package import check passed")
+    # find_spec only proves that package files exist. Import in a fresh Python
+    # process as well so NumPy/OpenCV/SoundFile ABI errors are caught here,
+    # before the app spends time loading Whisper or opening a public tunnel.
+    import_code = (
+        "import importlib; "
+        f"mods={list(LOCKED_IMPORTS.values())!r}; "
+        "[importlib.import_module(m) for m in mods]; print('ok')"
+    )
+    check = subprocess.run(
+        [sys.executable, "-c", import_code],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+    )
+    if check.returncode != 0:
+        raise RuntimeError(
+            "Locked package real-import check failed. Restart the Colab runtime once "
+            "and run again. Details:\n" + (check.stdout or "Unknown import error")[-4000:]
+        )
+    print("✅ Locked package real-import check passed")
 
 
 def verify_torch_audio_pair():
@@ -200,6 +217,15 @@ def verify_torch_audio_pair():
         raise RuntimeError(
             f"Torch/Torchaudio mismatch: torch={torch_version}, "
             f"torchaudio={final_audio_version or 'missing'}"
+        )
+    actual = subprocess.run(
+        [sys.executable, "-c", "import torch,torchaudio; print(torch.__version__); print(torchaudio.__version__)"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+    )
+    if actual.returncode != 0:
+        raise RuntimeError(
+            "Torch/Torchaudio files exist but cannot load together. Select a fresh T4 "
+            "runtime and run again. Details:\n" + (actual.stdout or "Unknown audio import error")[-2500:]
         )
     print(f"✅ CUDA audio pair: torch {torch_version} / torchaudio {final_audio_version}")
 
@@ -274,6 +300,9 @@ GEMINI_FLASH_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
 GEMINI_LAST_SELECTED_MODEL = None
 SYSTEM_INSTRUCTION = (
@@ -376,7 +405,16 @@ def _safe_extract_premium_fonts(zip_path):
     os.makedirs(PREMIUM_FONT_DIR, exist_ok=True)
     registered = []
     with zipfile.ZipFile(src) as archive:
-        for info in archive.infolist():
+        font_entries = [
+            info for info in archive.infolist()
+            if not info.is_dir() and os.path.splitext(info.filename)[1].lower() in (".ttf", ".otf")
+        ]
+        total_uncompressed = sum(max(0, int(info.file_size)) for info in font_entries)
+        if len(font_entries) > 200:
+            raise ValueError("Font ZIP ထဲမှာ fonts 200 ခုထက်ပိုနေပါတယ်။")
+        if total_uncompressed > 150 * 1024 * 1024:
+            raise ValueError("Font ZIP ဖြည်ပြီးအရွယ်အစား 150 MB ကျော်နေပါတယ်။")
+        for info in font_entries:
             if info.is_dir():
                 continue
             archive_name = info.filename.replace("\\", "/")
@@ -500,6 +538,9 @@ def install_uploaded_subtitle_fonts(files, selected_style):
         if ext not in (".ttf", ".otf"):
             failed.append(os.path.basename(src))
             continue
+        if os.path.getsize(src) > 25 * 1024 * 1024:
+            failed.append(os.path.basename(src) + " (over 25 MB)")
+            continue
 
         style = _font_style_from_filename(src)
         if not style:
@@ -527,9 +568,9 @@ def install_uploaded_subtitle_fonts(files, selected_style):
 
     parts = []
     if installed:
-        parts.append("✅ Installed: <b>" + ", ".join(dict.fromkeys(installed)) + "</b>")
+        parts.append("✅ Installed: <b>" + ", ".join(html.escape(str(x)) for x in dict.fromkeys(installed)) + "</b>")
     if failed:
-        parts.append("❌ Failed: " + ", ".join(failed))
+        parts.append("❌ Failed: " + ", ".join(html.escape(str(x)) for x in failed))
     msg = "<div class='font-ok'>" + "<br>".join(parts or ["Font upload completed."]) + "</div>"
     return (
         msg,
@@ -599,7 +640,7 @@ def subtitle_font_preview_html(font_style):
     font_rule = ""
     preview_family = '"Noto Sans Myanmar", sans-serif'
     actual = False
-    if path and os.path.isfile(path):
+    if path and os.path.isfile(path) and os.path.getsize(path) <= 6 * 1024 * 1024:
         try:
             with open(path, "rb") as font_file:
                 encoded = base64.b64encode(font_file.read()).decode("ascii")
@@ -784,6 +825,31 @@ def split_subtitle_display_chunks(text, min_chars=25, max_chars=35):
             chunks.pop()
 
     return [c for c in chunks if c]
+
+
+def compact_narration_for_slot(text, slot_seconds, chars_per_second=10.5):
+    """Bound narration before TTS so scene fitting never needs extreme speed."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    max_visible = max(24, int(max(0.5, float(slot_seconds)) * float(chars_per_second)))
+    if _subtitle_visual_len(clean) <= max_visible:
+        return clean
+    words = clean.split()
+    kept = []
+    for word in words:
+        proposal = " ".join(kept + [word])
+        if kept and _subtitle_visual_len(proposal) > max_visible:
+            break
+        kept.append(word)
+    shortened = " ".join(kept).strip()
+    if not shortened:
+        clusters = segment_myanmar_syllables(clean)
+        shortened = ""
+        for cluster in clusters:
+            if shortened and _subtitle_visual_len(shortened + cluster) > max_visible:
+                break
+            shortened += cluster
+    shortened = shortened.rstrip("၊။,.!?;:…—–- ")
+    return (shortened + "။") if shortened else clean
 
 
 def read_video_middle_frame(cap):
@@ -1051,7 +1117,7 @@ def gemini_generate_auto(client, contents, system_instruction=None, purpose="Gem
     Gemini 3 Flash models no longer accept some legacy sampling parameters.
     """
     global GEMINI_LAST_SELECTED_MODEL
-    candidates = list(GEMINI_FLASH_MODELS)
+    candidates = []
 
     # Prefer models the current API key actually exposes.  If listing fails,
     # simply use the known stable candidate order.
@@ -1061,13 +1127,24 @@ def gemini_generate_auto(client, contents, system_instruction=None, purpose="Gem
             model_name = _normalize_gemini_model_name(getattr(m, "name", ""))
             if model_name:
                 available.add(model_name)
-        visible = [m for m in candidates if m in available]
-        if visible:
-            candidates = visible
+        known_visible = [m for m in GEMINI_FLASH_MODELS if m in available]
+        discovered_flash = sorted(
+            m for m in available
+            if "flash" in m.lower()
+            and not any(blocked in m.lower() for blocked in ("embedding", "image", "live", "tts", "audio"))
+            and m not in known_visible
+        )
+        candidates = known_visible + discovered_flash
     except Exception as list_exc:
         print(f"ℹ️ Gemini model listing unavailable; using fallback list: {list_exc}")
 
-    if max_attempts is not None:
+    if not candidates:
+        candidates = list(GEMINI_FLASH_MODELS)
+    if GEMINI_LAST_SELECTED_MODEL in candidates:
+        candidates.remove(GEMINI_LAST_SELECTED_MODEL)
+        candidates.insert(0, GEMINI_LAST_SELECTED_MODEL)
+
+    if max_attempts is not None and int(max_attempts) > 0:
         candidates = candidates[:max(1, int(max_attempts))]
 
     last_error = None
@@ -1162,7 +1239,7 @@ Chronological subtitle JSON:
             prompt,
             system_instruction=SYSTEM_INSTRUCTION,
             purpose="Recap translation",
-            max_attempts=2,
+            max_attempts=6,
         )
         res_text = (response.text or "").strip()
         res_text = re.sub(r"^```(?:json)?\s*", "", res_text)
@@ -1318,6 +1395,22 @@ def normalize_clone_reference(reference_value, work_dir, max_seconds=15):
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if proc.returncode != 0 or not os.path.exists(dst):
         raise gr.Error("Reference audio ပြင်ဆင်၍ မရပါ: " + (proc.stderr or "Unknown FFmpeg error"))
+    try:
+        samples, _sample_rate = sf.read(dst, dtype="float32", always_2d=False)
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+        duration = probe_duration(dst, fallback=0.0)
+        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        clipped = float(np.mean(np.abs(samples) >= 0.995)) if samples.size else 1.0
+        if duration < 3.0:
+            raise gr.Error("Reference Voice က 3 seconds မပြည့်ပါ။ 5–15 seconds ကြည်လင်သောအသံသုံးပါ။")
+        if rms < 0.003:
+            raise gr.Error("Reference Voice အသံတိုးလွန်းခြင်း သို့မဟုတ် silence ဖြစ်နေပါတယ်။")
+        if clipped > 0.08:
+            raise gr.Error("Reference Voice clipping များလွန်းပါတယ်။ အသံမကွဲတဲ့ reference ကိုပြန်တင်ပါ။")
+    except gr.Error:
+        raise
+    except Exception as exc:
+        raise gr.Error(f"Reference Voice quality ကိုစစ်၍မရပါ: {exc}") from exc
     return dst
 
 
@@ -1402,34 +1495,69 @@ def generate_voxcpm_audio(
         if full_desc:
             kwargs["text"] = f"({full_desc}){clean_text}"
 
-    # VoxCPM has changed its generate/_generate keyword list across releases.
-    # Call it defensively: when the installed build rejects a keyword, remove
-    # only that unsupported keyword and retry instead of aborting the recap.
-    generate_kwargs = dict(kwargs)
+    # VoxCPM return types and keyword support differ across releases. Handle
+    # Tensor/array/tuple/dict output, remove only unsupported kwargs, and retry
+    # once after CUDA cleanup for transient allocation failures.
+    last_error = None
     removed_compat_args = []
-    for _compat_try in range(8):
+    wav_result = None
+    for runtime_try in range(2):
+        generate_kwargs = dict(kwargs)
         try:
-            wav = model.generate(**generate_kwargs)
-            break
-        except TypeError as exc:
-            msg = str(exc)
-            match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
-            if not match:
-                raise
-            bad_arg = match.group(1)
-            if bad_arg not in generate_kwargs:
-                raise
-            generate_kwargs.pop(bad_arg, None)
-            removed_compat_args.append(bad_arg)
-            print(f"⚙️ VoxCPM compatibility: '{bad_arg}' is unsupported by this installed version; retrying without it.")
-    else:
-        raise RuntimeError("VoxCPM generate compatibility retry limit reached")
+            for _compat_try in range(8):
+                try:
+                    wav_result = model.generate(**generate_kwargs)
+                    break
+                except TypeError as exc:
+                    msg = str(exc)
+                    match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                    if not match:
+                        raise
+                    bad_arg = match.group(1)
+                    if bad_arg not in generate_kwargs:
+                        raise
+                    generate_kwargs.pop(bad_arg, None)
+                    removed_compat_args.append(bad_arg)
+                    print(f"⚙️ VoxCPM compatibility: removing unsupported '{bad_arg}' and retrying.")
+            else:
+                raise RuntimeError("VoxCPM generate compatibility retry limit reached")
+            if wav_result is not None:
+                break
+        except Exception as exc:
+            last_error = exc
+            if runtime_try == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                time.sleep(1.0)
+                print(f"⚠️ VoxCPM transient failure; retrying once: {exc}")
+            else:
+                raise RuntimeError(f"VoxCPM generation failed after retry: {exc}") from exc
 
+    if wav_result is None:
+        raise RuntimeError(f"VoxCPM returned no waveform: {last_error}")
+    sample_rate = int(getattr(getattr(model, "tts_model", None), "sample_rate", 48000))
+    if isinstance(wav_result, dict):
+        sample_rate = int(wav_result.get("sample_rate", wav_result.get("sampling_rate", sample_rate)))
+        wav_result = next((wav_result[k] for k in ("audio", "wav", "waveform") if k in wav_result), None)
+    elif isinstance(wav_result, (tuple, list)) and len(wav_result) == 2 and np.isscalar(wav_result[1]):
+        wav_result, sample_rate = wav_result[0], int(wav_result[1])
+    if wav_result is None:
+        raise RuntimeError("VoxCPM response did not contain an audio waveform")
+    if hasattr(wav_result, "detach"):
+        wav_result = wav_result.detach().float().cpu().numpy()
+    waveform = np.asarray(wav_result, dtype=np.float32).squeeze()
+    if waveform.ndim == 2:
+        waveform = waveform.mean(axis=0 if waveform.shape[0] <= 2 else 1)
+    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if waveform.size < 100 or not np.all(np.isfinite(waveform)):
+        raise RuntimeError("VoxCPM returned an empty or invalid waveform")
+    peak = float(np.max(np.abs(waveform)))
+    if peak > 1.0:
+        waveform = waveform / peak * 0.98
     if removed_compat_args:
-        print("✅ VoxCPM compatibility mode active; removed unsupported args:", ", ".join(removed_compat_args))
-
-    sample_rate = int(getattr(model.tts_model, "sample_rate", 48000))
-    sf.write(filename, np.asarray(wav, dtype=np.float32), sample_rate)
+        print("✅ VoxCPM compatibility mode:", ", ".join(dict.fromkeys(removed_compat_args)))
+    sf.write(filename, waveform, sample_rate)
     return filename
 
 
@@ -2133,13 +2261,17 @@ def _member_quota_html(data):
         limit = int(limit)
         remaining = max(0, int(remaining if remaining is not None else limit - used))
         quota = f"ဒီနေ့ထုတ်ပြီး {used}/{limit} · ကျန် {remaining} Videos"
+    safe_expiry = html.escape(str(data.get('expiry', '')))
+    safe_label = html.escape(str(data.get('label', 'VIP Member')))
+    safe_role = html.escape(str(data.get('role', 'vip')).upper())
+    safe_quota = html.escape(quota)
     return f"""
     <div class="member-strip">
         <div>
-            <div class="member-small">ACCESS GRANTED ({data.get('expiry', '')} အထိ)</div>
-            <div class="member-name">👑 {data.get('label', 'VIP Member')} ({str(data.get('role', 'vip')).upper()})</div>
+            <div class="member-small">ACCESS GRANTED ({safe_expiry} အထိ)</div>
+            <div class="member-name">👑 {safe_label} ({safe_role})</div>
         </div>
-        <div class="quota-badge">{quota}</div>
+        <div class="quota-badge">{safe_quota}</div>
     </div>
     """
 
@@ -2150,7 +2282,7 @@ def refresh_member_quota(vip_access_state):
     try:
         client = Client(HF_SPACE_ID, token=HF_TOKEN or None, verbose=False)
         data = _vip_api_dict(client.predict(vip_access_state.get("code", ""), api_name="/verify"))
-        return _member_quota_html(data) if data.get("valid") else f"<div class='login-error'>{data.get('msg', 'VIP status error')}</div>"
+        return _member_quota_html(data) if data.get("valid") else f"<div class='login-error'>{html.escape(str(data.get('msg', 'VIP status error')))}</div>"
     except Exception as exc:
         print(f"[VIP QUOTA REFRESH ERROR] {type(exc).__name__}: {exc}")
         return _member_quota_html(vip_access_state)
@@ -2244,7 +2376,7 @@ def unlock_vip(vip_code):
                 {"authenticated": False},
                 gr.update(visible=True),
                 gr.update(visible=False),
-                f"<div class='login-error'>{msg}</div>",
+                f"<div class='login-error'>{html.escape(str(msg))}</div>",
                 ""
             )
 
@@ -3016,7 +3148,7 @@ Rules:
             client, contents,
             system_instruction="Analyze video frames faithfully. Never invent unseen story facts.",
             purpose="Visual movie analysis",
-            max_attempts=2,
+            max_attempts=6,
         )
         raw = (response.text or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -3046,15 +3178,22 @@ Rules:
 
 
 def _combine_audio_and_visual_scenes(audio_scenes, visual_scenes):
-    """Use visual context for every scene and attach overlapping dialogue when present."""
+    """Merge both sources without dropping speech outside Gemini windows."""
     if not visual_scenes:
         return audio_scenes
     combined = []
+    audio_coverage = [0.0 for _ in audio_scenes]
     for visual in visual_scenes:
         spoken = []
-        for audio in audio_scenes:
-            if float(audio["end"]) > float(visual["start"]) and float(audio["start"]) < float(visual["end"]):
+        for audio_index, audio in enumerate(audio_scenes):
+            overlap = max(
+                0.0,
+                min(float(audio["end"]), float(visual["end"]))
+                - max(float(audio["start"]), float(visual["start"])),
+            )
+            if overlap > 0:
                 spoken.append((audio.get("text") or "").strip())
+                audio_coverage[audio_index] += overlap
         visual_text = (visual.get("text") or "").strip()
         dialogue = " ".join(x for x in spoken if x)
         text = f"Visual: {visual_text}"
@@ -3066,6 +3205,23 @@ def _combine_audio_and_visual_scenes(audio_scenes, visual_scenes):
             "end": float(visual["end"]),
             "text": text,
         })
+
+    # Preserve dialogue scenes that Gemini's sparse visual frames did not
+    # meaningfully cover. Previously these were silently deleted as soon as
+    # any visual result existed.
+    for index, audio in enumerate(audio_scenes):
+        audio_duration = max(0.01, float(audio["end"]) - float(audio["start"]))
+        if audio_coverage[index] / audio_duration < 0.50:
+            combined.append({
+                "scene": 0,
+                "start": float(audio["start"]),
+                "end": float(audio["end"]),
+                "text": "Dialogue heard: " + (audio.get("text") or "").strip(),
+            })
+
+    combined.sort(key=lambda s: (float(s["start"]), float(s["end"])))
+    for index, scene in enumerate(combined, 1):
+        scene["scene"] = index
     return combined
 
 
@@ -3259,7 +3415,7 @@ SOURCE SCENES:
                 response, selected_model = gemini_generate_auto(
                     client, prompt, system_instruction=SYSTEM_INSTRUCTION,
                     purpose=f"Viral recap chapter {batch_index}",
-                    max_attempts=2,
+                    max_attempts=6,
                 )
                 raw = (response.text or "").strip()
                 raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -3289,6 +3445,25 @@ SOURCE SCENES:
                     generated_batches.append({"start": st, "end": en, "text": text})
             except Exception as exc:
                 print(f"⚠️ Script chapter {batch_index} failed:", exc)
+                # Recover this chapter immediately instead of returning a
+                # shorter recap with a missing middle/end. The backup keeps
+                # the exact source timestamps and chronological content.
+                backup_items = [
+                    {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+                    for s in batch_scenes
+                ]
+                recovered = translate_segments_batch(
+                    backup_items, "", source_lang=analysis_state.get("language", "en"),
+                    tone_style=tone_style,
+                )
+                for recovered_item in recovered:
+                    recovered_text = (recovered_item.get("mm_text") or recovered_item.get("text") or "").strip()
+                    if recovered_text:
+                        generated_batches.append({
+                            "start": float(recovered_item["start"]),
+                            "end": float(recovered_item["end"]),
+                            "text": recovered_text,
+                        })
         script_segments.extend(generated_batches)
 
     if not script_segments:
@@ -3384,10 +3559,25 @@ def expand_scene_windows_to_full_video(segments, source_duration):
     if not items:
         return []
     duration = max(0.5, float(source_duration or 0.5))
+    maximum_items = max(1, int(duration / 0.25))
+    if len(items) > maximum_items:
+        merged = []
+        for group_index in range(maximum_items):
+            lo = int(group_index * len(items) / maximum_items)
+            hi = int((group_index + 1) * len(items) / maximum_items)
+            group = items[lo:max(lo + 1, hi)]
+            merged.append({
+                "start": float(group[0]["start"]), "end": float(group[-1]["end"]),
+                "text": " ".join(str(x.get("text", "")).strip() for x in group).strip(),
+            })
+        items = merged
+    min_window = min(0.25, duration / max(1, len(items)))
     boundaries = [0.0]
-    for left, right in zip(items, items[1:]):
+    for idx, (left, right) in enumerate(zip(items, items[1:]), 1):
         gap_mid = (float(left["end"]) + float(right["start"])) / 2.0
-        boundary = max(boundaries[-1] + 0.05, min(gap_mid, duration - 0.05))
+        lower = boundaries[-1] + min_window
+        upper = duration - min_window * (len(items) - idx)
+        boundary = max(lower, min(gap_mid, upper))
         boundaries.append(boundary)
     boundaries.append(duration)
     expanded = []
@@ -3396,6 +3586,34 @@ def expand_scene_windows_to_full_video(segments, source_duration):
         end = min(duration, max(start + 0.05, boundaries[idx + 1]))
         expanded.append({"start": start, "end": end, "text": item["text"]})
     return expanded
+
+
+def allocate_scene_output_durations(source_spans, voice_durations, target_duration, preferred_max_tempo=1.18):
+    """Give speech-heavy scenes more time, without exceeding real footage."""
+    capacities = np.asarray([max(0.05, float(x)) for x in source_spans], dtype=float)
+    voices = np.asarray([max(0.05, float(x)) for x in voice_durations], dtype=float)
+    if capacities.size == 0 or capacities.size != voices.size:
+        return []
+    target = min(float(capacities.sum()), max(0.05, float(target_duration)))
+    slots = capacities * (target / max(0.05, float(capacities.sum())))
+    desired = np.minimum(capacities, voices / max(1.0, float(preferred_max_tempo)))
+    for _ in range(4):
+        need = np.maximum(0.0, desired - slots)
+        donors = np.maximum(0.0, slots - desired)
+        transferable = min(float(need.sum()), float(donors.sum()))
+        if transferable <= 1e-6:
+            break
+        slots += need * (transferable / max(1e-8, float(need.sum())))
+        slots -= donors * (transferable / max(1e-8, float(donors.sum())))
+    delta = target - float(slots.sum())
+    room = capacities - slots if delta > 0 else slots - 0.05
+    for idx in np.where(room > 1e-8)[0]:
+        change = min(abs(delta), float(room[idx]))
+        slots[idx] += change if delta > 0 else -change
+        delta += -change if delta > 0 else change
+        if abs(delta) <= 1e-7:
+            break
+    return [max(0.05, float(x)) for x in slots]
 
 
 def _coalesce_voxcpm_segments(segments, source_duration):
@@ -3770,6 +3988,7 @@ def render_reviewed_script_v3(
         if not clone_reference_path or not os.path.exists(clone_reference_path):
             raise gr.Error("🎙️ Reference MP3/WAV upload လုပ်ပါ။")
 
+    cleanup_stale_runtime_files()
     work_dir = tempfile.mkdtemp(prefix=f"yf_v3_{str(session_id)[:8]}_")
     voice_files, subtitle_segments, voice_durations, successful_source_segments = [], [], [], []
     source_duration = max(0.5, float(analysis_state.get("duration", 0.0) or 0.0))
@@ -3790,6 +4009,12 @@ def render_reviewed_script_v3(
                 f"⚡ VoxCPM short-clip optimization: {original_tts_calls} narration calls "
                 f"→ {len(script_segments)} (all script text preserved)"
             )
+    # Allocate the complete source timeline before synthesis, then keep each
+    # spoken line within a natural amount of text for its real visual window.
+    script_segments = expand_scene_windows_to_full_video(script_segments, source_duration)
+    for segment in script_segments:
+        slot_seconds = max(0.35, float(segment["end"]) - float(segment["start"]))
+        segment["text"] = compact_narration_for_slot(segment["text"], slot_seconds)
     total = len(script_segments)
 
     total_started_at = time.time()
@@ -3880,11 +4105,9 @@ def render_reviewed_script_v3(
 
     if not voice_files:
         raise gr.Error("Voice narration ထုတ်မရပါ။")
-    # Ensure source list matches exactly the voice clips that succeeded, then
-    # extend neighbouring scene windows across unused source gaps.  Their total
-    # source footage now equals the original video duration.
+    # Successful segments already cover the full source timeline.
     source_segments = successful_source_segments
-    render_source_segments = expand_scene_windows_to_full_video(source_segments, source_duration)
+    render_source_segments = source_segments
 
     narration_duration = max(0.5, sum(voice_durations))
     requested_duration = min(
@@ -3904,14 +4127,18 @@ def render_reviewed_script_v3(
     )
     source_spans = [max(0.05, s["end"] - s["start"]) for s in render_source_segments]
     span_total = max(0.05, sum(source_spans))
-    render_video_durations = [final_output_duration * span / span_total for span in source_spans]
+    render_video_durations = allocate_scene_output_durations(
+        source_spans, voice_durations, final_output_duration, preferred_max_tempo=1.18
+    )
 
     # Keep normal speech whenever it fits.  Only an objectively overlong line
     # is tempo-fitted to its own scene slot; this is the last-resort guard that
     # prevents overlap, cut-off narration and later-scene drift.
     timeline_voice_files, timeline_voice_durations = [], []
+    max_voice_tempo = 1.0
     for idx, (audio_path, voice_dur, slot_dur) in enumerate(zip(voice_files, voice_durations, render_video_durations)):
         if voice_dur > slot_dur + 0.04:
+            max_voice_tempo = max(max_voice_tempo, voice_dur / max(0.05, slot_dur))
             fitted_path = os.path.join(work_dir, f"voice_sync_{idx:03d}.wav")
             fit_narration_clip_to_slot(audio_path, slot_dur, fitted_path)
             timeline_voice_files.append(fitted_path)
@@ -3936,15 +4163,16 @@ def render_reviewed_script_v3(
         chunk_cursor = output_cursor
         spoken_end = output_cursor + voice_dur
         for chunk_index, chunk in enumerate(display_chunks):
-            remaining = max(0.05, spoken_end - chunk_cursor)
+            if chunk_cursor >= spoken_end - 0.04:
+                break
             if chunk_index == len(display_chunks) - 1:
                 chunk_end = spoken_end
             else:
                 chunk_end = min(spoken_end, chunk_cursor + max(0.25, voice_dur * len(chunk) / total_chars))
-            subtitle_segments.append({"start": chunk_cursor, "end": max(chunk_cursor + 0.05, chunk_end), "text": chunk})
-            chunk_cursor = min(spoken_end, chunk_end)
-            if remaining <= 0.05:
-                break
+            chunk_end = min(spoken_end, output_cursor + slot_dur, max(chunk_cursor + 0.04, chunk_end))
+            if chunk_end > chunk_cursor:
+                subtitle_segments.append({"start": chunk_cursor, "end": chunk_end, "text": chunk})
+            chunk_cursor = chunk_end
         output_cursor += slot_dur
 
     merged_voice = os.path.join(work_dir, "YF_Recap_Narration.m4a")
@@ -3971,7 +4199,11 @@ def render_reviewed_script_v3(
     srt_path = write_srt_file(subtitle_segments, os.path.join(work_dir, "YF_Recap_Subtitles.srt"))
     script_path = os.path.join(work_dir, "YF_Recap_Script.txt")
     with open(script_path, "w", encoding="utf-8") as f:
-        f.write(script_editor.strip() + "\n")
+        actual_lines = [
+            f"#{i:03d} [{seg['start']:.2f} --> {seg['end']:.2f}] | {seg['text']}"
+            for i, seg in enumerate(output_timeline, 1)
+        ]
+        f.write("\n".join(actual_lines).strip() + "\n")
 
     progress(0.58, desc=f"⚡ Scene-aligned Fast Render — {RENDER_ENGINE_LABEL}")
     input_args = ["-i", video_path]
@@ -4015,13 +4247,16 @@ def render_reviewed_script_v3(
 
     # Publish to a stable output path.  The preview and the dedicated download
     # button both point to this exact file instead of a temporary work file.
-    published_video = publish_final_video_for_download(out_video, session_id)
+    published_video, published_srt, published_mp3, published_script = publish_recap_artifacts(
+        out_video, srt_path, narration_mp3, script_path, session_id
+    )
+    shutil.rmtree(work_dir, ignore_errors=True)
 
     total_elapsed = time.time() - total_started_at
     progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
     return (
-        published_video, srt_path, narration_mp3, script_path,
-        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **93%** • Voice pace: **Normal (steady)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+        published_video, published_srt, published_mp3, published_script,
+        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **93%** • Voice timing: **Natural-first (max fit {max_voice_tempo:.2f}x)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
     )
 
 
@@ -4035,15 +4270,57 @@ YF_OUTPUT_DIR = os.getenv(
 os.makedirs(YF_OUTPUT_DIR, exist_ok=True)
 
 
+def cleanup_stale_runtime_files(temp_max_age_hours=6, output_max_age_hours=48):
+    """Bound Colab disk use without touching active/recent renders."""
+    now = time.time()
+    temp_cutoff = now - max(1, float(temp_max_age_hours)) * 3600
+    output_cutoff = now - max(6, float(output_max_age_hours)) * 3600
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "yf_v3_*")):
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < temp_cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+    try:
+        for name in os.listdir(YF_OUTPUT_DIR):
+            path = os.path.join(YF_OUTPUT_DIR, name)
+            if os.path.isfile(path) and os.path.getmtime(path) < output_cutoff:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+def publish_recap_artifacts(video_path, srt_path, mp3_path, script_path, session_id):
+    """Atomically publish every downloadable result before deleting temp files."""
+    safe_session = re.sub(r"[^A-Za-z0-9_-]+", "", str(session_id or "session"))[:32] or "session"
+    sources = [video_path, srt_path, mp3_path, script_path]
+    names = [
+        f"YF_Recap_Final_{safe_session}.mp4",
+        f"YF_Recap_Subtitles_{safe_session}.srt",
+        f"YF_Recap_Narration_{safe_session}.mp3",
+        f"YF_Recap_Script_{safe_session}.txt",
+    ]
+    destinations = []
+    for source, name in zip(sources, names):
+        if not source or not os.path.isfile(source) or os.path.getsize(source) <= 0:
+            raise RuntimeError(f"Output artifact missing before publish: {name}")
+        destination = os.path.join(YF_OUTPUT_DIR, name)
+        temporary = destination + ".part"
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+        destinations.append(destination)
+    return tuple(destinations)
+
+
 def publish_final_video_for_download(source_path, session_id):
     """Copy the rendered MP4 to a stable path served by Gradio's direct file endpoint."""
     if not source_path or not os.path.exists(source_path):
         raise RuntimeError("Rendered video file is missing before publish.")
     safe_session = re.sub(r"[^A-Za-z0-9_-]+", "", str(session_id or "session"))[:32] or "session"
     destination = os.path.join(YF_OUTPUT_DIR, f"YF_Recap_Final_{safe_session}.mp4")
-    tmp_destination = destination + ".part"
-    shutil.copy2(source_path, tmp_destination)
-    os.replace(tmp_destination, destination)
+    temporary = destination + ".part"
+    shutil.copy2(source_path, temporary)
+    os.replace(temporary, destination)
     return destination
 
 
@@ -4242,6 +4519,7 @@ PROCESS_STATUS = {}
 PROCESS_STATUS_LOCK = threading.Lock()
 PRECOMPUTE_CACHE = {}
 PRECOMPUTE_CACHE_LOCK = threading.Lock()
+PRECOMPUTE_CACHE_TTL_SECONDS = 3 * 60 * 60
 
 
 def _precompute_signature(video_value, user_api_key, tone_style, recap_length):
@@ -4274,6 +4552,8 @@ def precompute_recap_in_background(
 ):
     """Analyze and write the script while the user chooses later settings."""
     api_key = str(user_api_key or "").strip()
+    sid = str(session_id or "default")
+    signature = ""
     if not api_key:
         return "<div class='precompute-card waiting'>Gemini Key ထည့်ပြီးမှ background script စတင်နိုင်ပါတယ်။</div>"
     try:
@@ -4281,11 +4561,19 @@ def precompute_recap_in_background(
         signature = _precompute_signature(video_value, api_key, tone_style, recap_length)
         if not signature:
             raise ValueError("Video file မတွေ့ပါ။")
-        sid = str(session_id or "default")
         with PRECOMPUTE_CACHE_LOCK:
+            cutoff = time.time() - PRECOMPUTE_CACHE_TTL_SECONDS
+            for old_sid, old_item in list(PRECOMPUTE_CACHE.items()):
+                stamp = float(old_item.get("ready_at") or old_item.get("started_at") or 0)
+                if stamp and stamp < cutoff:
+                    PRECOMPUTE_CACHE.pop(old_sid, None)
             cached = dict(PRECOMPUTE_CACHE.get(sid, {}))
         if cached.get("signature") == signature and cached.get("script"):
             return "<div class='precompute-card ready'>✅ Recap Script အဆင်သင့်ဖြစ်ပြီးသားပါ။</div>"
+        with PRECOMPUTE_CACHE_LOCK:
+            PRECOMPUTE_CACHE[sid] = {
+                "signature": signature, "state": "running", "started_at": time.time()
+            }
 
         analysis, _summary, _rows = analyze_movie_v3(
             video_value, vip_access_state, user_api_key=api_key,
@@ -4296,6 +4584,9 @@ def precompute_recap_in_background(
             progress=_ProgressSlice(progress, 0.55, 1.0),
         )
         with PRECOMPUTE_CACHE_LOCK:
+            current = PRECOMPUTE_CACHE.get(sid, {})
+            if current.get("signature") != signature:
+                return "<div class='precompute-card waiting'>Settings ပြောင်းထားလို့ script အဟောင်းကိုမသုံးပါ။</div>"
             PRECOMPUTE_CACHE[sid] = {
                 "signature": signature,
                 "analysis": analysis,
@@ -4305,7 +4596,13 @@ def precompute_recap_in_background(
         return "<div class='precompute-card ready'>✅ Video Analyze + Recap Script အဆင်သင့်ဖြစ်ပါပြီ။ AUTO RECAP နှိပ်ရင် ထပ်မရေးတော့ပါ။</div>"
     except Exception as exc:
         print(f"[BACKGROUND SCRIPT ERROR] {type(exc).__name__}: {exc}")
-        return f"<div class='precompute-card error'>⚠️ Background script မပြီးပါ: {str(exc)[:240]}</div>"
+        if signature:
+            with PRECOMPUTE_CACHE_LOCK:
+                current = PRECOMPUTE_CACHE.get(sid, {})
+                if current.get("signature") == signature and current.get("state") == "running":
+                    PRECOMPUTE_CACHE.pop(sid, None)
+        safe_error = html.escape(str(exc)[:240])
+        return f"<div class='precompute-card error'>⚠️ Background script မပြီးပါ: {safe_error}</div>"
 
 
 def _set_process_status(session_id, **updates):
@@ -4321,6 +4618,10 @@ def _set_process_status(session_id, **updates):
 def _get_process_status(session_id):
     sid = str(session_id or "default")
     with PROCESS_STATUS_LOCK:
+        cutoff = time.time() - (6 * 60 * 60)
+        for old_sid, old_item in list(PROCESS_STATUS.items()):
+            if float(old_item.get("updated") or 0) < cutoff:
+                PROCESS_STATUS.pop(old_sid, None)
         return dict(PROCESS_STATUS.get(sid, {}))
 
 
@@ -4976,11 +5277,27 @@ def create_app():
       const card=()=>document.getElementById('yf-upload-progress-card');
       const paint=(pct,complete=false)=>{const c=card();if(!c||!state)return;pct=Math.max(0,Math.min(100,pct||0));const elapsed=Math.max(.2,(performance.now()-state.started)/1000);const sent=state.size*pct/100;const speed=sent/elapsed;const eta=pct>0?(state.size-sent)/Math.max(speed,1):Infinity;c.className=complete?'done':'active';c.querySelector('.yf-up-name').textContent=complete?'✅ Upload Complete':'📤 Video Uploading';c.querySelector('.yf-up-pct').textContent=complete?'100%':`${Math.round(pct)}%`;c.querySelector('.yf-up-track i').style.width=`${complete?100:pct}%`;c.querySelector('.yf-up-size').textContent=`${fmtBytes(complete?state.size:sent)} / ${fmtBytes(state.size)} • ${fmtBytes(speed)}/s`;c.querySelector('.yf-up-eta').textContent=complete?'တင်ပြီးပါပြီ':fmtTime(eta)};
       document.addEventListener('change',e=>{const input=e.target;if(!(input instanceof HTMLInputElement)||input.type!=='file'||!input.files?.length)return;const f=input.files[0];if(!(f.type||'').startsWith('video/'))return;state={size:f.size,started:performance.now(),last:1};paint(1)},true);
+      /* Use the browser's real upload byte events when Gradio sends FormData.
+         The DOM progress scan below remains a compatibility fallback. */
+      const originalSend=XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send=function(body){
+        if(state&&body instanceof FormData&&this.upload){
+          this.upload.addEventListener('progress',ev=>{
+            if(!ev.lengthComputable||!state)return;
+            state.last=Math.max(state.last,100*ev.loaded/ev.total);
+            paint(state.last,state.last>=99.9);
+          });
+          this.addEventListener('loadend',()=>{
+            if(state&&this.status>=200&&this.status<400)paint(100,true);
+          });
+        }
+        return originalSend.apply(this,arguments);
+      };
       setInterval(()=>{if(!state)return;let pct=0;for(const el of document.querySelectorAll('[role="progressbar"],progress')){let v=parseFloat(el.getAttribute('aria-valuenow')||el.value||'');let max=parseFloat(el.getAttribute('aria-valuemax')||el.max||'100');if(isFinite(v)){if(max>0&&max!==100)v=v/max*100;pct=Math.max(pct,v)}}if(!pct){for(const el of document.querySelectorAll('[class*="progress"]')){const m=(el.textContent||'').match(/(\d{1,3})\s*%/);if(m)pct=Math.max(pct,parseFloat(m[1]))}}if(pct>0){state.last=Math.max(state.last,pct);paint(state.last,state.last>=99.5)}const video=document.querySelector('#yf-video-upload video[src],#yf-video-upload video source[src]');if(video&&performance.now()-state.started>800){paint(100,true);state=null}},250);
     })();
     """
 
-    with gr.Blocks(title="YF Recap V6.8.3 • Aurora Studio") as app:
+    with gr.Blocks(title="YF Recap V6.12.0 • Midnight Emerald Studio") as app:
         app._yf_theme = theme
         app._yf_css = css
         app._yf_js = connection_js
