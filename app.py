@@ -14,7 +14,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.12.0 • FULL ERROR REPAIR • SAFE SYNC • RESILIENT GEMINI + VOXCPM"
+YF_BUILD = "V6.12.2 • VOXCPM NO-CUT CHUNK SYNTH • FULL SUBTITLE/AUDIO PRESERVE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -828,29 +828,14 @@ def split_subtitle_display_chunks(text, min_chars=25, max_chars=35):
 
 
 def compact_narration_for_slot(text, slot_seconds, chars_per_second=10.5):
-    """Bound narration before TTS so scene fitting never needs extreme speed."""
-    clean = re.sub(r"\s+", " ", str(text or "")).strip()
-    max_visible = max(24, int(max(0.5, float(slot_seconds)) * float(chars_per_second)))
-    if _subtitle_visual_len(clean) <= max_visible:
-        return clean
-    words = clean.split()
-    kept = []
-    for word in words:
-        proposal = " ".join(kept + [word])
-        if kept and _subtitle_visual_len(proposal) > max_visible:
-            break
-        kept.append(word)
-    shortened = " ".join(kept).strip()
-    if not shortened:
-        clusters = segment_myanmar_syllables(clean)
-        shortened = ""
-        for cluster in clusters:
-            if shortened and _subtitle_visual_len(shortened + cluster) > max_visible:
-                break
-            shortened += cluster
-    shortened = shortened.rstrip("၊။,.!?;:…—–- ")
-    return (shortened + "။") if shortened else clean
+    """Preserve the COMPLETE narration text.
 
+    Older builds truncated words when a scene slot looked too short. That caused
+    both spoken narration and subtitles to lose the tail of a sentence. Timing
+    is handled later by scene-duration allocation / tempo fitting instead of
+    deleting narration text.
+    """
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 def read_video_middle_frame(cap):
     """Read the frame at roughly 50% of a video, with a first-frame fallback."""
@@ -1470,6 +1455,12 @@ def generate_voxcpm_audio(
         "cfg_value": cfg_value,
         "inference_timesteps": inference_timesteps,
         "normalize": False,
+        # Current VoxCPM exposes these guards. Older builds are handled by the
+        # compatibility loop below, which removes unsupported kwargs safely.
+        "max_len": 4096,
+        "retry_badcase": True,
+        "retry_badcase_max_times": 3,
+        "retry_badcase_ratio_threshold": 8.0,
     }
 
     if mode == "clone":
@@ -1559,6 +1550,157 @@ def generate_voxcpm_audio(
         print("✅ VoxCPM compatibility mode:", ", ".join(dict.fromkeys(removed_compat_args)))
     sf.write(filename, waveform, sample_rate)
     return filename
+
+
+def _split_voxcpm_synthesis_chunks(text, max_visible=68):
+    """Split long narration into safe VoxCPM calls without deleting text.
+
+    VoxCPM can occasionally stop early on a long synthesis request, especially
+    in cloning mode.  This splitter preserves the complete normalized narration
+    while keeping each model call short enough to be reliable.
+    """
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return []
+    if _subtitle_visual_len(clean) <= max_visible:
+        return [clean]
+
+    units = [u for u in re.findall(r"\S+", clean) if u]
+    expanded_units = []
+    for unit in units:
+        if _subtitle_visual_len(unit) > max_visible:
+            expanded_units.extend(_split_long_unspaced_subtitle_unit(unit, max_chars=max_visible))
+        else:
+            expanded_units.append(unit)
+
+    chunks, current = [], ""
+    for unit in expanded_units:
+        proposal = unit if not current else f"{current} {unit}"
+        if current and _subtitle_visual_len(proposal) > max_visible:
+            chunks.append(current.strip())
+            current = unit
+        else:
+            current = proposal
+        # Prefer a natural Burmese sentence break once the chunk is reasonably full.
+        if current and _subtitle_visual_len(current) >= int(max_visible * 0.58) and current.endswith(("။", "!", "?", "…")):
+            chunks.append(current.strip())
+            current = ""
+    if current.strip():
+        chunks.append(current.strip())
+    return [c for c in chunks if c]
+
+
+def generate_voxcpm_audio_complete(
+    text, filename, mode="clone", voice_preset="", custom_voice_description="",
+    reference_wav_path=None, reference_transcript="", desired_speed=1.0,
+    cfg_value=2.0, inference_timesteps=10, seed=42,
+):
+    """Generate COMPLETE VoxCPM narration, retrying every short chunk.
+
+    No chunk is silently skipped.  Every text chunk must produce a valid WAV,
+    then all chunks are concatenated in order into ``filename``.
+    """
+    chunks = _split_voxcpm_synthesis_chunks(text, max_visible=68)
+    if not chunks:
+        raise RuntimeError("VoxCPM complete synthesis received empty text")
+
+    # Short lines use the normal fast path.
+    if len(chunks) == 1:
+        return generate_voxcpm_audio(
+            chunks[0], filename, mode=mode, voice_preset=voice_preset,
+            custom_voice_description=custom_voice_description,
+            reference_wav_path=reference_wav_path,
+            reference_transcript=reference_transcript, desired_speed=desired_speed,
+            cfg_value=cfg_value, inference_timesteps=inference_timesteps, seed=seed,
+        )
+
+    temp_dir = tempfile.mkdtemp(prefix="yf_voxcpm_chunks_")
+    arrays = []
+    target_sr = None
+    try:
+        for chunk_index, chunk in enumerate(chunks):
+            part_path = os.path.join(temp_dir, f"part_{chunk_index:03d}.wav")
+            last_error = None
+            # Two app-level retries are in addition to VoxCPM's own bad-case retry.
+            for attempt in range(2):
+                try:
+                    generate_voxcpm_audio(
+                        chunk, part_path, mode=mode, voice_preset=voice_preset,
+                        custom_voice_description=custom_voice_description,
+                        reference_wav_path=reference_wav_path,
+                        reference_transcript=reference_transcript,
+                        desired_speed=desired_speed, cfg_value=cfg_value,
+                        inference_timesteps=inference_timesteps,
+                        seed=int(seed or 42) + chunk_index + attempt * 1009,
+                    )
+                    if not os.path.exists(part_path) or os.path.getsize(part_path) < 512:
+                        raise RuntimeError("VoxCPM chunk returned no usable WAV")
+                    duration = probe_duration(part_path, fallback=0.0)
+                    # Catch the common bad case where only the first few words
+                    # are spoken. Threshold is deliberately conservative.
+                    visible = max(1, _subtitle_visual_len(chunk))
+                    minimum_reasonable = max(0.45, min(2.4, visible / 34.0))
+                    if duration < minimum_reasonable:
+                        raise RuntimeError(
+                            f"VoxCPM chunk ended too early ({duration:.2f}s for {visible} visible chars)"
+                        )
+                    data, sr = sf.read(part_path, dtype="float32", always_2d=False)
+                    data = np.asarray(data, dtype=np.float32)
+                    if data.ndim == 2:
+                        data = data.mean(axis=1)
+                    data = data.reshape(-1)
+                    if data.size < 100:
+                        raise RuntimeError("VoxCPM chunk waveform is empty")
+                    if target_sr is None:
+                        target_sr = int(sr)
+                    if int(sr) != int(target_sr):
+                        converted = os.path.join(temp_dir, f"part_{chunk_index:03d}_sr.wav")
+                        rr = subprocess.run([
+                            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                            "-i", part_path, "-ar", str(target_sr), "-ac", "1", converted
+                        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+                        if rr.returncode != 0:
+                            raise RuntimeError("VoxCPM chunk resample failed: " + (rr.stderr or "")[-500:])
+                        data, _ = sf.read(converted, dtype="float32", always_2d=False)
+                        data = np.asarray(data, dtype=np.float32).reshape(-1)
+                    arrays.append(data)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        if os.path.exists(part_path):
+                            os.remove(part_path)
+                    except OSError:
+                        pass
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if attempt == 0:
+                        time.sleep(0.5)
+            if last_error is not None:
+                raise RuntimeError(
+                    f"VoxCPM narration chunk {chunk_index + 1}/{len(chunks)} failed; "
+                    f"full narration was NOT silently cut: {last_error}"
+                )
+
+        if target_sr is None or not arrays:
+            raise RuntimeError("VoxCPM complete synthesis produced no chunks")
+        # Tiny pause prevents words from adjacent model calls being glued together.
+        pause = np.zeros(max(1, int(target_sr * 0.045)), dtype=np.float32)
+        joined = []
+        for i, arr in enumerate(arrays):
+            if i:
+                joined.append(pause)
+            joined.append(arr)
+        waveform = np.concatenate(joined).astype(np.float32, copy=False)
+        sf.write(filename, waveform, target_sr)
+        if not os.path.exists(filename) or os.path.getsize(filename) < 512:
+            raise RuntimeError("VoxCPM complete narration WAV was not written")
+        print(f"✅ VoxCPM no-cut synthesis: {len(chunks)} chunks joined • {probe_duration(filename, 0):.2f}s")
+        return filename
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def probe_duration(path, fallback=1.0):
@@ -3334,20 +3476,17 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
     analysis_state["target_recap_seconds"] = float(target_sec)
     progress(0.08, desc="✍️ Viral recap structure စီနေသည်...")
 
-    # Keep prompt payload bounded while retaining chronology.
-    max_scenes = 110
-    if len(scenes) > max_scenes:
-        stride = len(scenes) / max_scenes
-        selected = [scenes[min(len(scenes)-1, int(i * stride))] for i in range(max_scenes)]
-    else:
-        selected = scenes
+    # Preserve every analyzed scene. Older builds sampled down to 110 scenes,
+    # which could silently remove story sections before script/TTS generation.
+    # Prompt size is controlled below by chapter batching instead of scene loss.
+    selected = list(scenes)
 
     payload = [
         {
             "scene": int(s["scene"]),
             "start": round(float(s["start"]), 2),
             "end": round(float(s["end"]), 2),
-            "source": s["text"][:1300],
+            "source": s["text"],
         }
         for s in selected
     ]
@@ -3358,7 +3497,12 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
         # Long scripts are unreliable in one model response. Generate roughly
         # 40-second chronological chapters so a four-minute source receives a
         # genuinely long script instead of a one-minute summary.
-        batch_count = max(1, min(len(selected), int(math.ceil(target_sec / 40.0))))
+        # Keep each request reasonably sized without discarding scenes.
+        # At least one chapter per ~40 sec and at least one per 30 scenes.
+        batch_count = max(
+            1,
+            min(len(selected), max(int(math.ceil(target_sec / 40.0)), int(math.ceil(len(selected) / 30.0))))
+        )
         scene_batches = []
         for batch_index in range(batch_count):
             lo = int(round(batch_index * len(selected) / batch_count))
@@ -3374,7 +3518,7 @@ def generate_recap_script_v3(analysis_state, user_api_key, tone_style, recap_len
                     "scene": int(s["scene"]),
                     "start": round(float(s["start"]), 2),
                     "end": round(float(s["end"]), 2),
-                    "source": s["text"][:1300],
+                    "source": s["text"],
                 }
                 for s in batch_scenes
             ]
@@ -3485,7 +3629,7 @@ SOURCE SCENES:
         ]
 
     # Keep clean chronology and cap pathological responses.
-    script_segments = sorted(script_segments, key=lambda x: x["start"])[:120]
+    script_segments = sorted(script_segments, key=lambda x: x["start"])
     editor_lines = []
     for i, s in enumerate(script_segments, 1):
         editor_lines.append(
@@ -3629,7 +3773,7 @@ def _coalesce_voxcpm_segments(segments, source_duration):
             combined_chars = len(prev["text"]) + 1 + len(item["text"])
             combined_span = float(item["end"]) - float(prev["start"])
             source_gap = float(item["start"]) - float(prev["end"])
-            if combined_chars <= 220 and combined_span <= 18.0 and source_gap <= 0.8:
+            if combined_chars <= 100 and combined_span <= 12.0 and source_gap <= 0.8:
                 prev["end"] = float(item["end"])
                 prev["text"] = f"{prev['text']} {item['text']}".strip()
                 continue
@@ -4072,13 +4216,13 @@ def render_reviewed_script_v3(
             # voice to Edge TTS or gTTS when synthesis fails.
             audio = os.path.join(work_dir, f"voice_{idx:03d}.wav")
             try:
-                generate_voxcpm_audio(
+                generate_voxcpm_audio_complete(
                     text, audio,
                     mode="clone",
                     voice_preset="", custom_voice_description="",
                     reference_wav_path=clone_reference_16k, reference_transcript=clone_transcript,
                     desired_speed=1.0, cfg_value=voxcpm_cfg,
-                    # Fixed seed keeps timbre/prosody stable across segments.
+                    # Fixed base seed keeps timbre/prosody stable across chunks.
                     inference_timesteps=voxcpm_steps, seed=int(voxcpm_seed or 42),
                 )
             except Exception as vox_exc:
@@ -4087,7 +4231,10 @@ def render_reviewed_script_v3(
                     f"မပြောင်းထားပါ။ ({vox_exc})"
                 ) from vox_exc
         if not os.path.exists(audio) or os.path.getsize(audio) == 0:
-            continue
+            raise gr.Error(
+                f"Narration segment {idx + 1}/{total} အသံ file မထွက်ပါ။ "
+                "ဒီ scene ကို silent skip မလုပ်တော့ပါ။ ပြန်ထုတ်ရန်လိုအပ်ပါတယ်။"
+            )
         # Preserve the voice at its natural pace. Retiming happens to video.
         slot_start = max(0.0, min(float(seg["start"]), source_duration - 0.35))
         slot_end = min(source_duration, max(slot_start + 0.35, float(seg["end"])))
@@ -4159,17 +4306,21 @@ def render_reviewed_script_v3(
         display_chunks = split_subtitle_display_chunks(source_seg["text"], min_chars=25, max_chars=35)
         if not display_chunks:
             display_chunks = [source_seg["text"]]
-        total_chars = max(1, sum(len(c) for c in display_chunks))
+        chunk_weights = [max(1, _subtitle_visual_len(c)) for c in display_chunks]
+        total_weight = max(1, sum(chunk_weights))
+        spoken_end = min(output_cursor + slot_dur, output_cursor + max(0.04, voice_dur))
+        cumulative_weight = 0
         chunk_cursor = output_cursor
-        spoken_end = output_cursor + voice_dur
-        for chunk_index, chunk in enumerate(display_chunks):
-            if chunk_cursor >= spoken_end - 0.04:
-                break
+        for chunk_index, (chunk, weight) in enumerate(zip(display_chunks, chunk_weights)):
+            cumulative_weight += weight
             if chunk_index == len(display_chunks) - 1:
                 chunk_end = spoken_end
             else:
-                chunk_end = min(spoken_end, chunk_cursor + max(0.25, voice_dur * len(chunk) / total_chars))
-            chunk_end = min(spoken_end, output_cursor + slot_dur, max(chunk_cursor + 0.04, chunk_end))
+                chunk_end = output_cursor + (spoken_end - output_cursor) * (cumulative_weight / total_weight)
+            # Never drop a remaining subtitle chunk. Very short narration may
+            # produce brief cards, but every generated word remains represented.
+            if chunk_end <= chunk_cursor:
+                chunk_end = min(spoken_end, chunk_cursor + 0.01)
             if chunk_end > chunk_cursor:
                 subtitle_segments.append({"start": chunk_cursor, "end": chunk_end, "text": chunk})
             chunk_cursor = chunk_end
