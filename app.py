@@ -14,7 +14,7 @@ import platform
 import urllib.request
 import zipfile
 
-YF_BUILD = "V6.12.2 • VOXCPM NO-CUT CHUNK SYNTH • FULL SUBTITLE/AUDIO PRESERVE"
+YF_BUILD = "V6.12.4 • VOICE CLONE SILENCE GUARD • COMPLETE DIALOGUE PRESERVE"
 print(f"✨ YF Recap build: {YF_BUILD}")
 
 # ----------------------------------------------------------------
@@ -1590,6 +1590,33 @@ def _split_voxcpm_synthesis_chunks(text, max_visible=68):
     return [c for c in chunks if c]
 
 
+def _validate_voxcpm_spoken_audio(path, text):
+    """Reject empty, silent, or obviously early-stopped VoxCPM output."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) < 512:
+        raise RuntimeError("VoxCPM returned no usable WAV")
+    data, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 2:
+        data = data.mean(axis=1)
+    data = data.reshape(-1)
+    if data.size < 100 or int(sample_rate or 0) <= 0:
+        raise RuntimeError("VoxCPM waveform is empty")
+    duration = data.size / float(sample_rate)
+    visible = max(1, _subtitle_visual_len(text))
+    minimum_reasonable = max(0.40, min(2.40, visible / 34.0))
+    rms = float(np.sqrt(np.mean(np.square(data, dtype=np.float64))))
+    peak = float(np.max(np.abs(data)))
+    if duration < minimum_reasonable:
+        raise RuntimeError(
+            f"VoxCPM stopped too early ({duration:.2f}s for {visible} visible chars)"
+        )
+    if rms < 0.00001 or peak < 0.00008:
+        raise RuntimeError(
+            f"VoxCPM returned silent audio (RMS={rms:.7f}, peak={peak:.7f})"
+        )
+    return data, int(sample_rate), duration
+
+
 def generate_voxcpm_audio_complete(
     text, filename, mode="clone", voice_preset="", custom_voice_description="",
     reference_wav_path=None, reference_transcript="", desired_speed=1.0,
@@ -1604,14 +1631,37 @@ def generate_voxcpm_audio_complete(
     if not chunks:
         raise RuntimeError("VoxCPM complete synthesis received empty text")
 
-    # Short lines use the normal fast path.
+    # Short lines also need validation. Older builds returned immediately here,
+    # so a non-empty but silent/early-stopped WAV was accepted into the video.
     if len(chunks) == 1:
-        return generate_voxcpm_audio(
-            chunks[0], filename, mode=mode, voice_preset=voice_preset,
-            custom_voice_description=custom_voice_description,
-            reference_wav_path=reference_wav_path,
-            reference_transcript=reference_transcript, desired_speed=desired_speed,
-            cfg_value=cfg_value, inference_timesteps=inference_timesteps, seed=seed,
+        last_error = None
+        for attempt in range(3):
+            try:
+                generate_voxcpm_audio(
+                    chunks[0], filename, mode=mode, voice_preset=voice_preset,
+                    custom_voice_description=custom_voice_description,
+                    reference_wav_path=reference_wav_path,
+                    reference_transcript=reference_transcript, desired_speed=desired_speed,
+                    cfg_value=cfg_value, inference_timesteps=inference_timesteps,
+                    seed=int(seed or 42) + attempt * 1009,
+                )
+                _validate_voxcpm_spoken_audio(filename, chunks[0])
+                return filename
+            except Exception as exc:
+                last_error = exc
+                try:
+                    if os.path.exists(filename):
+                        os.remove(filename)
+                except OSError:
+                    pass
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if attempt < 2:
+                    time.sleep(0.5)
+        raise RuntimeError(
+            f"VoxCPM single narration chunk failed after 3 attempts; "
+            f"silent audio was NOT inserted: {last_error}"
         )
 
     temp_dir = tempfile.mkdtemp(prefix="yf_voxcpm_chunks_")
@@ -1633,24 +1683,7 @@ def generate_voxcpm_audio_complete(
                         inference_timesteps=inference_timesteps,
                         seed=int(seed or 42) + chunk_index + attempt * 1009,
                     )
-                    if not os.path.exists(part_path) or os.path.getsize(part_path) < 512:
-                        raise RuntimeError("VoxCPM chunk returned no usable WAV")
-                    duration = probe_duration(part_path, fallback=0.0)
-                    # Catch the common bad case where only the first few words
-                    # are spoken. Threshold is deliberately conservative.
-                    visible = max(1, _subtitle_visual_len(chunk))
-                    minimum_reasonable = max(0.45, min(2.4, visible / 34.0))
-                    if duration < minimum_reasonable:
-                        raise RuntimeError(
-                            f"VoxCPM chunk ended too early ({duration:.2f}s for {visible} visible chars)"
-                        )
-                    data, sr = sf.read(part_path, dtype="float32", always_2d=False)
-                    data = np.asarray(data, dtype=np.float32)
-                    if data.ndim == 2:
-                        data = data.mean(axis=1)
-                    data = data.reshape(-1)
-                    if data.size < 100:
-                        raise RuntimeError("VoxCPM chunk waveform is empty")
+                    data, sr, duration = _validate_voxcpm_spoken_audio(part_path, chunk)
                     if target_sr is None:
                         target_sr = int(sr)
                     if int(sr) != int(target_sr):
@@ -2109,7 +2142,18 @@ def process_magic_recap_video(
         # 1) Speech-to-text (GPU when CUDA is available)
         progress(0.04, desc="🎙️ 01/06 • Speech ကိုဖတ်ယူနေသည်...")
         segments_raw, info = whisper_model.transcribe(
-            video_path, beam_size=1, vad_filter=True, condition_on_previous_text=False
+            video_path,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={
+                # Keep quiet/short dialogue. The former default VAD settings
+                # could classify soft speech and brief replies as silence.
+                "threshold": 0.35,
+                "min_speech_duration_ms": 120,
+                "min_silence_duration_ms": 350,
+                "speech_pad_ms": 300,
+            },
+            condition_on_previous_text=True,
         )
         raw_segments = [
             {"start": float(seg.start), "end": float(seg.end), "text": (seg.text or "").strip()}
@@ -3377,7 +3421,16 @@ def analyze_movie_v3(video_value, vip_access_state, user_api_key="", progress=gr
     progress(0.08, desc="🎙️ Speech & dialogue ကို Analyze လုပ်နေသည်...")
     try:
         segments_raw, info = whisper_model.transcribe(
-            video_path, beam_size=1, vad_filter=True, condition_on_previous_text=False
+            video_path,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={
+                "threshold": 0.35,
+                "min_speech_duration_ms": 120,
+                "min_silence_duration_ms": 350,
+                "speech_pad_ms": 300,
+            },
+            condition_on_previous_text=True,
         )
         raw_segments = [
             {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
@@ -3543,8 +3596,14 @@ CRITICAL STORY RULES:
 - Every output item MUST use start/end values that come from (or stay inside) a supplied source scene.
 - Keep chronological order.
 
+OUTPUT COMPLETENESS IS MANDATORY:
+- Return exactly ONE output item for EVERY supplied SOURCE SCENE.
+- Copy that source scene's `scene`, `start`, and `end` exactly.
+- Do not merge scenes, omit brief dialogue, or drop the beginning/middle/ending.
+- Even a short reply or transition must remain represented in its scene's recap text.
+
 Return VALID JSON ONLY in exactly this shape:
-{{"segments":[{{"start":0.0,"end":8.2,"text":"Burmese narration"}}]}}
+{{"segments":[{{"scene":1,"start":0.0,"end":8.2,"text":"Burmese narration"}}]}}
 No markdown and no extra keys.
 
 SOURCE SCENES:
@@ -3565,9 +3624,23 @@ SOURCE SCENES:
                 raw = re.sub(r"^```(?:json)?\s*", "", raw)
                 raw = re.sub(r"\s*```$", "", raw)
                 parsed = json.loads(raw)
+                generated_by_scene = {}
+                source_by_scene = {int(s["scene"]): s for s in batch_scenes}
                 for item in parsed.get("segments", []):
                     text = str(item.get("text", "")).strip()
                     if not text:
+                        continue
+                    try:
+                        scene_number = int(item.get("scene"))
+                    except (TypeError, ValueError):
+                        scene_number = 0
+                    if scene_number in source_by_scene and scene_number not in generated_by_scene:
+                        matched_scene = source_by_scene[scene_number]
+                        generated_by_scene[scene_number] = {
+                            "start": float(matched_scene["start"]),
+                            "end": float(matched_scene["end"]),
+                            "text": text,
+                        }
                         continue
                     raw_st = max(0.0, float(item.get("start", 0.0)))
                     raw_en = max(raw_st + 0.35, float(item.get("end", raw_st + 3.0)))
@@ -3586,7 +3659,46 @@ SOURCE SCENES:
                     en = min(scene_en, max(st + 0.35, raw_en))
                     if en <= st:
                         st, en = scene_st, max(scene_st + 0.35, scene_en)
-                    generated_batches.append({"start": st, "end": en, "text": text})
+                    matched_number = int(matched_scene["scene"])
+                    if matched_number not in generated_by_scene:
+                        generated_by_scene[matched_number] = {"start": st, "end": en, "text": text}
+
+                # Models sometimes stop early while still returning valid JSON.
+                # Detect that case and recover every omitted source scene rather
+                # than silently producing a recap with missing dialogue/events.
+                missing_scenes = [
+                    s for s in batch_scenes if int(s["scene"]) not in generated_by_scene
+                ]
+                if missing_scenes:
+                    print(
+                        f"⚠️ Chapter {batch_index}: recovering "
+                        f"{len(missing_scenes)} omitted scene(s)"
+                    )
+                    missing_items = [
+                        {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+                        for s in missing_scenes
+                    ]
+                    recovered = translate_segments_batch(
+                        missing_items, api_key,
+                        source_lang=analysis_state.get("language", "en"),
+                        tone_style=tone_style,
+                    )
+                    for scene, recovered_item in zip(missing_scenes, recovered):
+                        recovered_text = (
+                            recovered_item.get("mm_text")
+                            or recovered_item.get("text")
+                            or scene.get("text")
+                            or ""
+                        ).strip()
+                        if recovered_text:
+                            generated_by_scene[int(scene["scene"])] = {
+                                "start": float(scene["start"]),
+                                "end": float(scene["end"]),
+                                "text": recovered_text,
+                            }
+                generated_batches.extend(
+                    generated_by_scene[key] for key in sorted(generated_by_scene)
+                )
             except Exception as exc:
                 print(f"⚠️ Script chapter {batch_index} failed:", exc)
                 # Recover this chapter immediately instead of returning a
@@ -3612,13 +3724,9 @@ SOURCE SCENES:
 
     if not script_segments:
         progress(0.35, desc="📝 Backup recap script ပြင်ဆင်နေသည်...")
-        # Fallback: use the most informative chronological scenes and translate them.
-        desired_count = max(4, min(len(selected), int(target_sec / 12)))
-        if len(selected) > desired_count:
-            stride = len(selected) / desired_count
-            fallback_scenes = [selected[min(len(selected)-1, int(i * stride))] for i in range(desired_count)]
-        else:
-            fallback_scenes = selected
+        # Fallback must preserve every chronological scene. Sampling here used
+        # to be a direct cause of missing speech and story sections.
+        fallback_scenes = selected
         temp = [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in fallback_scenes]
         translated = translate_segments_batch(
             temp, api_key, source_lang=analysis_state.get("language", "en"), tone_style=tone_style
