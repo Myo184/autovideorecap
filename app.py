@@ -4160,10 +4160,15 @@ def build_story_video_filter_graph(source_segments, voice_durations, target_w, t
         st, en = float(seg["start"]), float(seg["end"])
         src_dur = max(0.15, en - st)
         out_dur = max(0.15, float(out_dur))
-        factor = out_dur / src_dur
         label = f"clip{i}"
+        # Keep every selected scene at its original 1x speed. A long scene is
+        # trimmed to the narration slot; a short scene holds its last frame.
+        # This keeps voice, subtitle and picture boundaries identical without
+        # making adjacent scenes alternate between fast and slow motion.
         parts.append(
-            f"[0:v]trim=start={st:.3f}:end={en:.3f},setpts=(PTS-STARTPTS)*{factor:.8f},fps={render_fps}[{label}]"
+            f"[0:v]trim=start={st:.3f}:end={en:.3f},setpts=PTS-STARTPTS,"
+            f"tpad=stop_mode=clone:stop_duration={out_dur:.3f},"
+            f"trim=duration={out_dur:.3f},setpts=PTS-STARTPTS,fps={render_fps}[{label}]"
         )
         clip_labels.append(f"[{label}]")
     parts.append("".join(clip_labels) + f"concat=n={len(clip_labels)}:v=1:a=0[storysrc]")
@@ -4364,43 +4369,14 @@ def render_reviewed_script_v3(
     source_segments = successful_source_segments
     render_source_segments = source_segments
 
-    narration_duration = max(0.5, sum(voice_durations))
-    requested_duration = min(
-        source_duration,
-        max(1.0, float(analysis_state.get("target_recap_seconds", source_duration)))
-    )
-    # Hard safety rule: an automatic/full-length recap may keep narration at a
-    # natural pace, but it may not collapse below 93% of its chosen target.
-    # Example: 4:30 source -> minimum 4:11 final output.
-    minimum_output_duration = requested_duration * 0.93
-    # Auto mode stays between 93% and 100% of the source.  Because expanded
-    # source windows cover the whole upload, every output slot is shorter than
-    # or equal to its real footage: video is never rendered in slow motion.
-    final_output_duration = min(
-        requested_duration,
-        max(minimum_output_duration, min(narration_duration, requested_duration)),
-    )
-    source_spans = [max(0.05, s["end"] - s["start"]) for s in render_source_segments]
-    span_total = max(0.05, sum(source_spans))
-    render_video_durations = allocate_scene_output_durations(
-        source_spans, voice_durations, final_output_duration, preferred_max_tempo=1.18
-    )
-
-    # Keep normal speech whenever it fits.  Only an objectively overlong line
-    # is tempo-fitted to its own scene slot; this is the last-resort guard that
-    # prevents overlap, cut-off narration and later-scene drift.
-    timeline_voice_files, timeline_voice_durations = [], []
+    # One timing authority: each generated voice file defines its scene slot.
+    # Neither voice nor video is independently tempo-adjusted. This removes
+    # cumulative drift and keeps the speaking pace uniform from start to end.
+    timeline_voice_files = list(voice_files)
+    timeline_voice_durations = [max(0.15, float(d)) for d in voice_durations]
+    render_video_durations = list(timeline_voice_durations)
+    final_output_duration = max(0.5, sum(render_video_durations))
     max_voice_tempo = 1.0
-    for idx, (audio_path, voice_dur, slot_dur) in enumerate(zip(voice_files, voice_durations, render_video_durations)):
-        if voice_dur > slot_dur + 0.04:
-            max_voice_tempo = max(max_voice_tempo, voice_dur / max(0.05, slot_dur))
-            fitted_path = os.path.join(work_dir, f"voice_sync_{idx:03d}.wav")
-            fit_narration_clip_to_slot(audio_path, slot_dur, fitted_path)
-            timeline_voice_files.append(fitted_path)
-            timeline_voice_durations.append(slot_dur)
-        else:
-            timeline_voice_files.append(audio_path)
-            timeline_voice_durations.append(voice_dur)
 
     output_timeline, output_cursor = [], 0.0
     for source_seg, voice_dur, slot_dur in zip(source_segments, timeline_voice_durations, render_video_durations):
@@ -4416,7 +4392,7 @@ def render_reviewed_script_v3(
             display_chunks = [source_seg["text"]]
         chunk_weights = [max(1, _subtitle_visual_len(c)) for c in display_chunks]
         total_weight = max(1, sum(chunk_weights))
-        spoken_end = min(output_cursor + slot_dur, output_cursor + max(0.04, voice_dur))
+        spoken_end = output_cursor + slot_dur
         cumulative_weight = 0
         chunk_cursor = output_cursor
         for chunk_index, (chunk, weight) in enumerate(zip(display_chunks, chunk_weights)):
@@ -4515,7 +4491,7 @@ def render_reviewed_script_v3(
     progress(1.0, desc=f"✅ YF Recap Complete • {_fmt_eta_seconds(total_elapsed)}")
     return (
         published_video, published_srt, published_mp3, published_script,
-        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Minimum duration protected: **93%** • Voice timing: **Natural-first (max fit {max_voice_tempo:.2f}x)** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
+        f"### ✅ Complete\nFinal video duration: **{_fmt_eta_seconds(final_output_duration)}** • Voice/video speed: **Fixed natural 1.00x** • Scene sync: **Voice-locked** • Custom font applied: **{subtitle_font_style}**  \n**Actual processing time:** {_fmt_eta_seconds(total_elapsed)}"
     )
 
 
